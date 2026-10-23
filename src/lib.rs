@@ -1,11 +1,13 @@
 //! Shared types and utilities for xdu tools.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::{DataType, Field, Schema};
+use duckdb::Connection;
 
 /// A single file metadata record.
 #[derive(Clone, Debug, PartialEq)]
@@ -115,11 +117,15 @@ pub enum SortMode {
     GidAsc,
     /// By mode, ascending
     ModeAsc,
+    /// By size change, largest growth first (compare mode only)
+    DeltaDesc,
+    /// By size change, largest shrink first (compare mode only)
+    DeltaAsc,
 }
 
 impl SortMode {
     /// All sort modes in display order.
-    pub const ALL: [SortMode; 14] = [
+    pub const ALL: [SortMode; 16] = [
         SortMode::Name,
         SortMode::SizeDesc,
         SortMode::SizeAsc,
@@ -134,7 +140,14 @@ impl SortMode {
         SortMode::UidAsc,
         SortMode::GidAsc,
         SortMode::ModeAsc,
+        SortMode::DeltaDesc,
+        SortMode::DeltaAsc,
     ];
+
+    /// Whether this sort mode only makes sense when comparing two indices.
+    pub fn is_compare_only(self) -> bool {
+        matches!(self, SortMode::DeltaDesc | SortMode::DeltaAsc)
+    }
 
     /// Returns the next sort mode in the cycle.
     pub fn next(self) -> Self {
@@ -152,14 +165,16 @@ impl SortMode {
             SortMode::CtimeAsc => SortMode::UidAsc,
             SortMode::UidAsc => SortMode::GidAsc,
             SortMode::GidAsc => SortMode::ModeAsc,
-            SortMode::ModeAsc => SortMode::Name,
+            SortMode::ModeAsc => SortMode::DeltaDesc,
+            SortMode::DeltaDesc => SortMode::DeltaAsc,
+            SortMode::DeltaAsc => SortMode::Name,
         }
     }
 
     /// Returns the previous sort mode in the cycle.
     pub fn prev(self) -> Self {
         match self {
-            SortMode::Name => SortMode::ModeAsc,
+            SortMode::Name => SortMode::DeltaAsc,
             SortMode::SizeDesc => SortMode::Name,
             SortMode::SizeAsc => SortMode::SizeDesc,
             SortMode::CountDesc => SortMode::SizeAsc,
@@ -173,6 +188,8 @@ impl SortMode {
             SortMode::UidAsc => SortMode::CtimeAsc,
             SortMode::GidAsc => SortMode::UidAsc,
             SortMode::ModeAsc => SortMode::GidAsc,
+            SortMode::DeltaDesc => SortMode::ModeAsc,
+            SortMode::DeltaAsc => SortMode::DeltaDesc,
         }
     }
 
@@ -195,6 +212,8 @@ impl SortMode {
             SortMode::UidAsc    => "min_uid ASC",
             SortMode::GidAsc    => "min_gid ASC",
             SortMode::ModeAsc   => "min_mode ASC",
+            SortMode::DeltaDesc => "size_delta DESC",
+            SortMode::DeltaAsc  => "size_delta ASC",
         }
     }
 
@@ -215,6 +234,8 @@ impl SortMode {
             SortMode::UidAsc    => "min_uid ASC",
             SortMode::GidAsc    => "min_gid ASC",
             SortMode::ModeAsc   => "min_mode ASC",
+            SortMode::DeltaDesc => "size_delta DESC",
+            SortMode::DeltaAsc  => "size_delta ASC",
         }
     }
 }
@@ -236,6 +257,8 @@ impl fmt::Display for SortMode {
             SortMode::UidAsc    => write!(f, "uid-asc"),
             SortMode::GidAsc    => write!(f, "gid-asc"),
             SortMode::ModeAsc   => write!(f, "mode-asc"),
+            SortMode::DeltaDesc => write!(f, "delta-desc"),
+            SortMode::DeltaAsc  => write!(f, "delta-asc"),
         }
     }
 }
@@ -259,7 +282,9 @@ impl FromStr for SortMode {
             "uid-asc" | "uid" => Ok(SortMode::UidAsc),
             "gid-asc" | "gid" => Ok(SortMode::GidAsc),
             "mode-asc" | "mode" => Ok(SortMode::ModeAsc),
-            _ => Err(format!("Invalid sort mode: {}. Use: name, size-desc, size-asc, count-desc, count-asc, age-desc, age-asc, mtime-desc, mtime-asc, ctime-desc, ctime-asc, uid-asc, gid-asc, mode-asc", s)),
+            "delta-desc" | "delta" | "growth" => Ok(SortMode::DeltaDesc),
+            "delta-asc" | "shrink" => Ok(SortMode::DeltaAsc),
+            _ => Err(format!("Invalid sort mode: {}. Use: name, size-desc, size-asc, count-desc, count-asc, age-desc, age-asc, mtime-desc, mtime-asc, ctime-desc, ctime-asc, uid-asc, gid-asc, mode-asc, delta-desc, delta-asc", s)),
         }
     }
 }
@@ -661,6 +686,187 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Format a signed byte delta with an explicit sign (e.g. "+1.50 MiB", "-12 B", "0 B").
+pub fn format_bytes_signed(delta: i64) -> String {
+    let magnitude = format_bytes(delta.unsigned_abs());
+    match delta.signum() {
+        1 => format!("+{}", magnitude),
+        -1 => format!("-{}", magnitude),
+        _ => magnitude,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Index comparison
+// ---------------------------------------------------------------------------
+
+/// Special partition name for files directly in the top-level directory.
+pub const ROOT_PARTITION: &str = "__root__";
+
+/// Per-file change classification produced by [`diff_partition_sql`], from most to
+/// least significant. A file is assigned the first status that applies.
+pub const DIFF_STATUSES: &[&str] = &[
+    "added",     // only in the new index
+    "removed",   // only in the old index
+    "modified",  // size or mtime changed
+    "meta",      // only ctime/uid/gid/mode changed
+    "accessed",  // only atime changed
+    "unchanged",
+];
+
+/// Quote a string as a SQL literal.
+pub fn sql_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// List partition directories (those containing at least one `.parquet` file), sorted.
+pub fn list_partitions(index: &Path) -> anyhow::Result<Vec<String>> {
+    let mut partitions = Vec::new();
+    for entry in std::fs::read_dir(index)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let has_parquet = std::fs::read_dir(entry.path())?
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().extension().is_some_and(|ext| ext == "parquet"));
+        if has_parquet {
+            partitions.push(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    partitions.sort();
+    Ok(partitions)
+}
+
+/// Discover the crawl root of an index (the directory that was passed to `xdu`),
+/// without a trailing slash.
+///
+/// Files in partition `p` live at `<root>/p/...` and files in `__root__` at `<root>/file`.
+/// The root is recovered from the longest common directory prefix of all paths; if the
+/// index has a single non-root partition, that prefix is trimmed back to `<root>`.
+pub fn discover_index_root(conn: &Connection, index: &Path, partitions: &[String]) -> anyhow::Result<String> {
+    let glob = format!("{}/*/*.parquet", index.display());
+    let sql = format!("SELECT min(path), max(path) FROM read_parquet({})", sql_quote(&glob));
+    let (lo, hi): (Option<String>, Option<String>) =
+        conn.query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let (lo, hi) = match (lo, hi) {
+        (Some(lo), Some(hi)) => (lo, hi),
+        _ => anyhow::bail!("Index is empty: {}", index.display()),
+    };
+
+    let common: String = lo.chars().zip(hi.chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a)
+        .collect();
+    // Truncate to a whole directory, e.g. "/data/alice" + "/data/alfred" -> "/data"
+    let mut root = match common.rfind('/') {
+        Some(pos) => common[..pos].to_string(),
+        None => String::new(),
+    };
+
+    let named: Vec<&String> = partitions.iter().filter(|p| *p != ROOT_PARTITION).collect();
+    let has_root_files = partitions.iter().any(|p| p == ROOT_PARTITION);
+    if named.len() == 1 && !has_root_files {
+        // Common prefix is somewhere inside the only partition: cut back to "<root>/<p>".
+        let marker = format!("/{}", named[0]);
+        let probe = format!("{}/", root);
+        if let Some(pos) = probe.rfind(&format!("{}/", marker)) {
+            root = probe[..pos].to_string();
+        }
+    }
+    Ok(root)
+}
+
+/// One side of a comparison: an index directory and its crawl root.
+#[derive(Clone, Debug)]
+pub struct DiffSide {
+    pub index: PathBuf,
+    pub root: String,
+}
+
+impl DiffSide {
+    /// SQL relation for one partition of this side, keyed by path relative to the root.
+    /// Yields a typed empty relation when the partition is absent.
+    fn relation(&self, partition: &str, present: bool) -> String {
+        if !present {
+            return "SELECT NULL::VARCHAR AS rel, NULL::BIGINT AS size, NULL::BIGINT AS atime, \
+                    NULL::BIGINT AS mtime, NULL::BIGINT AS ctime, NULL::INTEGER AS uid, \
+                    NULL::INTEGER AS gid, NULL::INTEGER AS mode WHERE false".to_string();
+        }
+        let glob = format!("{}/{}/*.parquet", self.index.display(), partition);
+        format!(
+            "SELECT substr(path, {start}) AS rel, size, atime, mtime, ctime, uid, gid, mode \
+             FROM read_parquet({glob})",
+            start = self.root.len() + 2,
+            glob = sql_quote(&glob),
+        )
+    }
+}
+
+/// Build a query comparing one partition between an old and new index.
+///
+/// Files are matched on their path relative to each index's root, so indices taken
+/// from different snapshot mount points (e.g. `.snapshots/@GMT-...`) line up.
+///
+/// Output columns: `rel, status, size_old, size_new, delta, mtime_old, mtime_new`, plus
+/// `atime, mtime, ctime, uid, gid, mode` taken from the new index (or the old one for
+/// removed files). Sizes of the missing side are 0; `status` is one of [`DIFF_STATUSES`].
+pub fn diff_partition_sql(
+    old: &DiffSide,
+    new: &DiffSide,
+    partition: &str,
+    in_old: bool,
+    in_new: bool,
+) -> String {
+    format!(
+        r#"
+        WITH a AS ({rel_a}), b AS ({rel_b})
+        SELECT
+            COALESCE(a.rel, b.rel) AS rel,
+            CASE
+                WHEN a.rel IS NULL THEN 'added'
+                WHEN b.rel IS NULL THEN 'removed'
+                WHEN a.size <> b.size OR a.mtime <> b.mtime THEN 'modified'
+                WHEN a.ctime <> b.ctime OR a.uid <> b.uid OR a.gid <> b.gid OR a.mode <> b.mode THEN 'meta'
+                WHEN a.atime <> b.atime THEN 'accessed'
+                ELSE 'unchanged'
+            END AS status,
+            COALESCE(a.size, 0) AS size_old,
+            COALESCE(b.size, 0) AS size_new,
+            COALESCE(b.size, 0) - COALESCE(a.size, 0) AS delta,
+            a.mtime AS mtime_old,
+            b.mtime AS mtime_new,
+            COALESCE(b.atime, a.atime) AS atime,
+            COALESCE(b.mtime, a.mtime) AS mtime,
+            COALESCE(b.ctime, a.ctime) AS ctime,
+            COALESCE(b.uid, a.uid) AS uid,
+            COALESCE(b.gid, a.gid) AS gid,
+            COALESCE(b.mode, a.mode) AS mode
+        FROM a FULL OUTER JOIN b ON a.rel = b.rel
+        "#,
+        rel_a = old.relation(partition, in_old),
+        rel_b = new.relation(partition, in_new),
+    )
+}
+
+/// Like [`diff_partition_sql`], but shaped like an index so existing index queries can run
+/// on it: `path` is absolute under the new root (removed files included), `size` is the
+/// new size, and `size_old` and `status` are added.
+pub fn diff_as_index_sql(
+    old: &DiffSide,
+    new: &DiffSide,
+    partition: &str,
+    in_old: bool,
+    in_new: bool,
+) -> String {
+    format!(
+        "SELECT {root} || '/' || rel AS path, size_new AS size, size_old, \
+         atime, mtime, ctime, uid, gid, mode, status FROM ({diff})",
+        root = sql_quote(&new.root),
+        diff = diff_partition_sql(old, new, partition, in_old, in_new),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -980,7 +1186,12 @@ mod tests {
         assert_eq!(SortMode::CtimeAsc.next(), SortMode::UidAsc);
         assert_eq!(SortMode::UidAsc.next(), SortMode::GidAsc);
         assert_eq!(SortMode::GidAsc.next(), SortMode::ModeAsc);
-        assert_eq!(SortMode::ModeAsc.next(), SortMode::Name);
+        assert_eq!(SortMode::ModeAsc.next(), SortMode::DeltaDesc);
+        assert_eq!(SortMode::DeltaDesc.next(), SortMode::DeltaAsc);
+        assert_eq!(SortMode::DeltaAsc.next(), SortMode::Name);
+        for mode in SortMode::ALL {
+            assert_eq!(mode.next().prev(), mode);
+        }
     }
 
     #[test]
@@ -997,6 +1208,11 @@ mod tests {
         assert_eq!("oldest".parse::<SortMode>().unwrap(), SortMode::AgeDesc);
         assert_eq!("age-asc".parse::<SortMode>().unwrap(), SortMode::AgeAsc);
         assert_eq!("newest".parse::<SortMode>().unwrap(), SortMode::AgeAsc);
+        assert_eq!("delta".parse::<SortMode>().unwrap(), SortMode::DeltaDesc);
+        assert_eq!("shrink".parse::<SortMode>().unwrap(), SortMode::DeltaAsc);
+        for mode in SortMode::ALL {
+            assert_eq!(mode.to_string().parse::<SortMode>().unwrap(), mode);
+        }
     }
 
     #[test]

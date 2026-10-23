@@ -156,6 +156,9 @@ xdu-view -i /var/lib/xdu/home --older-than 30 -s size-desc
 
 # View large Python files (>1MB)
 xdu-view -i /var/lib/xdu/home -p '\.py$' --min-size 1M
+
+# See what changed since an earlier index, biggest growth first
+xdu-view -i /var/lib/xdu/home-wed --compare /var/lib/xdu/home-mon -s delta
 ```
 
 #### Command-Line Options
@@ -170,8 +173,9 @@ xdu-view -i /var/lib/xdu/home -p '\.py$' --min-size 1M
 | `--older-than` | Files not accessed in N days | |
 | `--newer-than` | Files accessed within N days | |
 | `-s, --sort` | Sort order (see below) | name |
+| `--compare` | Earlier index to compare against (see [Comparing Two Indices](#comparing-two-indices)) | |
 
-**Sort modes:** `name` (default, directories first), `size-desc`, `size-asc`, `count-desc`, `count-asc`, `age-desc` (oldest first), `age-asc` (newest first)
+**Sort modes:** `name` (default, directories first), `size-desc`, `size-asc`, `count-desc`, `count-asc`, `age-desc` (oldest first), `age-asc` (newest first), and with `--compare`: `delta-desc` (largest growth first), `delta-asc` (largest shrink first)
 
 #### Keybindings
 
@@ -198,6 +202,7 @@ xdu-view -i /var/lib/xdu/home -p '\.py$' --min-size 1M
 | `>` | Set minimum size filter |
 | `<` | Set maximum size filter |
 | `c` | Clear all filters |
+| `d` | Cycle changes shown: all/changed/added/removed/modified (with `--compare`) |
 
 When entering a filter value, type the value and press `Enter` to apply, or `Esc` to cancel.
 
@@ -219,6 +224,26 @@ When entering a filter value, type the value and press `Enter` to apply, or `Esc
 ▸ tests                      128.50 MiB      892 files    1 month ago
   README.md                    4.50 KiB        1 file     today
 ```
+
+#### Comparing Two Indices
+
+With `--compare OLD`, `xdu-view` browses the `-i` index and shows how each entry changed
+since `OLD`, matching files by path relative to each index's crawl root (as `xdu-diff` does).
+Removed files and directories stay visible so shrinkage can be traced too.
+
+```
+  name                       size        Δsize        files  Δfiles   accessed
++ ▸ new-project          3.14 MiB    +3.14 MiB   6.5K files   +6.5K      today
+~ ▸ QuotaTable         353.15 MiB  +384.00 KiB    307 files              today
+- ▸ old-scratch               0 B   -12.00 GiB      0 files   -1.2K  1 month ago
+  ▸ Spring              17.02 MiB                34.9K files         20 days ago
+```
+
+- Markers: `+` new, `-` gone, `~` changed (added, removed, or modified files inside)
+- **Δsize** and **Δfiles** are green for growth and red for shrinkage; in tree view, Δsize replaces the file count
+- `d` cycles which files are shown: all → changed → added → removed → modified
+- Sort with `s` → `delta-desc` / `delta-asc`, then drill into the top entry to find where growth happened
+- The tree view's file preview shows the file's previous size
 
 #### Common Use Cases
 
@@ -348,6 +373,48 @@ xdu-rm -i /var/lib/xdu/home --older-than 60 --min-size 1G --dry-run | head -20
 xdu-rm -i /var/lib/xdu/home --older-than 60 --min-size 1G --dry-run | tail -1
 # 847,231 file(s) would be deleted.
 ```
+
+### Comparing Indices with xdu-diff
+
+The `xdu-diff` command compares two indices of the same tree taken at different times—for
+example, indices of two filesystem snapshots. Files are matched by their path relative to
+each index's crawl root, so `/fs/.snapshots/@GMT-2026.10.14-…/home/alice/x` and
+`/fs/.snapshots/@GMT-2026.10.16-…/home/alice/x` are treated as the same file.
+
+```bash
+# Per-partition summary of growth, new/deleted files
+xdu-diff -h /var/lib/xdu/home-mon /var/lib/xdu/home-wed
+
+# Partitions with the largest change first
+xdu-diff -h --sort abs /var/lib/xdu/home-mon /var/lib/xdu/home-wed
+
+# Top 20 files by growth
+xdu-diff -h --files --sort delta -l 20 OLD NEW
+
+# New files over 1 GiB in one partition, as absolute paths
+xdu-diff --files --status added --min-delta 1G -u alice --absolute OLD NEW
+```
+
+Each file is classified as `added`, `removed`, `modified` (size or mtime changed), `meta`
+(only ctime/uid/gid/mode changed), `accessed` (only atime changed), or `unchanged`. In
+`--files` mode each line shows a marker (`+ - ~ m .`), the size delta, the current size, and the path.
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-f, --files` | List individual files instead of a per-partition summary | |
+| `--status` | Statuses to list with `--files` (comma-separated, or `all`) | `added,removed,modified,meta` |
+| `-u, --partition` | Restrict to a single partition | |
+| `-p, --pattern` | Regex matched against relative paths | |
+| `--min-delta` | With `--files`: minimum absolute size change (e.g., `10M`) | |
+| `-s, --sort` | `name`, `delta` (growth first), `shrink`, `abs` (largest change first) | `name` |
+| `-l, --limit` | Limit number of output rows | |
+| `-a, --all` | Summary: include partitions with no changes | |
+| `--absolute` | With `--files`: print absolute paths | |
+| `-h, --human-readable` | Human-readable sizes | |
+| `--csv` | CSV output with header (raw values) | |
+| `--old-root`, `--new-root` | Override the detected crawl root of each index | auto |
+
+The exit status follows `diff`: 0 if there are no differences (atime-only changes don't count), 1 if there are differences, 2 on error.
 
 ### Querying with DuckDB
 

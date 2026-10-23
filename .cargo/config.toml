@@ -1,2 +1,14 @@
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-args=-static-libstdc++"]
+# -static-libstdc++ alone has no effect: rustc links via `cc`, and the cc crate
+# (used by libduckdb-sys) emits a dynamic `-lstdc++`. Instead, suppress that
+# (CXXSTDLIB below) and link libstdc++.a explicitly.
+rustflags = [
+    "-C", "link-arg=-Wl,-Bstatic",
+    "-C", "link-arg=-lstdc++",
+    "-C", "link-arg=-Wl,-Bdynamic",
+    "-C", "link-arg=-static-libgcc",
+]
+
+[env]
+# Empty value tells the cc crate not to emit `cargo:rustc-link-lib=stdc++`.
+CXXSTDLIB = ""

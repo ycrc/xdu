@@ -44,6 +44,10 @@ path = "src/bin/xdu-rm.rs"
 name = "xdu-du"
 path = "src/bin/xdu-du.rs"
 
+[[bin]]
+name = "xdu-diff"
+path = "src/bin/xdu-diff.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1

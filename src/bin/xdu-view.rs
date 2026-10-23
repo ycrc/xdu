@@ -1,7 +1,8 @@
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::collapsible_else_if)]
 
-use std::collections::{HashMap, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{stdout, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -21,7 +22,10 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
-use xdu::{format_bytes, parse_size, QueryFilters, SortMode};
+use xdu::{
+    diff_as_index_sql, discover_index_root, format_bytes, format_bytes_signed, format_count, list_partitions,
+    parse_size, sql_quote, DiffSide, QueryFilters, SortMode,
+};
 
 /// Detect file type from magic bytes, shebangs, text content, and extension.
 ///
@@ -394,6 +398,43 @@ fn format_file_count(count: i64) -> String {
     }
 }
 
+/// Signed size change for display; blank for unchanged entries.
+fn format_size_delta(entry: &DirEntry) -> String {
+    if entry.changed == 0 && entry.size_delta() == 0 {
+        String::new()
+    } else {
+        format_bytes_signed(entry.size_delta())
+    }
+}
+
+/// Signed compact file-count change (e.g. "+6.5K", "-3"); blank when zero.
+fn format_count_delta(delta: i64) -> String {
+    match delta.signum() {
+        1 => format!("+{}", format_count(delta as u64)),
+        -1 => format!("-{}", format_count(delta.unsigned_abs())),
+        _ => String::new(),
+    }
+}
+
+/// Green for growth, red for shrinkage.
+fn delta_style(delta: i64) -> Style {
+    match delta.signum() {
+        1 => Style::default().fg(Color::Green),
+        -1 => Style::default().fg(Color::Red),
+        _ => Style::default(),
+    }
+}
+
+/// Name style in compare mode, by change marker.
+fn marker_style(marker: char) -> Style {
+    match marker {
+        '+' => Style::default().fg(Color::Green),
+        '-' => Style::default().fg(Color::Red),
+        '~' => Style::default().fg(Color::Yellow),
+        _ => Style::default(),
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "xdu-view",
@@ -402,7 +443,8 @@ fn format_file_count(count: i64) -> String {
 Examples:
   xdu-view -i /index/scratch
   xdu-view -i /index/scratch -u alice
-  xdu-view -i /index/scratch --older-than 90 --sort size"
+  xdu-view -i /index/scratch --older-than 90 --sort size
+  xdu-view -i /index/snap-wed --compare /index/snap-mon --sort delta"
 )]
 struct Args {
     /// Path to the Parquet index directory
@@ -433,9 +475,15 @@ struct Args {
     #[arg(long, value_name = "DAYS")]
     newer_than: Option<u64>,
 
-    /// Sort order: name, size-asc, size-desc, count-asc, count-desc, age-asc, age-desc
+    /// Sort order: name, size-asc, size-desc, count-asc, count-desc, age-asc, age-desc,
+    /// delta-desc, delta-asc (delta sorts require --compare)
     #[arg(short, long, default_value = "name")]
     sort: String,
+
+    /// Compare against an earlier index of the same tree (e.g. an older snapshot) and
+    /// show size changes and added/removed files
+    #[arg(long, value_name = "DIR")]
+    compare: Option<PathBuf>,
 }
 
 /// Represents a directory entry in the view
@@ -452,6 +500,140 @@ struct DirEntry {
     uid: i32,
     gid: i32,
     mode: i32,
+    /// Size in the comparison (old) index; equals `total_size` when not comparing
+    size_old: i64,
+    /// File count in the comparison (old) index; equals `file_count` when not comparing
+    files_old: i64,
+    /// Number of files added, removed, or modified relative to the old index
+    changed: i64,
+}
+
+impl DirEntry {
+    fn size_delta(&self) -> i64 { self.total_size - self.size_old }
+    fn files_delta(&self) -> i64 { self.file_count - self.files_old }
+
+    /// Change marker for compare mode: `+` new, `-` gone, `~` changed, blank if unchanged.
+    fn change_marker(&self) -> char {
+        if self.changed == 0 {
+            ' '
+        } else if self.files_old == 0 {
+            '+'
+        } else if self.file_count == 0 {
+            '-'
+        } else {
+            '~'
+        }
+    }
+
+    /// Entry for "..", which has no stats.
+    fn parent() -> Self {
+        DirEntry {
+            name: "..".to_string(),
+            path: "..".to_string(),
+            is_dir: true,
+            total_size: 0,
+            file_count: 0,
+            latest_atime: 0,
+            latest_mtime: 0,
+            latest_ctime: 0,
+            uid: -1,
+            gid: -1,
+            mode: -1,
+            size_old: 0,
+            files_old: 0,
+            changed: 0,
+        }
+    }
+}
+
+/// Which files to include when comparing two indices.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum StatusFilter {
+    #[default]
+    All,
+    Changed,
+    Added,
+    Removed,
+    Modified,
+}
+
+impl StatusFilter {
+    fn next(self) -> Self {
+        match self {
+            StatusFilter::All => StatusFilter::Changed,
+            StatusFilter::Changed => StatusFilter::Added,
+            StatusFilter::Added => StatusFilter::Removed,
+            StatusFilter::Removed => StatusFilter::Modified,
+            StatusFilter::Modified => StatusFilter::All,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            StatusFilter::All => "all",
+            StatusFilter::Changed => "changed",
+            StatusFilter::Added => "added",
+            StatusFilter::Removed => "removed",
+            StatusFilter::Modified => "modified",
+        }
+    }
+    /// SQL condition on the diff `status` column, if any.
+    fn condition(self) -> Option<&'static str> {
+        match self {
+            StatusFilter::All => None,
+            StatusFilter::Changed => Some("status IN ('added', 'removed', 'modified', 'meta')"),
+            StatusFilter::Added => Some("status = 'added'"),
+            StatusFilter::Removed => Some("status = 'removed'"),
+            StatusFilter::Modified => Some("status IN ('modified', 'meta')"),
+        }
+    }
+}
+
+/// State for comparing the viewed index against an earlier one.
+struct Compare {
+    old: DiffSide,
+    new: DiffSide,
+    old_partitions: BTreeSet<String>,
+    new_partitions: BTreeSet<String>,
+    /// Partition name -> temp table holding its materialized diff
+    tables: RefCell<HashMap<String, String>>,
+}
+
+impl Compare {
+    fn partitions(&self) -> impl Iterator<Item = &String> {
+        self.old_partitions.union(&self.new_partitions)
+    }
+
+    fn has_partition(&self, partition: &str) -> bool {
+        self.old_partitions.contains(partition) || self.new_partitions.contains(partition)
+    }
+
+    /// Unmaterialized diff of one partition, shaped like an index.
+    fn diff_sql(&self, partition: &str) -> String {
+        diff_as_index_sql(
+            &self.old,
+            &self.new,
+            partition,
+            self.old_partitions.contains(partition),
+            self.new_partitions.contains(partition),
+        )
+    }
+
+    /// Name of a temp table holding the diff of `partition`, creating it on first use so
+    /// navigating within a partition doesn't redo the join.
+    fn table(&self, conn: &Connection, partition: &str) -> Result<String> {
+        if let Some(name) = self.tables.borrow().get(partition) {
+            return Ok(name.clone());
+        }
+        let name = format!("xdu_diff_{}", self.tables.borrow().len());
+        conn.execute_batch(&format!(
+            "CREATE TEMP TABLE {} AS {}",
+            name,
+            self.diff_sql(partition)
+        ))
+        .with_context(|| format!("Comparing partition '{}'", partition))?;
+        self.tables.borrow_mut().insert(partition.to_string(), name.clone());
+        Ok(name)
+    }
 }
 
 /// Which timestamp column is currently displayed.
@@ -592,6 +774,8 @@ struct FilePreview {
     size: i64,
     /// Access time from the index
     atime: i64,
+    /// Size in the comparison index, when comparing (None if the file is new)
+    size_old: Option<i64>,
     /// Human-readable type description (e.g. "PNG image", "text/plain; UTF-8")
     type_description: String,
     /// Whether the file is detected as plain text
@@ -630,6 +814,15 @@ struct Column {
 struct App {
     conn: Connection,
     index_path: PathBuf,
+
+    /// Crawl root of the index (partition `p` lives at `<index_root>/p`)
+    index_root: String,
+
+    /// Comparison against an earlier index, if `--compare` was given
+    compare: Option<Compare>,
+
+    /// Which files to show when comparing
+    status_filter: StatusFilter,
     
     /// Current absolute path prefix (the root path for the current partition)
     partition_root: String,
@@ -693,9 +886,12 @@ struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         conn: Connection,
         index_path: PathBuf,
+        index_root: String,
+        compare: Option<Compare>,
         initial_partition: Option<String>,
         filters: QueryFilters,
         sort_mode: SortMode,
@@ -703,6 +899,9 @@ impl App {
         let mut app = App {
             conn,
             index_path,
+            index_root,
+            compare,
+            status_filter: StatusFilter::default(),
             partition_root: String::new(),
             current_path: String::new(),
             current_partition: None,
@@ -739,55 +938,160 @@ impl App {
         Ok(app)
     }
     
+    /// SQL relation with the files of one partition, or None if the partition doesn't exist.
+    /// When comparing, this is the partition's diff (with `size_old` and `status` columns).
+    fn partition_source(&self, partition: &str) -> Result<Option<String>> {
+        match self.compare {
+            Some(ref cmp) => {
+                if !cmp.has_partition(partition) {
+                    return Ok(None);
+                }
+                Ok(Some(cmp.table(&self.conn, partition)?))
+            }
+            None => {
+                let dir = self.index_path.join(partition);
+                if !dir.is_dir() {
+                    return Ok(None);
+                }
+                let glob = format!("{}/*.parquet", dir.display());
+                Ok(Some(format!("read_parquet({})", sql_quote(&glob))))
+            }
+        }
+    }
+
+    /// SQL relation with the files of all partitions plus a `partition` column.
+    fn all_partitions_source(&self) -> String {
+        match self.compare {
+            Some(ref cmp) => {
+                // Reuse partitions already materialized; join the rest on the fly.
+                let tables = cmp.tables.borrow();
+                let parts: Vec<String> = cmp.partitions()
+                    .filter(|p| p.as_str() != ROOT_PARTITION)
+                    .map(|p| {
+                        let source = match tables.get(p) {
+                            Some(table) => table.clone(),
+                            None => format!("({})", cmp.diff_sql(p)),
+                        };
+                        format!("SELECT {} AS partition, * FROM {}", sql_quote(p), source)
+                    })
+                    .collect();
+                if parts.is_empty() {
+                    "(SELECT NULL::VARCHAR AS partition, NULL::BIGINT AS size WHERE false)".to_string()
+                } else {
+                    format!("({})", parts.join(" UNION ALL "))
+                }
+            }
+            None => {
+                let glob = format!("{}/*/*.parquet", self.index_path.display());
+                format!(
+                    "(SELECT *, regexp_extract(filename, '.*/([^/]+)/[^/]+\\.parquet$', 1) AS partition \
+                     FROM read_parquet({}, filename=true))",
+                    sql_quote(&glob)
+                )
+            }
+        }
+    }
+
+    /// Active filter conditions, including the compare-mode status filter.
+    fn conditions(&self) -> Vec<String> {
+        let mut conditions = self.filters.to_conditions();
+        if self.compare.is_some() {
+            if let Some(cond) = self.status_filter.condition() {
+                conditions.push(cond.to_string());
+            }
+        }
+        conditions
+    }
+
+    /// Whether any filter (including the status filter) is narrowing the view.
+    fn is_filtered(&self) -> bool {
+        self.filters.is_active() || (self.compare.is_some() && self.status_filter != StatusFilter::All)
+    }
+
+    /// Aggregate columns shared by the partition and directory queries, read back by
+    /// [`App::read_stats`]. Removed files (compare mode) count toward the old index only.
+    fn aggregate_columns(&self) -> &'static str {
+        if self.compare.is_some() {
+            r#"
+                SUM(size) as total_size,
+                COUNT(*) FILTER (WHERE status <> 'removed') as file_count,
+                MAX(atime) as latest_atime,
+                MAX(mtime) as latest_mtime,
+                MAX(ctime) as latest_ctime,
+                CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
+                CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
+                MIN(mode) as min_mode,
+                SUM(size_old) as total_size_old,
+                COUNT(*) FILTER (WHERE status <> 'added') as files_old,
+                COUNT(*) FILTER (WHERE status IN ('added', 'removed', 'modified', 'meta')) as changed,
+                SUM(size) - SUM(size_old) as size_delta"#
+        } else {
+            r#"
+                SUM(size) as total_size,
+                COUNT(*) as file_count,
+                MAX(atime) as latest_atime,
+                MAX(mtime) as latest_mtime,
+                MAX(ctime) as latest_ctime,
+                CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
+                CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
+                MIN(mode) as min_mode,
+                SUM(size) as total_size_old,
+                COUNT(*) as files_old,
+                0 as changed,
+                0 as size_delta"#
+        }
+    }
+
+    /// Build a DirEntry from the columns of [`App::aggregate_columns`], starting at `col`.
+    fn read_stats(row: &duckdb::Row, col: usize, name: String, path: String, is_dir: bool) -> duckdb::Result<DirEntry> {
+        Ok(DirEntry {
+            name,
+            path,
+            is_dir,
+            total_size: row.get(col)?,
+            file_count: row.get(col + 1)?,
+            latest_atime: row.get(col + 2)?,
+            latest_mtime: row.get(col + 3)?,
+            latest_ctime: row.get(col + 4)?,
+            uid: row.get(col + 5)?,
+            gid: row.get(col + 6)?,
+            mode: row.get(col + 7)?,
+            size_old: row.get(col + 8)?,
+            files_old: row.get(col + 9)?,
+            changed: row.get(col + 10)?,
+        })
+    }
+
     /// Query individual files from the __root__ partition.
     /// Returns DirEntry items with is_dir=false and file_count=1.
     fn query_root_files(&self) -> Result<Vec<DirEntry>> {
-        let glob = format!("{}/{}/*.parquet", self.index_path.display(), ROOT_PARTITION);
-        let where_clause = self.filters.to_full_where_clause();
+        let Some(source) = self.partition_source(ROOT_PARTITION)? else {
+            return Ok(Vec::new());
+        };
+        let conditions = self.conditions();
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        // Per-file equivalents of the aggregate columns
+        let stats = if self.compare.is_some() {
+            "size, CASE WHEN status = 'removed' THEN 0 ELSE 1 END, atime, mtime, ctime, uid, gid, mode, \
+             size_old, CASE WHEN status = 'added' THEN 0 ELSE 1 END, \
+             CASE WHEN status IN ('added', 'removed', 'modified', 'meta') THEN 1 ELSE 0 END"
+        } else {
+            "size, 1, atime, mtime, ctime, uid, gid, mode, size, 1, 0"
+        };
 
-        let sql = format!(
-            r#"
-            SELECT path, size, atime, mtime, ctime, uid, gid, mode
-            FROM read_parquet('{glob}')
-            {where_clause}
-            "#,
-            glob = glob,
-            where_clause = where_clause
-        );
+        let sql = format!("SELECT path, {stats} FROM {source} {where_clause}");
 
         let mut entries = Vec::new();
-        let mut stmt = match self.conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(_) => return Ok(entries), // No __root__ partition exists
-        };
-        let mut rows = match stmt.query([]) {
-            Ok(r) => r,
-            Err(_) => return Ok(entries),
-        };
-
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let path: String = row.get(0)?;
-            let size: i64 = row.get(1)?;
-            let atime: i64 = row.get(2)?;
-            let mtime: i64 = row.get(3)?;
-            let ctime: i64 = row.get(4)?;
-            let uid: i32 = row.get(5)?;
-            let gid: i32 = row.get(6)?;
-            let mode: i32 = row.get(7)?;
             let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-            entries.push(DirEntry {
-                name,
-                path,
-                is_dir: false,
-                total_size: size,
-                file_count: 1,
-                latest_atime: atime,
-                latest_mtime: mtime,
-                latest_ctime: ctime,
-                uid,
-                gid,
-                mode,
-            });
+            entries.push(Self::read_stats(row, 1, name, path, false)?);
         }
 
         Ok(entries)
@@ -816,185 +1120,73 @@ impl App {
             SortMode::UidAsc    => entries.sort_by(|a, b| a.uid.cmp(&b.uid)),
             SortMode::GidAsc    => entries.sort_by(|a, b| a.gid.cmp(&b.gid)),
             SortMode::ModeAsc   => entries.sort_by(|a, b| a.mode.cmp(&b.mode)),
+            SortMode::DeltaDesc => entries.sort_by(|a, b| b.size_delta().cmp(&a.size_delta())),
+            SortMode::DeltaAsc  => entries.sort_by(|a, b| a.size_delta().cmp(&b.size_delta())),
         }
     }
 
-    /// Load the list of partitions
-    fn load_partitions(&mut self) -> Result<()> {
-        self.loading = true;
-        let start = Instant::now();
-        
-        // Use DuckDB's hive partitioning to get partition names directly from directory structure
-        let glob = format!("{}/*/*.parquet", self.index_path.display());
-        
-        // Build filter clause — exclude __root__ (its files are merged as individual entries)
-        let filter_clause = self.filters.to_where_clause();
-        let having_clause = if filter_clause.is_empty() {
-            format!("HAVING partition IS NOT NULL AND partition != '' AND partition != '{}'", ROOT_PARTITION)
-        } else {
-            format!(
-                "HAVING partition IS NOT NULL AND partition != '' AND partition != '{}' AND SUM(CASE WHEN {} THEN 1 ELSE 0 END) > 0",
-                ROOT_PARTITION, filter_clause
-            )
-        };
-        
-        // Query using filename to extract partition from the parquet file path
-        // The partition name is the directory containing the parquet file
-        // When filters are active, only count/sum matching files
-        let sql = if self.filters.is_active() {
-            format!(
-                r#"
-                SELECT
-                    regexp_extract(filename, '.*/([^/]+)/[^/]+\.parquet$', 1) as partition,
-                    SUM(CASE WHEN {filter} THEN size ELSE 0 END) as total_size,
-                    MAX(CASE WHEN {filter} THEN atime ELSE 0 END) as latest_atime,
-                    SUM(CASE WHEN {filter} THEN 1 ELSE 0 END) as file_count,
-                    MAX(CASE WHEN {filter} THEN mtime ELSE 0 END) as latest_mtime,
-                    MAX(CASE WHEN {filter} THEN ctime ELSE 0 END) as latest_ctime,
-                    CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
-                    CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
-                    MIN(mode) as min_mode
-                FROM read_parquet('{glob}', filename=true)
-                GROUP BY partition
-                {having}
-                ORDER BY {order}
-                "#,
-                filter = filter_clause,
-                glob = glob,
-                having = having_clause,
-                order = self.sort_mode.to_partition_order_by()
-            )
-        } else {
-            format!(
-                r#"
-                SELECT
-                    regexp_extract(filename, '.*/([^/]+)/[^/]+\.parquet$', 1) as partition,
-                    SUM(size) as total_size,
-                    MAX(atime) as latest_atime,
-                    COUNT(*) as file_count,
-                    MAX(mtime) as latest_mtime,
-                    MAX(ctime) as latest_ctime,
-                    CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
-                    CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
-                    MIN(mode) as min_mode
-                FROM read_parquet('{glob}', filename=true)
-                GROUP BY partition
-                HAVING partition IS NOT NULL AND partition != '' AND partition != '{root}'
-                ORDER BY {order}
-                "#,
-                glob = glob,
-                root = ROOT_PARTITION,
-                order = self.sort_mode.to_partition_order_by()
-            )
-        };
+    /// Query the partition list (with __root__ files merged in as individual entries).
+    fn query_partition_entries(&self) -> Result<Vec<DirEntry>> {
+        let mut conditions = self.conditions();
+        // Exclude __root__ — its files are merged as individual entries
+        conditions.push(format!("partition IS NOT NULL AND partition != '' AND partition != '{}'", ROOT_PARTITION));
 
-        self.entries.clear();
+        let sql = format!(
+            r#"
+            SELECT partition, {aggregates}
+            FROM {source}
+            WHERE {conditions}
+            GROUP BY partition
+            ORDER BY {order}
+            "#,
+            aggregates = self.aggregate_columns(),
+            source = self.all_partitions_source(),
+            conditions = conditions.join(" AND "),
+            order = self.sort_mode.to_partition_order_by()
+        );
+
+        let mut entries = Vec::new();
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
-
         while let Some(row) = rows.next()? {
             let name: String = row.get(0)?;
-            let total_size: i64 = row.get(1)?;
-            let latest_atime: i64 = row.get(2)?;
-            let file_count: i64 = row.get(3)?;
-            let latest_mtime: i64 = row.get(4)?;
-            let latest_ctime: i64 = row.get(5)?;
-            let uid: i32 = row.get(6)?;
-            let gid: i32 = row.get(7)?;
-            let mode: i32 = row.get(8)?;
-
-            self.entries.push(DirEntry {
-                name: name.clone(),
-                path: name,
-                is_dir: true,
-                total_size,
-                file_count,
-                latest_atime,
-                latest_mtime,
-                latest_ctime,
-                uid,
-                gid,
-                mode,
-            });
+            entries.push(Self::read_stats(row, 1, name.clone(), name, true)?);
         }
 
         // Merge individual files from the __root__ partition
         let root_files = self.query_root_files()?;
         if !root_files.is_empty() {
-            self.entries.extend(root_files);
-            Self::sort_entries(&mut self.entries, self.sort_mode);
+            entries.extend(root_files);
+            Self::sort_entries(&mut entries, self.sort_mode);
         }
-        
-        self.status = format!("{} entries loaded in {:.2}s", self.entries.len(), start.elapsed().as_secs_f64());
-        self.loading = false;
-        Ok(())
+        Ok(entries)
     }
-    
-    /// Discover the common root path for a partition
-    fn discover_partition_root(&self, partition: &str) -> Result<String> {
-        let glob = format!("{}/{}/*.parquet", self.index_path.display(), partition);
-        
-        // Get the shortest path to find the common root
-        let sql = format!(
-            "SELECT path FROM read_parquet('{}') ORDER BY length(path) LIMIT 1",
-            glob
-        );
-        
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query([])?;
-        
-        if let Some(row) = rows.next()? {
-            let sample_path: String = row.get(0)?;
-            // Find the directory containing this file
-            if let Some(pos) = sample_path.rfind('/') {
-                return Ok(sample_path[..pos].to_string());
-            }
-        }
-        
-        Ok(String::new())
-    }
-    
-    /// Load directory contents for the current path
-    fn load_directory(&mut self) -> Result<()> {
-        self.loading = true;
-        let start = Instant::now();
-        
-        let partition = self.current_partition.as_ref().unwrap();
-        let glob = format!("{}/{}/*.parquet", self.index_path.display(), partition);
-        
-        // If we don't have a partition root yet, discover it
-        if self.partition_root.is_empty() {
-            self.partition_root = self.discover_partition_root(partition)?;
-            self.current_path = self.partition_root.clone();
-        }
-        
-        // Build the path prefix we're looking at (with trailing slash for LIKE)
-        let prefix = format!("{}/", self.current_path);
-        
-        // Query to get entries at this level
-        // We extract the next path component after the current path prefix
-        let prefix_len = prefix.len();
-        
-        // Build filter conditions
-        let filter_clause = self.filters.to_where_clause();
-        let file_filter = if filter_clause.is_empty() {
-            format!("path LIKE '{}%'", prefix)
-        } else {
-            format!("path LIKE '{}%' AND {}", prefix, filter_clause)
+
+    /// Query the entries (subdirectories and files) directly under `path` in a partition.
+    fn query_directory_entries(&self, partition: &str, path: &str) -> Result<Vec<DirEntry>> {
+        let Some(source) = self.partition_source(partition)? else {
+            return Ok(Vec::new());
         };
-        
+
+        // Path prefix we're looking at (with trailing slash for LIKE).
+        // We extract the next path component after it.
+        let prefix = format!("{}/", path);
+        let prefix_len = prefix.len();
+
+        let mut conditions = vec![format!("starts_with(path, {})", sql_quote(&prefix))];
+        conditions.extend(self.conditions());
+
         let order_by = self.sort_mode.to_order_by(self.sort_mode == SortMode::Name);
-        
+
         let sql = format!(
             r#"
             WITH files AS (
-                SELECT path, size, atime, mtime, ctime, uid, gid, mode
-                FROM read_parquet('{glob}')
-                WHERE {file_filter}
+                SELECT * FROM {source}
+                WHERE {conditions}
             ),
             components AS (
                 SELECT
-                    path, size, atime, mtime, ctime, uid, gid, mode,
+                    *,
                     CASE
                         WHEN position('/' IN substr(path, {prefix_len} + 1)) > 0
                         THEN substr(path, {prefix_len} + 1, position('/' IN substr(path, {prefix_len} + 1)) - 1)
@@ -1009,74 +1201,65 @@ impl App {
             SELECT
                 component,
                 bool_or(is_dir) as is_dir,
-                SUM(size) as total_size,
-                COUNT(*) as file_count,
-                MAX(atime) as latest_atime,
-                MAX(mtime) as latest_mtime,
-                MAX(ctime) as latest_ctime,
-                CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
-                CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
-                MIN(mode) as min_mode
+                {aggregates}
             FROM components
             WHERE component != '' AND component IS NOT NULL
             GROUP BY component
             ORDER BY {order_by}
             "#,
-            glob = glob,
-            file_filter = file_filter,
-            prefix_len = prefix_len,
-            order_by = order_by
+            conditions = conditions.join(" AND "),
+            aggregates = self.aggregate_columns(),
         );
 
-        self.entries.clear();
-
-        // Add parent entry (always show ".." to go back)
-        self.entries.push(DirEntry {
-            name: "..".to_string(),
-            path: "..".to_string(),
-            is_dir: true,
-            total_size: 0,
-            file_count: 0,
-            latest_atime: 0,
-            latest_mtime: 0,
-            latest_ctime: 0,
-            uid: -1,
-            gid: -1,
-            mode: -1,
-        });
-
+        let mut entries = Vec::new();
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
-
         while let Some(row) = rows.next()? {
             let component: String = row.get(0)?;
             let is_dir: bool = row.get(1)?;
-            let total_size: i64 = row.get(2)?;
-            let file_count: i64 = row.get(3)?;
-            let latest_atime: i64 = row.get(4)?;
-            let latest_mtime: i64 = row.get(5)?;
-            let latest_ctime: i64 = row.get(6)?;
-            let uid: i32 = row.get(7)?;
-            let gid: i32 = row.get(8)?;
-            let mode: i32 = row.get(9)?;
-
-            self.entries.push(DirEntry {
-                name: component.clone(),
-                path: format!("{}/{}", self.current_path, component),
-                is_dir,
-                total_size,
-                file_count,
-                latest_atime,
-                latest_mtime,
-                latest_ctime,
-                uid,
-                gid,
-                mode,
-            });
+            let entry_path = format!("{}/{}", path, component);
+            entries.push(Self::read_stats(row, 2, component, entry_path, is_dir)?);
         }
-        
+        Ok(entries)
+    }
+
+    /// Load the list of partitions
+    fn load_partitions(&mut self) -> Result<()> {
+        self.loading = true;
+        let start = Instant::now();
+
+        self.entries = self.query_partition_entries()?;
+
+        self.status = format!("{} entries loaded in {:.2}s", self.entries.len(), start.elapsed().as_secs_f64());
+        self.loading = false;
+        Ok(())
+    }
+
+    /// Root directory of a partition (`<index_root>/<partition>`).
+    fn partition_root_path(&self, partition: &str) -> String {
+        format!("{}/{}", self.index_root, partition)
+    }
+
+    /// Load directory contents for the current path
+    fn load_directory(&mut self) -> Result<()> {
+        self.loading = true;
+        let start = Instant::now();
+
+        let partition = self.current_partition.clone().unwrap();
+
+        // If we don't have a partition root yet, start there
+        if self.partition_root.is_empty() {
+            self.partition_root = self.partition_root_path(&partition);
+            self.current_path = self.partition_root.clone();
+        }
+
+        // Always show ".." to go back
+        let mut entries = vec![DirEntry::parent()];
+        entries.extend(self.query_directory_entries(&partition, &self.current_path)?);
+        self.entries = entries;
+
         let elapsed = start.elapsed().as_secs_f64();
-        let filter_info = if self.filters.is_active() { " (filtered)" } else { "" };
+        let filter_info = if self.is_filtered() { " (filtered)" } else { "" };
         self.status = format!("{} entries in {:.2}s{}", self.entries.len(), elapsed, filter_info);
         self.loading = false;
         Ok(())
@@ -1091,11 +1274,27 @@ impl App {
     /// Cycle pending sort to next mode
     fn sort_select_next(&mut self) {
         self.pending_sort = self.pending_sort.next();
+        while self.pending_sort.is_compare_only() && self.compare.is_none() {
+            self.pending_sort = self.pending_sort.next();
+        }
     }
 
     /// Cycle pending sort to previous mode
     fn sort_select_prev(&mut self) {
         self.pending_sort = self.pending_sort.prev();
+        while self.pending_sort.is_compare_only() && self.compare.is_none() {
+            self.pending_sort = self.pending_sort.prev();
+        }
+    }
+
+    /// Cycle which files are shown when comparing (all → changed → added → ...)
+    fn cycle_status_filter(&mut self) -> Result<()> {
+        if self.compare.is_none() {
+            self.status = "Change filter requires --compare".to_string();
+            return Ok(());
+        }
+        self.status_filter = self.status_filter.next();
+        self.reload()
     }
 
     /// Confirm sort selection and reload
@@ -1353,100 +1552,7 @@ impl App {
 
     /// Create a Column for the partition list.
     fn make_partition_column(&self) -> Result<Column> {
-        let glob = format!("{}/*/*.parquet", self.index_path.display());
-        let filter_clause = self.filters.to_where_clause();
-        // Exclude __root__ — its files are merged as individual entries
-        let having_clause = if filter_clause.is_empty() {
-            format!("HAVING partition IS NOT NULL AND partition != '' AND partition != '{}'", ROOT_PARTITION)
-        } else {
-            format!(
-                "HAVING partition IS NOT NULL AND partition != '' AND partition != '{}' AND SUM(CASE WHEN {} THEN 1 ELSE 0 END) > 0",
-                ROOT_PARTITION, filter_clause
-            )
-        };
-
-        let sql = if self.filters.is_active() {
-            format!(
-                r#"
-                SELECT
-                    regexp_extract(filename, '.*/([^/]+)/[^/]+\.parquet$', 1) as partition,
-                    SUM(CASE WHEN {filter} THEN size ELSE 0 END) as total_size,
-                    MAX(CASE WHEN {filter} THEN atime ELSE 0 END) as latest_atime,
-                    SUM(CASE WHEN {filter} THEN 1 ELSE 0 END) as file_count,
-                    MAX(CASE WHEN {filter} THEN mtime ELSE 0 END) as latest_mtime,
-                    MAX(CASE WHEN {filter} THEN ctime ELSE 0 END) as latest_ctime,
-                    CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
-                    CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
-                    MIN(mode) as min_mode
-                FROM read_parquet('{glob}', filename=true)
-                GROUP BY partition
-                {having}
-                ORDER BY {order}
-                "#,
-                filter = filter_clause,
-                glob = glob,
-                having = having_clause,
-                order = self.sort_mode.to_partition_order_by()
-            )
-        } else {
-            format!(
-                r#"
-                SELECT
-                    regexp_extract(filename, '.*/([^/]+)/[^/]+\.parquet$', 1) as partition,
-                    SUM(size) as total_size,
-                    MAX(atime) as latest_atime,
-                    COUNT(*) as file_count,
-                    MAX(mtime) as latest_mtime,
-                    MAX(ctime) as latest_ctime,
-                    CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
-                    CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
-                    MIN(mode) as min_mode
-                FROM read_parquet('{glob}', filename=true)
-                GROUP BY partition
-                HAVING partition IS NOT NULL AND partition != '' AND partition != '{root}'
-                ORDER BY {order}
-                "#,
-                glob = glob,
-                root = ROOT_PARTITION,
-                order = self.sort_mode.to_partition_order_by()
-            )
-        };
-
-        let mut entries = Vec::new();
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query([])?;
-
-        while let Some(row) = rows.next()? {
-            let name: String = row.get(0)?;
-            let total_size: i64 = row.get(1)?;
-            let latest_atime: i64 = row.get(2)?;
-            let file_count: i64 = row.get(3)?;
-            let latest_mtime: i64 = row.get(4)?;
-            let latest_ctime: i64 = row.get(5)?;
-            let uid: i32 = row.get(6)?;
-            let gid: i32 = row.get(7)?;
-            let mode: i32 = row.get(8)?;
-            entries.push(DirEntry {
-                name: name.clone(),
-                path: name,
-                is_dir: true,
-                total_size,
-                file_count,
-                latest_atime,
-                latest_mtime,
-                latest_ctime,
-                uid,
-                gid,
-                mode,
-            });
-        }
-
-        // Merge individual files from the __root__ partition
-        let root_files = self.query_root_files()?;
-        if !root_files.is_empty() {
-            entries.extend(root_files);
-            Self::sort_entries(&mut entries, self.sort_mode);
-        }
+        let entries = self.query_partition_entries()?;
 
         let mut list_state = ListState::default();
         if !entries.is_empty() {
@@ -1465,7 +1571,7 @@ impl App {
 
     /// Create a Column for a partition's root directory.
     fn make_partition_root_column(&self, partition: &str) -> Result<Column> {
-        let partition_root = self.discover_partition_root(partition)?;
+        let partition_root = self.partition_root_path(partition);
         self.make_directory_column_tree(partition, &partition_root, &partition_root)
     }
 
@@ -1476,91 +1582,7 @@ impl App {
         partition_root: &str,
         path: &str,
     ) -> Result<Column> {
-        let glob = format!("{}/{}/*.parquet", self.index_path.display(), partition);
-        let prefix = format!("{}/", path);
-        let prefix_len = prefix.len();
-
-        let filter_clause = self.filters.to_where_clause();
-        let file_filter = if filter_clause.is_empty() {
-            format!("path LIKE '{}%'", prefix)
-        } else {
-            format!("path LIKE '{}%' AND {}", prefix, filter_clause)
-        };
-
-        let order_by = self.sort_mode.to_order_by(self.sort_mode == SortMode::Name);
-
-        let sql = format!(
-            r#"
-            WITH files AS (
-                SELECT path, size, atime, mtime, ctime, uid, gid, mode
-                FROM read_parquet('{glob}')
-                WHERE {file_filter}
-            ),
-            components AS (
-                SELECT
-                    path, size, atime, mtime, ctime, uid, gid, mode,
-                    CASE
-                        WHEN position('/' IN substr(path, {prefix_len} + 1)) > 0
-                        THEN substr(path, {prefix_len} + 1, position('/' IN substr(path, {prefix_len} + 1)) - 1)
-                        ELSE substr(path, {prefix_len} + 1)
-                    END as component,
-                    CASE
-                        WHEN position('/' IN substr(path, {prefix_len} + 1)) > 0 THEN true
-                        ELSE false
-                    END as is_dir
-                FROM files
-            )
-            SELECT
-                component,
-                bool_or(is_dir) as is_dir,
-                SUM(size) as total_size,
-                COUNT(*) as file_count,
-                MAX(atime) as latest_atime,
-                MAX(mtime) as latest_mtime,
-                MAX(ctime) as latest_ctime,
-                CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
-                CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
-                MIN(mode) as min_mode
-            FROM components
-            WHERE component != '' AND component IS NOT NULL
-            GROUP BY component
-            ORDER BY {order_by}
-            "#,
-            glob = glob,
-            file_filter = file_filter,
-            prefix_len = prefix_len,
-            order_by = order_by
-        );
-
-        let mut entries = Vec::new();
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query([])?;
-
-        while let Some(row) = rows.next()? {
-            let component: String = row.get(0)?;
-            let is_dir: bool = row.get(1)?;
-            let total_size: i64 = row.get(2)?;
-            let file_count: i64 = row.get(3)?;
-            let latest_atime: i64 = row.get(4)?;
-            let latest_mtime: i64 = row.get(5)?;
-            let latest_ctime: i64 = row.get(6)?;
-            let uid: i32 = row.get(7)?;
-            let gid: i32 = row.get(8)?;
-            let mode: i32 = row.get(9)?;
-            entries.push(DirEntry {
-                name: component.clone(),
-                path: format!("{}/{}", path, component),
-                is_dir,
-                total_size,
-                file_count,
-                latest_atime,
-                latest_mtime,
-                latest_ctime,
-                uid,
-                gid,
-                mode,
-            });
-        }
+        let entries = self.query_directory_entries(partition, path)?;
 
         let title = path.rsplit('/').next().unwrap_or(partition).to_string();
 
@@ -1613,6 +1635,7 @@ impl App {
                 path: String,
                 size: i64,
                 atime: i64,
+                size_old: Option<i64>,
             },
             None,
         }
@@ -1635,6 +1658,7 @@ impl App {
                             path: entry.path.clone(),
                             size: entry.total_size,
                             atime: entry.latest_atime,
+                            size_old: (entry.files_old > 0).then_some(entry.size_old),
                         }
                     }
                 } else {
@@ -1656,8 +1680,12 @@ impl App {
                 };
                 self.columns.push(new_col);
             }
-            PreviewAction::File { path, size, atime } => {
-                self.file_preview = Some(Self::load_file_preview(&path, size, atime));
+            PreviewAction::File { path, size, atime, size_old } => {
+                let mut preview = Self::load_file_preview(&path, size, atime);
+                if self.compare.is_some() {
+                    preview.size_old = size_old;
+                }
+                self.file_preview = Some(preview);
             }
             PreviewAction::None => {}
         }
@@ -1684,6 +1712,7 @@ impl App {
                 path: path.to_string(),
                 size,
                 atime,
+                size_old: None,
                 type_description: "(unreadable)".to_string(),
                 is_text: false,
                 lines: VecDeque::new(),
@@ -1745,6 +1774,7 @@ impl App {
             path: path.to_string(),
             size,
             atime,
+            size_old: None,
             type_description,
             is_text,
             lines,
@@ -2083,6 +2113,9 @@ fn main() -> Result<()> {
     // Parse sort mode
     let sort_mode: SortMode = args.sort.parse()
         .map_err(|e: String| anyhow::anyhow!(e))?;
+    if sort_mode.is_compare_only() && args.compare.is_none() {
+        anyhow::bail!("--sort {} requires --compare", sort_mode);
+    }
     
     // Build filters from CLI args
     let filters = QueryFilters::new()
@@ -2096,9 +2129,29 @@ fn main() -> Result<()> {
     
     // Connect to DuckDB
     let conn = Connection::open_in_memory()?;
-    
+
+    let partitions = list_partitions(&index_path)?;
+    let index_root = discover_index_root(&conn, &index_path, &partitions)?;
+
+    let compare = match args.compare {
+        Some(ref old_path) => {
+            let old_index = old_path.canonicalize()
+                .with_context(|| format!("Comparison index not found: {}", old_path.display()))?;
+            let old_partitions = list_partitions(&old_index)?;
+            let old_root = discover_index_root(&conn, &old_index, &old_partitions)?;
+            Some(Compare {
+                old: DiffSide { index: old_index, root: old_root },
+                new: DiffSide { index: index_path.clone(), root: index_root.clone() },
+                old_partitions: old_partitions.into_iter().collect(),
+                new_partitions: partitions.into_iter().collect(),
+                tables: RefCell::new(HashMap::new()),
+            })
+        }
+        None => None,
+    };
+
     // Initialize app
-    let mut app = App::new(conn, index_path, args.partition, filters, sort_mode)?;
+    let mut app = App::new(conn, index_path, index_root, compare, args.partition, filters, sort_mode)?;
     
     // Setup terminal
     enable_raw_mode()?;
@@ -2263,6 +2316,12 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                     KeyCode::Char('x') => app.toggle_mode(),
                     // Sort mode selection (both modes)
                     KeyCode::Char('s') => app.start_sort_select(),
+                    // Cycle change filter (compare mode)
+                    KeyCode::Char('d') => {
+                        if let Err(e) = app.cycle_status_filter() {
+                            app.status = format!("Error: {}", e);
+                        }
+                    }
                     // Filter inputs (both modes)
                     KeyCode::Char('/') => app.start_input(InputMode::Pattern),
                     KeyCode::Char('o') => app.start_input(InputMode::OlderThan(app.timestamp_col)),
@@ -2394,6 +2453,7 @@ fn render_help_overlay(f: &mut Frame) {
         Line::from(vec![Span::raw("?    this help           "), Span::styled(">", Style::default().fg(Color::Cyan)), Span::raw("   min size")]),
         Line::from(vec![Span::raw("                         "), Span::styled("<", Style::default().fg(Color::Cyan)), Span::raw("   max size")]),
         Line::from(vec![Span::raw("                         "), Span::styled("c", Style::default().fg(Color::Cyan)), Span::raw("   clear filters")]),
+        Line::from(vec![Span::raw("                         "), Span::styled("d", Style::default().fg(Color::Cyan)), Span::raw("   cycle changes shown (--compare)")]),
         Line::from(""),
         Line::from(Span::styled("  Press any key to close", Style::default().fg(Color::DarkGray))),
     ];
@@ -2439,10 +2499,16 @@ fn render_list_content(f: &mut Frame, app: &App, area: Rect) {
     };
 
     // Pre-compute formatted strings and find max widths dynamically
+    let comparing = app.compare.is_some();
     struct EntryFmt {
         name: String,
+        name_style: Style,
         size: String,
+        delta: String,
+        delta_style: Style,
         count: String,
+        dfiles: String,
+        dfiles_style: Style,
         ts: String,
         uid: String,
         gid: String,
@@ -2456,8 +2522,21 @@ fn render_list_content(f: &mut Frame, app: &App, area: Rect) {
         } else {
             "  "
         };
-        let name = format!("{}{}", prefix, entry.name);
         let is_blank = entry.name == "..";
+        let marker = if comparing && !is_blank { entry.change_marker() } else { ' ' };
+        let name = if comparing {
+            format!("{} {}{}", marker, prefix, entry.name)
+        } else {
+            format!("{}{}", prefix, entry.name)
+        };
+        let name_style = marker_style(marker);
+        let (delta, dfiles) = if comparing && !is_blank {
+            (format_size_delta(entry), format_count_delta(entry.files_delta()))
+        } else {
+            (String::new(), String::new())
+        };
+        let delta_style = delta_style(entry.size_delta());
+        let dfiles_style = self::delta_style(entry.files_delta());
 
         let size = if is_blank { String::new() } else { format_bytes(entry.total_size as u64) };
         let count = if is_blank { String::new() } else { format_file_count(entry.file_count) };
@@ -2471,18 +2550,21 @@ fn render_list_content(f: &mut Frame, app: &App, area: Rect) {
         let uid = if is_blank || !app.visible_extras.uid { String::new() } else { format_uid(entry.uid, entry.is_dir) };
         let gid = if is_blank || !app.visible_extras.gid { String::new() } else { format_gid(entry.gid, entry.is_dir) };
         let mode_s = if is_blank || !app.visible_extras.mode { String::new() } else { format_mode(entry.mode, entry.is_dir) };
-        EntryFmt { name, size, count, ts, uid, gid, mode_s }
+        EntryFmt { name, name_style, size, delta, delta_style, count, dfiles, dfiles_style, ts, uid, gid, mode_s }
     }).collect();
 
     // Calculate dynamic column widths based on content (with minimum widths)
     let size_width  = formatted.iter().map(|f| f.size.len()).max().unwrap_or(0).max(10);
+    let delta_width = if comparing { formatted.iter().map(|f| f.delta.len()).max().unwrap_or(0).max(10) } else { 0 };
     let count_width = formatted.iter().map(|f| f.count.len()).max().unwrap_or(0).max(8);
+    let dfiles_width = if comparing { formatted.iter().map(|f| f.dfiles.len()).max().unwrap_or(0).max(6) } else { 0 };
     let ts_width    = formatted.iter().map(|f| f.ts.len()).max().unwrap_or(0).max(12);
     let uid_width   = if app.visible_extras.uid  { formatted.iter().map(|f| f.uid.len()).max().unwrap_or(0).max(4).max("user".len()) } else { 0 };
     let gid_width   = if app.visible_extras.gid  { formatted.iter().map(|f| f.gid.len()).max().unwrap_or(0).max(5).max("group".len()) } else { 0 };
     let mode_width  = if app.visible_extras.mode { formatted.iter().map(|f| f.mode_s.len()).max().unwrap_or(0).max(6) } else { 0 };
 
-    let extra_cols = [uid_width, gid_width, mode_width].iter().filter(|&&w| w > 0).map(|&w| w + 2).sum::<usize>();
+    let extra_cols = [uid_width, gid_width, mode_width, delta_width, dfiles_width]
+        .iter().filter(|&&w| w > 0).map(|&w| w + 2).sum::<usize>();
 
     // Calculate available width for names
     let area_width = area.width.saturating_sub(2) as usize;
@@ -2497,30 +2579,32 @@ fn render_list_content(f: &mut Frame, app: &App, area: Rect) {
             f.name.clone()
         };
 
-        let mut line = format!(
-            "{:<name_width$}  {:>size_width$}  {:>count_width$}  {:>ts_width$}",
-            name_display, f.size, f.count, f.ts,
-            name_width = name_width,
-            size_width = size_width,
-            count_width = count_width,
-            ts_width = ts_width,
-        );
-        if app.visible_extras.uid  { line += &format!("  {:>uid_width$}",  f.uid,    uid_width  = uid_width);  }
-        if app.visible_extras.gid  { line += &format!("  {:>gid_width$}",  f.gid,    gid_width  = gid_width);  }
-        if app.visible_extras.mode { line += &format!("  {:>mode_width$}", f.mode_s, mode_width = mode_width); }
+        let mut spans = vec![
+            Span::styled(format!("{:<name_width$}", name_display), f.name_style),
+            Span::raw(format!("  {:>size_width$}", f.size)),
+        ];
+        if comparing {
+            spans.push(Span::styled(format!("  {:>delta_width$}", f.delta), f.delta_style));
+        }
+        spans.push(Span::raw(format!("  {:>count_width$}", f.count)));
+        if comparing {
+            spans.push(Span::styled(format!("  {:>dfiles_width$}", f.dfiles), f.dfiles_style));
+        }
+        let mut rest = format!("  {:>ts_width$}", f.ts);
+        if app.visible_extras.uid  { rest += &format!("  {:>uid_width$}",  f.uid,    uid_width  = uid_width);  }
+        if app.visible_extras.gid  { rest += &format!("  {:>gid_width$}",  f.gid,    gid_width  = gid_width);  }
+        if app.visible_extras.mode { rest += &format!("  {:>mode_width$}", f.mode_s, mode_width = mode_width); }
+        spans.push(Span::raw(rest));
 
-        ListItem::new(line)
+        ListItem::new(Line::from(spans))
     }).collect();
 
     // Build header string using same widths as data rows
-    let mut header = format!(
-        "{:<name_width$}  {:>size_width$}  {:>count_width$}  {:>ts_width$}",
-        "name", "size", "files", app.timestamp_col.label(),
-        name_width = name_width,
-        size_width = size_width,
-        count_width = count_width,
-        ts_width = ts_width,
-    );
+    let mut header = format!("{:<name_width$}  {:>size_width$}", "name", "size");
+    if comparing { header += &format!("  {:>delta_width$}", "Δsize"); }
+    header += &format!("  {:>count_width$}", "files");
+    if comparing { header += &format!("  {:>dfiles_width$}", "Δfiles"); }
+    header += &format!("  {:>ts_width$}", app.timestamp_col.label());
     if app.visible_extras.uid  { header += &format!("  {:>uid_width$}",  "user",  uid_width  = uid_width);  }
     if app.visible_extras.gid  { header += &format!("  {:>gid_width$}",  "group", gid_width  = gid_width);  }
     if app.visible_extras.mode { header += &format!("  {:>mode_width$}", "mode",  mode_width = mode_width); }
@@ -2626,9 +2710,13 @@ fn render_tree_content(f: &mut Frame, app: &App, area: Rect) {
         let highlight_width = 2;
         let content_width = col_inner_width.saturating_sub(highlight_width);
 
+        let comparing = app.compare.is_some();
         struct TFmt {
             name: String,
+            name_style: Style,
             size: String,
+            delta: String,
+            delta_style: Style,
             count: String,
             ts: String,
             uid: String,
@@ -2637,7 +2725,15 @@ fn render_tree_content(f: &mut Frame, app: &App, area: Rect) {
         }
         let formatted: Vec<TFmt> = col.entries.iter().map(|entry| {
             let prefix = if entry.is_dir { "▸ " } else { "  " };
-            let name = format!("{}{}", prefix, entry.name);
+            let marker = if comparing { entry.change_marker() } else { ' ' };
+            let name = if comparing {
+                format!("{}{}{}", marker, prefix, entry.name)
+            } else {
+                format!("{}{}", prefix, entry.name)
+            };
+            let name_style = marker_style(marker);
+            let delta = if comparing { format_size_delta(entry) } else { String::new() };
+            let delta_style = delta_style(entry.size_delta());
             let size = format_bytes(entry.total_size as u64);
             let count = format_file_count(entry.file_count);
             let ts = match app.timestamp_col {
@@ -2648,17 +2744,19 @@ fn render_tree_content(f: &mut Frame, app: &App, area: Rect) {
             let uid = if app.visible_extras.uid  { format_uid(entry.uid, entry.is_dir) }  else { String::new() };
             let gid = if app.visible_extras.gid  { format_gid(entry.gid, entry.is_dir) }  else { String::new() };
             let mode_s = if app.visible_extras.mode { format_mode(entry.mode, entry.is_dir) } else { String::new() };
-            TFmt { name, size, count, ts, uid, gid, mode_s }
+            TFmt { name, name_style, size, delta, delta_style, count, ts, uid, gid, mode_s }
         }).collect();
 
         let size_w  = formatted.iter().map(|f| f.size.len()).max().unwrap_or(0).max(6);
-        let count_w = formatted.iter().map(|f| f.count.len()).max().unwrap_or(0).max(6);
+        let delta_w = if comparing { formatted.iter().map(|f| f.delta.len()).max().unwrap_or(0).max(6) } else { 0 };
+        // Columns are narrow: when comparing, Δsize takes the place of the file count
+        let count_w = if comparing { 0 } else { formatted.iter().map(|f| f.count.len()).max().unwrap_or(0).max(6) };
         let ts_w    = formatted.iter().map(|f| f.ts.len()).max().unwrap_or(0).max(6);
         let uid_w   = if app.visible_extras.uid  { formatted.iter().map(|f| f.uid.len()).max().unwrap_or(0).max("user".len()) } else { 0 };
         let gid_w   = if app.visible_extras.gid  { formatted.iter().map(|f| f.gid.len()).max().unwrap_or(0).max("group".len()) } else { 0 };
         let mode_w  = if app.visible_extras.mode { formatted.iter().map(|f| f.mode_s.len()).max().unwrap_or(0).max(5) } else { 0 };
-        let extra_w = [uid_w, gid_w, mode_w].iter().filter(|&&w| w > 0).map(|&w| w + 2).sum::<usize>();
-        let stat_cols = size_w + count_w + ts_w + extra_w + 6;
+        let extra_w = [uid_w, gid_w, mode_w, delta_w].iter().filter(|&&w| w > 0).map(|&w| w + 2).sum::<usize>();
+        let stat_cols = size_w + count_w + ts_w + extra_w + if comparing { 4 } else { 6 };
         let name_max = content_width.saturating_sub(stat_cols);
 
         let items: Vec<ListItem> = formatted.iter().map(|f| {
@@ -2670,19 +2768,24 @@ fn render_tree_content(f: &mut Frame, app: &App, area: Rect) {
                 f.name.clone()
             };
 
-            let mut line = format!(
-                "{:<name_w$}  {:>size_w$}  {:>count_w$}  {:>ts_w$}",
-                name_display, f.size, f.count, f.ts,
-                name_w = name_max,
-                size_w = size_w,
-                count_w = count_w,
-                ts_w = ts_w,
-            );
-            if app.visible_extras.uid  { line += &format!("  {:>uid_w$}",  f.uid,    uid_w  = uid_w);  }
-            if app.visible_extras.gid  { line += &format!("  {:>gid_w$}",  f.gid,    gid_w  = gid_w);  }
-            if app.visible_extras.mode { line += &format!("  {:>mode_w$}", f.mode_s, mode_w = mode_w); }
+            let mut spans = vec![
+                Span::styled(format!("{:<name_w$}", name_display, name_w = name_max), f.name_style),
+                Span::raw(format!("  {:>size_w$}", f.size)),
+            ];
+            if comparing {
+                spans.push(Span::styled(format!("  {:>delta_w$}", f.delta), f.delta_style));
+            }
+            let mut rest = if comparing {
+                format!("  {:>ts_w$}", f.ts)
+            } else {
+                format!("  {:>count_w$}  {:>ts_w$}", f.count, f.ts)
+            };
+            if app.visible_extras.uid  { rest += &format!("  {:>uid_w$}",  f.uid,    uid_w  = uid_w);  }
+            if app.visible_extras.gid  { rest += &format!("  {:>gid_w$}",  f.gid,    gid_w  = gid_w);  }
+            if app.visible_extras.mode { rest += &format!("  {:>mode_w$}", f.mode_s, mode_w = mode_w); }
+            spans.push(Span::raw(rest));
 
-            ListItem::new(line)
+            ListItem::new(Line::from(spans))
         }).collect();
 
         let title_style = if is_active {
@@ -2692,14 +2795,10 @@ fn render_tree_content(f: &mut Frame, app: &App, area: Rect) {
         };
 
         // Build header string using same widths as data rows
-        let mut col_header = format!(
-            "{:<name_w$}  {:>size_w$}  {:>count_w$}  {:>ts_w$}",
-            "name", "size", "files", app.timestamp_col.label(),
-            name_w = name_max,
-            size_w = size_w,
-            count_w = count_w,
-            ts_w = ts_w,
-        );
+        let mut col_header = format!("{:<name_w$}  {:>size_w$}", "name", "size", name_w = name_max);
+        if comparing { col_header += &format!("  {:>delta_w$}", "Δsize"); }
+        if !comparing { col_header += &format!("  {:>count_w$}", "files"); }
+        col_header += &format!("  {:>ts_w$}", app.timestamp_col.label());
         if app.visible_extras.uid  { col_header += &format!("  {:>uid_w$}",  "user",  uid_w  = uid_w);  }
         if app.visible_extras.gid  { col_header += &format!("  {:>gid_w$}",  "group", gid_w  = gid_w);  }
         if app.visible_extras.mode { col_header += &format!("  {:>mode_w$}", "mode",  mode_w = mode_w); }
@@ -2779,6 +2878,16 @@ fn render_file_preview_pane(f: &mut Frame, app: &App, area: Rect) {
         format!("  Size: {}", format_bytes(preview.size as u64)),
         Style::default().fg(Color::Green),
     )));
+    if app.compare.is_some() {
+        let was = match preview.size_old {
+            Some(old) => format!("{} ({})", format_bytes(old as u64), format_bytes_signed(preview.size - old)),
+            None => "(new file)".to_string(),
+        };
+        text_lines.push(Line::from(Span::styled(
+            format!("  Was:  {}", was),
+            Style::default().fg(Color::Magenta),
+        )));
+    }
     text_lines.push(Line::from(Span::styled(
         format!("  Atime: {}", app.format_atime(preview.atime)),
         Style::default().fg(Color::Cyan),
@@ -2826,6 +2935,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         // Build sort selector display with short names
         let options: Vec<String> = SortMode::ALL
             .iter()
+            .filter(|m| app.compare.is_some() || !m.is_compare_only())
             .map(|m| {
                 if *m == app.pending_sort {
                     format!("▶ {} ◀", m)
@@ -2875,10 +2985,16 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                         TimestampCol::Mtime => app.format_atime(entry.latest_mtime),
                         TimestampCol::Ctime => app.format_atime(entry.latest_ctime),
                     };
+                    let delta_str = if app.compare.is_some() {
+                        format!(" ({})", format_bytes_signed(entry.size_delta()))
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        "{} │ {} │ {} │ {}",
+                        "{} │ {}{} │ {} │ {}",
                         path_str,
                         format_bytes(entry.total_size as u64),
+                        delta_str,
                         format_file_count(entry.file_count),
                         ts_str
                     )
@@ -2911,15 +3027,27 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             format!(" [{}]", extras.join(","))
         };
 
+        let compare_str = match app.compare {
+            Some(ref cmp) => format!(
+                " │ vs {} show:{}",
+                cmp.old.index.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                app.status_filter.label(),
+            ),
+            None => String::new(),
+        };
+        let compare_keys = if app.compare.is_some() { " d:changes" } else { "" };
+
         format!(
-            " {}{} │ sort:{} {} {} {} │ q:quit jk:nav ←→:cd /:pat s:sort m:view t:{} ?:help c:clear",
+            " {}{}{} │ sort:{} {} {} {} │ q:quit jk:nav ←→:cd /:pat s:sort m:view t:{}{} ?:help c:clear",
             context_info,
             filter_str,
+            compare_str,
             app.sort_mode,
             mode_indicator,
             app.timestamp_col.label(),
             extras_str,
             app.timestamp_col.label(),
+            compare_keys,
         )
     };
 
