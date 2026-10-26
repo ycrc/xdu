@@ -10,7 +10,7 @@ use clap::Parser;
 use duckdb::Connection;
 use rayon::prelude::*;
 
-use xdu::{parse_size, QueryFilters};
+use xdu::{index_glob, parse_size, sql_quote, QueryFilters};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -30,7 +30,7 @@ struct Args {
     #[arg(short, long, value_name = "REGEX")]
     pattern: Option<String>,
 
-    /// Filter by partition (user directory name)
+    /// Filter by partition (e.g. a user directory, or a nested path like projects/big); includes nested partitions
     #[arg(short = 'u', long, value_name = "NAME")]
     partition: Option<String>,
 
@@ -97,11 +97,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("Index directory not found: {}", args.index.display()))?;
 
     // Build the glob pattern for Parquet files
-    let glob_pattern = if let Some(ref partition) = args.partition {
-        format!("{}/{}/*.parquet", index_path.display(), partition)
-    } else {
-        format!("{}/*/*.parquet", index_path.display())
-    };
+    let glob_pattern = sql_quote(&index_glob(&index_path, args.partition.as_deref()));
 
     // Connect to DuckDB (in-memory)
     let conn = Connection::open_in_memory()?;
@@ -126,7 +122,7 @@ fn main() -> Result<()> {
 
     // Query for matching files
     let sql = format!(
-        "SELECT path, size, atime FROM read_parquet('{}') {} {}",
+        "SELECT path, size, atime FROM read_parquet({}) {} {}",
         glob_pattern, where_clause, limit_clause
     );
 

@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use duckdb::Connection;
 
-use xdu::format_bytes;
+use xdu::{format_bytes, index_glob, sql_quote, top_level_key_sql};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -37,11 +37,11 @@ struct Args {
     #[arg(short = 'c', long)]
     total: bool,
 
-    /// Restrict to a single partition (user directory)
+    /// Restrict to a single partition (e.g. a user directory, or projects/big), including nested partitions
     #[arg(short = 'u', long, value_name = "NAME")]
     partition: Option<String>,
 
-    /// Path prefixes to summarize (default: all partitions)
+    /// Path prefixes to summarize (default: each top-level directory)
     paths: Vec<String>,
 
     /// Show help
@@ -59,11 +59,7 @@ fn main() -> Result<()> {
     let index_path = args.index.canonicalize()
         .with_context(|| format!("Index directory not found: {}", args.index.display()))?;
 
-    let glob = if let Some(ref p) = args.partition {
-        format!("{}/{}/*.parquet", index_path.display(), p)
-    } else {
-        format!("{}/*/*.parquet", index_path.display())
-    };
+    let glob = sql_quote(&index_glob(&index_path, args.partition.as_deref()));
 
     let conn = Connection::open_in_memory()?;
     let stdout = io::stdout();
@@ -72,7 +68,7 @@ fn main() -> Result<()> {
 
     if args.paths.is_empty() {
         if args.summarize {
-            let sql = format!("SELECT COALESCE(SUM(size), 0) FROM read_parquet('{}')", glob);
+            let sql = format!("SELECT COALESCE(SUM(size), 0) FROM read_parquet({})", glob);
             let mut stmt = conn.prepare(&sql)?;
             let mut rows = stmt.query([])?;
             if let Some(row) = rows.next()? {
@@ -81,14 +77,15 @@ fn main() -> Result<()> {
                 writeln!(out, "{}\t.", fmt_size(total, args.human_readable))?;
             }
         } else {
+            // One line per top-level directory, with nested partitions folded in.
             let sql = format!(
-                "SELECT regexp_extract(filename, '.*/([^/]+)/[^/]+\\.parquet$', 1) as partition, \
+                "SELECT {} as partition, \
                  COALESCE(SUM(size), 0) as total_size \
-                 FROM read_parquet('{}', filename=true) \
+                 FROM read_parquet({}, filename=true) \
                  GROUP BY partition \
                  HAVING partition IS NOT NULL AND partition != '' \
                  ORDER BY partition",
-                glob
+                top_level_key_sql(&index_path), glob
             );
             let mut stmt = conn.prepare(&sql)?;
             let mut rows = stmt.query([])?;
@@ -103,7 +100,7 @@ fn main() -> Result<()> {
         for path in &args.paths {
             let path = path.trim_end_matches('/');
             let sql = format!(
-                "SELECT COALESCE(SUM(size), 0) FROM read_parquet('{}') \
+                "SELECT COALESCE(SUM(size), 0) FROM read_parquet({}) \
                  WHERE path LIKE '{}/%' OR path = '{}'",
                 glob, path, path
             );

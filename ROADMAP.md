@@ -148,7 +148,8 @@ TTY-connected users see real-time `indicatif` MultiProgress output:
 ### Hive-Partitioned Parquet
 
 The index is structured as `outdir/<partition>/<chunk>.parquet`, where partitions
-correspond to top-level subdirectories. This layout enables per-user queries without
+correspond to top-level subdirectories by default. Large directories can be split further
+(`--split`, `--split-depth`), which nests partitions as `outdir/<relative path>/`. This layout enables per-user queries without
 full-index scans and maps naturally to S3 object storage (Phase 3).
 
 ### Iceberg-Style Streaming (Phase 5)

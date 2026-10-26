@@ -2,7 +2,7 @@
 #![allow(clippy::collapsible_else_if)]
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{stdout, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -23,8 +23,9 @@ use ratatui::{
 };
 
 use xdu::{
-    diff_as_index_sql, discover_index_root, format_bytes, format_bytes_signed, format_count, list_partitions,
-    parse_size, sql_quote, DiffSide, QueryFilters, SortMode,
+    all_parquet_glob, diff_as_index_sql, diff_units, discover_index_root, format_bytes, format_bytes_signed,
+    format_count, list_partitions, parse_size, sql_quote, subtree_glob, top_level_key_sql, DiffSide, DiffUnit,
+    QueryFilters, SortMode,
 };
 
 /// Detect file type from magic bytes, shebangs, text content, and extension.
@@ -592,30 +593,24 @@ impl StatusFilter {
 struct Compare {
     old: DiffSide,
     new: DiffSide,
-    old_partitions: BTreeSet<String>,
-    new_partitions: BTreeSet<String>,
+    /// Top-level directory -> comparison unit covering its whole subtree
+    units: BTreeMap<String, DiffUnit>,
     /// Partition name -> temp table holding its materialized diff
     tables: RefCell<HashMap<String, String>>,
 }
 
 impl Compare {
     fn partitions(&self) -> impl Iterator<Item = &String> {
-        self.old_partitions.union(&self.new_partitions)
+        self.units.keys()
     }
 
     fn has_partition(&self, partition: &str) -> bool {
-        self.old_partitions.contains(partition) || self.new_partitions.contains(partition)
+        self.units.contains_key(partition)
     }
 
     /// Unmaterialized diff of one partition, shaped like an index.
     fn diff_sql(&self, partition: &str) -> String {
-        diff_as_index_sql(
-            &self.old,
-            &self.new,
-            partition,
-            self.old_partitions.contains(partition),
-            self.new_partitions.contains(partition),
-        )
+        diff_as_index_sql(&self.old, &self.new, &self.units[partition])
     }
 
     /// Name of a temp table holding the diff of `partition`, creating it on first use so
@@ -949,11 +944,11 @@ impl App {
                 Ok(Some(cmp.table(&self.conn, partition)?))
             }
             None => {
-                let dir = self.index_path.join(partition);
-                if !dir.is_dir() {
+                // Includes partitions nested below this one.
+                if !self.index_path.join(partition).is_dir() {
                     return Ok(None);
                 }
-                let glob = format!("{}/*.parquet", dir.display());
+                let glob = subtree_glob(&self.index_path, partition);
                 Ok(Some(format!("read_parquet({})", sql_quote(&glob))))
             }
         }
@@ -982,11 +977,11 @@ impl App {
                 }
             }
             None => {
-                let glob = format!("{}/*/*.parquet", self.index_path.display());
+                // Nested partitions are grouped under their top-level directory.
                 format!(
-                    "(SELECT *, regexp_extract(filename, '.*/([^/]+)/[^/]+\\.parquet$', 1) AS partition \
-                     FROM read_parquet({}, filename=true))",
-                    sql_quote(&glob)
+                    "(SELECT *, {} AS partition FROM read_parquet({}, filename=true))",
+                    top_level_key_sql(&self.index_path),
+                    sql_quote(&all_parquet_glob(&self.index_path))
                 )
             }
         }
@@ -2139,11 +2134,15 @@ fn main() -> Result<()> {
                 .with_context(|| format!("Comparison index not found: {}", old_path.display()))?;
             let old_partitions = list_partitions(&old_index)?;
             let old_root = discover_index_root(&conn, &old_index, &old_partitions)?;
+            // The view navigates by top-level directory, so compare whole subtrees.
+            let units = diff_units(&old_partitions, &partitions, false)
+                .into_iter()
+                .map(|u| (u.name.clone(), u))
+                .collect();
             Some(Compare {
                 old: DiffSide { index: old_index, root: old_root },
                 new: DiffSide { index: index_path.clone(), root: index_root.clone() },
-                old_partitions: old_partitions.into_iter().collect(),
-                new_partitions: partitions.into_iter().collect(),
+                units,
                 tables: RefCell::new(HashMap::new()),
             })
         }

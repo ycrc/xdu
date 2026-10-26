@@ -22,10 +22,10 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use rayon::ThreadPoolBuilder;
 
-use xdu::{format_bytes, format_count, format_speed, get_schema, parse_size, FileRecord, SizeMode};
-
-/// Special partition name for files directly in the top-level directory.
-const ROOT_PARTITION: &str = "__root__";
+use xdu::{
+    format_bytes, format_count, format_speed, get_schema, list_partitions, parse_size, resolve_split_points,
+    FileRecord, Manifest, SizeMode, SplitSpec, MANIFEST_VERSION, ROOT_PARTITION,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -35,8 +35,16 @@ const ROOT_PARTITION: &str = "__root__";
 Examples:
   xdu /data/scratch -o /index/scratch -j 8
   xdu /data/scratch -o /index/scratch --partition alice,bob
+  xdu /data/scratch -o /index/scratch --split 'projects/*'
+  xdu /data/scratch -o /index/scratch --split-depth 2
   xdu /data/scratch -o /index/scratch --apparent-size
-  xdu /data/scratch -o /index/scratch --block-size 128K"
+  xdu /data/scratch -o /index/scratch --block-size 128K
+
+Partitioning:
+  Each split point (a directory relative to DIR) gets its own partition, stored in
+  OUTDIR/<path>/. A file goes to the deepest split point containing it; files directly
+  in DIR go to OUTDIR/__root__/. By default every top-level directory is a split point.
+  The split settings are saved in OUTDIR/_xdu.json and reused by later runs."
 )]
 struct Args {
     /// Top-level directory to index
@@ -66,9 +74,27 @@ struct Args {
     #[arg(short = 'k', long, value_name = "SIZE")]
     block_size: Option<String>,
 
-    /// Index only specific partitions (top-level subdirectory names, comma-separated).
+    /// Index only specific partitions (comma-separated, e.g. alice,projects/big, or __root__).
     #[arg(short, long, value_name = "NAMES", value_delimiter = ',')]
     partition: Option<Vec<String>>,
+
+    /// With --partition, also re-index the partitions nested below the given ones.
+    #[arg(short, long, requires = "partition")]
+    recursive: bool,
+
+    /// Make every directory down to depth N its own partition (0 = only --split paths).
+    /// [default: the existing index's setting, or 1]
+    #[arg(long, value_name = "N")]
+    split_depth: Option<usize>,
+
+    /// Extra directories to make their own partitions (relative to DIR, comma-separated).
+    /// `*` and `?` match within a path component, e.g. 'projects/*'.
+    #[arg(long, value_name = "PATHS", value_delimiter = ',')]
+    split: Vec<String>,
+
+    /// Read --split paths from a file (one per line; blank lines and # comments ignored).
+    #[arg(long, value_name = "FILE")]
+    split_file: Option<PathBuf>,
 }
 
 /// Per-partition buffer that accumulates records and flushes to Parquet.
@@ -208,7 +234,15 @@ impl PartitionBuffer {
 struct WorkItem {
     path: PathBuf,
     partition: String,
-    max_depth: Option<usize>,
+    /// Depth of `path` below the crawl root.
+    depth: usize,
+}
+
+/// Split-point directories, which every walker must skip (they are crawled separately).
+struct SplitDirs {
+    paths: HashSet<PathBuf>,
+    /// Deepest split point below the crawl root; walkers stop checking below this.
+    max_depth: usize,
 }
 
 /// Statistics returned from a crawl operation.
@@ -231,7 +265,9 @@ fn crawl(
     buffsize: usize,
     size_mode: SizeMode,
     schema: &Arc<Schema>,
-    partition_filter: Option<&HashSet<String>>,
+    work_queue: VecDeque<WorkItem>,
+    split_dirs: Arc<SplitDirs>,
+    filter_desc: &str,
     is_tty: bool,
 ) -> Result<CrawlStats> {
     // Build shared rayon thread pool for jwalk walkers
@@ -241,51 +277,6 @@ fn crawl(
             .build()
             .context("Failed to build thread pool")?
     );
-
-    // Enumerate top-level entries to build work queue
-    let mut partition_items: Vec<WorkItem> = Vec::new();
-    let mut has_root_files = false;
-
-    for entry in fs::read_dir(top_dir)
-        .with_context(|| format!("Failed to read directory: {}", top_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        let ft = entry.file_type()?;
-
-        if ft.is_dir() {
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            if let Some(pf) = partition_filter
-                && !pf.contains(&name)
-            {
-                continue;
-            }
-            partition_items.push(WorkItem {
-                path,
-                partition: name,
-                max_depth: None,
-            });
-        } else if ft.is_file() || ft.is_symlink() {
-            has_root_files = true;
-        }
-    }
-
-    // Sort for deterministic output order
-    partition_items.sort_by(|a, b| a.partition.cmp(&b.partition));
-
-    // Build work queue: root files first (depth-limited), then partition subdirectories
-    let mut work_queue: VecDeque<WorkItem> = VecDeque::with_capacity(partition_items.len() + 1);
-
-    if has_root_files {
-        work_queue.push_back(WorkItem {
-            path: top_dir.to_path_buf(),
-            partition: ROOT_PARTITION.to_string(),
-            max_depth: Some(1),
-        });
-    }
-    for item in partition_items {
-        work_queue.push_back(item);
-    }
 
     let num_items = work_queue.len();
     if num_items == 0 {
@@ -297,14 +288,6 @@ fn crawl(
     if !is_tty {
         mp.set_draw_target(ProgressDrawTarget::hidden());
     }
-
-    let filter_desc = if let Some(pf) = partition_filter {
-        let mut names: Vec<_> = pf.iter().cloned().collect();
-        names.sort();
-        format!(" (partitions: {})", names.join(", "))
-    } else {
-        String::new()
-    };
 
     if is_tty {
         eprintln!("{:>12} {}{}", style("Indexing").green().bold(), top_dir.display(), filter_desc);
@@ -349,6 +332,7 @@ fn crawl(
                 let mp_ref = &mp;
                 let global_bar_ref = &global_bar;
                 let outdir = outdir.to_path_buf();
+                let split_dirs = split_dirs.clone();
 
                 s.spawn(move || -> Result<()> {
                     let bar_style = ProgressStyle::default_spinner()
@@ -370,14 +354,27 @@ fn crawl(
 
                         bar.set_message(format!("{}: scanning...", item.partition));
 
+                        // Leave split-point subdirectories to their own work items.
+                        let skip = split_dirs.clone();
+                        let base_depth = item.depth;
                         let walker = WalkDir::new(&item.path)
                             .parallelism(Parallelism::RayonExistingPool {
                                 pool: pool.clone(),
                                 busy_timeout: None,
                             })
-                            .max_depth(item.max_depth.unwrap_or(usize::MAX))
                             .skip_hidden(false)
-                            .follow_links(false);
+                            .follow_links(false)
+                            .process_read_dir(move |depth, dir, _, children| {
+                                // `depth` is None for the walk root itself, which must be kept.
+                                let Some(depth) = depth else { return };
+                                if base_depth + depth + 1 > skip.max_depth {
+                                    return;
+                                }
+                                children.retain(|child| match child {
+                                    Ok(e) => !(e.file_type.is_dir() && skip.paths.contains(&dir.join(&e.file_name))),
+                                    Err(_) => true,
+                                });
+                            });
 
                         let mut buffer = PartitionBuffer::new(
                             item.partition.clone(),
@@ -574,6 +571,44 @@ fn crawl(
     })
 }
 
+/// Name of a size mode, as recorded in the manifest.
+fn size_mode_name(mode: SizeMode) -> String {
+    match mode {
+        SizeMode::DiskUsage => "disk-usage".to_string(),
+        SizeMode::ApparentSize => "apparent-size".to_string(),
+        SizeMode::BlockRounded(n) => format!("block-rounded:{}", n),
+    }
+}
+
+/// True for chunk files written by xdu (`NNNNNN.parquet`).
+fn is_chunk_file(name: &str) -> bool {
+    name.strip_suffix(".parquet")
+        .is_some_and(|stem| stem.len() == 6 && stem.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Delete the chunk files of one partition, then any directories left empty up to the index root.
+/// Returns the number of chunks removed.
+fn remove_partition_chunks(outdir: &Path, key: &str) -> Result<usize> {
+    let dir = outdir.join(key);
+    let mut removed = 0;
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && is_chunk_file(&entry.file_name().to_string_lossy()) {
+            fs::remove_file(entry.path())
+                .with_context(|| format!("Failed to remove stale chunk: {}", entry.path().display()))?;
+            removed += 1;
+        }
+    }
+    let mut d = dir.as_path();
+    while d != outdir && fs::remove_dir(d).is_ok() {
+        match d.parent() {
+            Some(p) => d = p,
+            None => break,
+        }
+    }
+    Ok(removed)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let start_time = Instant::now();
@@ -599,18 +634,80 @@ fn main() -> Result<()> {
 
     let schema = get_schema();
 
-    // Build partition filter if specified
-    let partition_filter: Option<HashSet<String>> = args.partition.map(|p| p.into_iter().collect());
+    // Decide the split spec: command line, else the existing index's, else the default.
+    let existing = Manifest::load(&outdir)?;
+    let existing_spec = existing.as_ref().map(|m| m.split.clone()).unwrap_or_default();
+    let mut patterns = args.split.clone();
+    if let Some(ref file) = args.split_file {
+        let text = fs::read_to_string(file)
+            .with_context(|| format!("Failed to read split file: {}", file.display()))?;
+        patterns.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(String::from),
+        );
+    }
+    let spec = if args.split_depth.is_some() || !patterns.is_empty() {
+        SplitSpec { depth: args.split_depth.unwrap_or(1), patterns }.normalized()
+    } else {
+        existing_spec.normalized()
+    };
 
-    // Validate partition filter if specified
-    if let Some(ref pf) = partition_filter {
-        for partition_name in pf {
-            let partition_path = top_dir.join(partition_name);
-            if !partition_path.is_dir() {
-                anyhow::bail!("Partition '{}' not found in {}", partition_name, top_dir.display());
+    let existing_partitions = list_partitions(&outdir)?;
+    if args.partition.is_some() && !existing_partitions.is_empty() && !spec.same_layout(&existing_spec) {
+        anyhow::bail!(
+            "The split settings differ from those of the existing index in {}; \
+             run without --partition to rebuild it with the new layout",
+            outdir.display()
+        );
+    }
+    let size_mode_str = size_mode_name(size_mode);
+    if let Some(ref m) = existing
+        && args.partition.is_some()
+        && !m.size_mode.is_empty()
+        && m.size_mode != size_mode_str
+    {
+        eprintln!("warning: existing index uses size mode '{}', this run uses '{}'", m.size_mode, size_mode_str);
+    }
+
+    let (split_points, warnings) = resolve_split_points(&top_dir, &spec)?;
+    for w in &warnings {
+        eprintln!("warning: {}", w);
+    }
+
+    // One work item per partition: the root, then each split point.
+    let mut items: Vec<WorkItem> = vec![WorkItem { path: top_dir.clone(), partition: ROOT_PARTITION.to_string(), depth: 0 }];
+    items.extend(split_points.iter().map(|key| WorkItem {
+        path: top_dir.join(key),
+        partition: key.clone(),
+        depth: key.split('/').count(),
+    }));
+
+    let split_dirs = Arc::new(SplitDirs {
+        paths: split_points.iter().map(|key| top_dir.join(key)).collect(),
+        max_depth: split_points.iter().map(|key| key.split('/').count()).max().unwrap_or(0),
+    });
+
+    // Restrict to the requested partitions, if any.
+    let filter_desc = if let Some(ref wanted) = args.partition {
+        let wanted: Vec<String> = wanted.iter().map(|p| p.trim_matches('/').to_string()).collect();
+        for w in &wanted {
+            if !items.iter().any(|i| &i.partition == w) {
+                anyhow::bail!("Partition '{}' is not a split point in {}", w, top_dir.display());
             }
         }
-    }
+        items.retain(|i| {
+            wanted.iter().any(|w| {
+                &i.partition == w
+                    || (args.recursive && w != ROOT_PARTITION && i.partition.starts_with(&format!("{}/", w)))
+            })
+        });
+        let names: Vec<&str> = items.iter().map(|i| i.partition.as_str()).collect();
+        format!(" (partitions: {})", names.join(", "))
+    } else {
+        String::new()
+    };
 
     let stats = crawl(
         &top_dir,
@@ -619,9 +716,33 @@ fn main() -> Result<()> {
         args.buffsize,
         size_mode,
         &schema,
-        partition_filter.as_ref(),
+        items.into_iter().collect(),
+        split_dirs,
+        &filter_desc,
         is_tty,
     )?;
+
+    // A full crawl owns the whole index: drop partitions that are no longer split points.
+    if args.partition.is_none() {
+        let keep: HashSet<&str> = split_points.iter().map(String::as_str).chain([ROOT_PARTITION]).collect();
+        for key in &existing_partitions {
+            if !keep.contains(key.as_str()) {
+                let n = remove_partition_chunks(&outdir, key)?;
+                if n > 0 {
+                    eprintln!("Removed stale partition {} ({} chunks)", key, n);
+                }
+            }
+        }
+    }
+
+    Manifest {
+        version: MANIFEST_VERSION,
+        root: top_dir.to_string_lossy().to_string(),
+        split: spec,
+        size_mode: size_mode_str,
+    }
+    .save(&outdir)
+    .with_context(|| format!("Failed to write manifest in {}", outdir.display()))?;
 
     let elapsed = start_time.elapsed();
     let prune_info = if stats.pruned > 0 { format!(", pruned {} stale", stats.pruned) } else { String::new() };

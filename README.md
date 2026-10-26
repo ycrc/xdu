@@ -29,7 +29,8 @@ Traditional tools like `du` and `find` are designed for interactive, one-off que
 
 ### Hive-Partitioned Output
 
-The index is partitioned by top-level subdirectory. For a `/home` filesystem:
+By default the index is partitioned by top-level subdirectory (large directories can be
+split further; see [Nested Partitions](#nested-partitions)). For a `/home` filesystem:
 
 ```
 index/
@@ -46,6 +47,48 @@ This layout enables:
 - **Partition pruning**: Query a single user's data without scanning the entire index
 - **Parallel writes**: Each partition is processed independently
 - **Incremental updates**: Re-index individual partitions without rebuilding everything
+
+Files directly in the top-level directory go to `index/__root__/`. The index also
+contains `_xdu.json`, which records the crawl root and the split settings.
+
+### Nested Partitions
+
+When one top-level directory is much larger than the others, it can be split further.
+Each *split point* (a directory, relative to the crawled directory) gets its own
+partition at `index/<path>/`, and each file goes to the deepest split point containing it:
+
+```bash
+xdu /data -o /index/data --split 'projects/big,projects/big/*'
+```
+
+```
+index/
+├── _xdu.json
+├── __root__/000000.parquet         files directly in /data
+├── alice/000000.parquet            all of /data/alice
+├── projects/000000.parquet         /data/projects, except projects/big
+├── projects/big/000000.parquet     files directly in projects/big
+├── projects/big/x/000000.parquet   all of projects/big/x
+└── projects/big/y/000000.parquet   all of projects/big/y
+```
+
+- By default every top-level directory is a split point (`--split-depth 1`).
+  `--split-depth 2` splits every second-level directory too; `--split-depth 0` keeps
+  only the `--split` paths.
+- `--split` paths may use `*` and `?` within a component. `--split-file` reads them from
+  a file, one per line. Wildcards never cross a `/`, so `'a/*'` means the children of `a`.
+  For grandchildren too, write `'a/*,a/*/*'`. `**` is rejected. Quote patterns so the
+  shell doesn't expand them.
+- A split path must be a real directory. xdu never follows symlinks, so a path through a
+  symlink is rejected with an error naming the link. Nothing below a symlink is indexed anyway.
+- The settings are saved in `_xdu.json`, so later runs (including `-p` re-indexes) reuse them.
+  Changing them requires a full run, which removes partitions that are no longer split points.
+- Split finely enough to balance the work, but keep the partition count modest: thousands of
+  tiny Parquet files make queries slower.
+- `xdu-find`, `xdu-du` and `xdu-rm` accept nested paths for `-u` and include everything
+  below them. `xdu-du` and `xdu-view` group nested partitions under their top-level directory.
+- `xdu-diff` compares partition by partition when both indices have the same split settings,
+  and whole top-level directories otherwise.
 
 ### Schema
 
@@ -102,7 +145,11 @@ xdu /home -o /var/lib/xdu/home -j 16 -b 100000
 | `-o, --outdir` | Output directory for index | Required |
 | `-j, --jobs` | Parallel threads (`XDU_JOBS` env) | 4 |
 | `-B, --buffsize` | Records per Parquet chunk | 100000 |
-| `-p, --partition` | Index only specific partitions (comma-separated) | All |
+| `-p, --partition` | Index only specific partitions (comma-separated, e.g. `alice,projects/big`) | All |
+| `-r, --recursive` | With `-p`, also index partitions nested below those given | |
+| `--split-depth` | Make every directory down to depth N a partition | 1, or the index's saved setting |
+| `--split` | Extra partition directories, relative to DIR (comma-separated, `*` and `?` allowed) | |
+| `--split-file` | Read `--split` paths from a file | |
 | `--apparent-size` | Report file length instead of disk usage (st_blocks) | |
 | `-k, --block-size` | Round sizes up to block size (e.g., `128K`). Implies `--apparent-size` | |
 
@@ -131,7 +178,7 @@ xdu-find -i /var/lib/xdu/home -p '\.tmp$' --older-than 30 | xargs rm
 |--------|-------------|---------|
 | `-i, --index` | Path to Parquet index directory | Required |
 | `-p, --pattern` | Regex pattern to match paths | |
-| `-u, --partition` | Filter by partition (user directory) | |
+| `-u, --partition` | Filter by partition (user directory, or a nested path like `projects/big`; includes everything below it) | |
 | `--min-size` | Minimum file size (e.g., 1K, 10M, 1G) | |
 | `--max-size` | Maximum file size | |
 | `--older-than` | Files not accessed in N days | |
@@ -166,7 +213,7 @@ xdu-view -i /var/lib/xdu/home-wed --compare /var/lib/xdu/home-mon -s delta
 | Option | Description | Default |
 |--------|-------------|---------|
 | `-i, --index` | Path to Parquet index directory | Required |
-| `-u, --partition` | Start in a specific partition | |
+| `-u, --partition` | Start in a specific partition (top-level directory, or a nested path) | |
 | `-p, --pattern` | Regex pattern to filter paths | |
 | `--min-size` | Minimum file size (e.g., 1K, 10M, 1G) | |
 | `--max-size` | Maximum file size | |
@@ -296,7 +343,7 @@ xdu-rm -i /var/lib/xdu/home -u alice -p '\.tmp$' --older-than 30 --force
 |--------|-------------|---------|
 | `-i, --index` | Path to Parquet index directory | Required |
 | `-p, --pattern` | Regex pattern to match paths | |
-| `-u, --partition` | Filter by partition (user directory) | |
+| `-u, --partition` | Filter by partition (user directory, or a nested path like `projects/big`; includes everything below it) | |
 | `--min-size` | Minimum file size (e.g., 1K, 10M, 1G) | |
 | `--max-size` | Maximum file size | |
 | `--older-than` | Files not accessed in N days | |
@@ -403,7 +450,7 @@ Each file is classified as `added`, `removed`, `modified` (size or mtime changed
 |--------|-------------|---------|
 | `-f, --files` | List individual files instead of a per-partition summary | |
 | `--status` | Statuses to list with `--files` (comma-separated, or `all`) | `added,removed,modified,meta` |
-| `-u, --partition` | Restrict to a single partition | |
+| `-u, --partition` | Restrict to a partition or subdirectory (e.g. `alice`, `projects/big`) | |
 | `-p, --pattern` | Regex matched against relative paths | |
 | `--min-delta` | With `--files`: minimum absolute size change (e.g., `10M`) | |
 | `-s, --sort` | `name`, `delta` (growth first), `shrink`, `abs` (largest change first) | `name` |
@@ -425,21 +472,23 @@ The Parquet index integrates seamlessly with DuckDB for instant analytics:
 SELECT
     regexp_extract(path, '/home/([^/]+)/', 1) AS user,
     sum(size) / 1e12 AS tb
-FROM read_parquet('/var/lib/xdu/home/*/*.parquet')
+FROM read_parquet('/var/lib/xdu/home/**/*.parquet')
 GROUP BY user
 ORDER BY tb DESC;
 
 -- Files not accessed in 180 days
 SELECT path, size, atime
-FROM read_parquet('/var/lib/xdu/home/*/*.parquet')
+FROM read_parquet('/var/lib/xdu/home/**/*.parquet')
 WHERE atime < epoch(now()) - 86400 * 180
 ORDER BY size DESC
 LIMIT 100;
 
--- Query single user (partition pruning)
+-- Query single user (partition pruning; ** includes any nested partitions)
 SELECT sum(size) / 1e9 AS gb
-FROM read_parquet('/var/lib/xdu/home/alice/*.parquet');
+FROM read_parquet('/var/lib/xdu/home/alice/**/*.parquet');
 ```
+
+Use `**/*.parquet` rather than `*/*.parquet` so nested partitions are included.
 
 ## Scheduling
 
@@ -507,6 +556,15 @@ xdu /home -o /var/lib/xdu/home -j 8 --partition alice
 
 This is much faster than a full re-index and automatically prunes stale chunks from previous runs.
 
+With nested partitions, name the partition by its path. Add `-r` to include the partitions below it:
+
+```bash
+xdu /data -o /index/data --partition projects/big -r
+```
+
+A partial run reuses the split settings saved in the index. To change them, do a full run.
+A full run also removes partitions for directories that no longer exist.
+
 ### Adaptive Parallelism
 
 Unlike traditional one-thread-per-partition approaches, xdu uses jwalk's adaptive parallelism. Work is dynamically distributed at every directory level:
@@ -514,6 +572,11 @@ Unlike traditional one-thread-per-partition approaches, xdu uses jwalk's adaptiv
 - When a thread enters a directory with many subdirectories, those subdirectories are redistributed across idle threads
 - This eliminates the "long tail" problem where a few large partitions bottleneck the entire crawl
 - A filesystem with 1000 small partitions and 5 "whale" partitions (30M+ files each) now completes in 3-4 hours instead of 10+ hours
+
+Adaptive parallelism balances the *crawl*. A whale partition is still one Parquet unit, though,
+so drilling into it in `xdu-view`, diffing it, or re-indexing it with `-p` touches all of its files.
+Splitting it with `--split` (see [Nested Partitions](#nested-partitions)) breaks it into smaller
+units for those operations.
 
 ## License
 

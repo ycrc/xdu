@@ -3498,6 +3498,7 @@ dependencies = [
  "parquet",
  "ratatui",
  "rayon",
+ "serde_json",
  "tempfile",
 ]
 

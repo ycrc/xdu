@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -8,8 +7,8 @@ use clap::Parser;
 use duckdb::Connection;
 
 use xdu::{
-    diff_partition_sql, discover_index_root, format_bytes, format_bytes_signed, list_partitions,
-    parse_size, sql_quote, DiffSide, DIFF_STATUSES,
+    diff_partition_sql, diff_units, discover_index_root, format_bytes, format_bytes_signed, index_split_spec,
+    list_partitions, parse_size, sql_quote, DiffSide, SplitSpec, DIFF_STATUSES, ROOT_PARTITION,
 };
 
 #[derive(Parser, Debug)]
@@ -19,6 +18,9 @@ use xdu::{
     disable_help_flag = true,
     after_help = "Files are matched by path relative to each index's crawl root, so indices
 built from different snapshot directories compare cleanly.
+
+Indices built with the same split settings are compared partition by partition;
+otherwise whole top-level directories are compared.
 
 Statuses: added, removed, modified (size/mtime), meta (ctime/uid/gid/mode),
           accessed (atime only), unchanged
@@ -47,7 +49,7 @@ struct Args {
     #[arg(long, value_name = "LIST", default_value = "added,removed,modified,meta")]
     status: String,
 
-    /// Restrict to a single partition
+    /// Restrict to a single partition or subdirectory (e.g. alice, projects/big)
     #[arg(short = 'u', long, value_name = "NAME")]
     partition: Option<String>,
 
@@ -187,7 +189,11 @@ fn delta_key(sort: &str, delta: i64) -> i64 {
     }
 }
 
-fn open_side(conn: &Connection, path: &PathBuf, root_override: &Option<String>) -> Result<(DiffSide, Vec<String>)> {
+fn open_side(
+    conn: &Connection,
+    path: &PathBuf,
+    root_override: &Option<String>,
+) -> Result<(DiffSide, Vec<String>, SplitSpec)> {
     let index = path.canonicalize()
         .with_context(|| format!("Index directory not found: {}", path.display()))?;
     let partitions = list_partitions(&index)?;
@@ -195,7 +201,8 @@ fn open_side(conn: &Connection, path: &PathBuf, root_override: &Option<String>) 
         Some(r) => r.trim_end_matches('/').to_string(),
         None => discover_index_root(conn, &index, &partitions)?,
     };
-    Ok((DiffSide { index, root }, partitions))
+    let spec = index_split_spec(&index)?;
+    Ok((DiffSide { index, root }, partitions, spec))
 }
 
 fn run(args: Args) -> Result<bool> {
@@ -218,22 +225,35 @@ fn run(args: Args) -> Result<bool> {
         .map_err(|e| anyhow::anyhow!(e))?;
 
     let conn = Connection::open_in_memory()?;
-    let (old, old_parts) = open_side(&conn, &args.old, &args.old_root)?;
-    let (new, new_parts) = open_side(&conn, &args.new, &args.new_root)?;
+    let (old, old_parts, old_spec) = open_side(&conn, &args.old, &args.old_root)?;
+    let (new, new_parts, new_spec) = open_side(&conn, &args.new, &args.new_root)?;
 
-    let old_set: BTreeSet<&String> = old_parts.iter().collect();
-    let new_set: BTreeSet<&String> = new_parts.iter().collect();
-    let mut partitions: Vec<&String> = old_set.union(&new_set).copied().collect();
+    let mut units = diff_units(&old_parts, &new_parts, old_spec.same_layout(&new_spec));
+    // Conditions on relative paths shared by both modes.
+    let mut rel_conditions: Vec<String> = Vec::new();
     if let Some(ref p) = args.partition {
-        partitions.retain(|name| *name == p);
-        if partitions.is_empty() {
+        let p = p.trim_matches('/').to_string();
+        // Keep units inside `p`, or the subtree unit that contains it.
+        units.retain(|u| {
+            u.name == p
+                || u.name.starts_with(&format!("{}/", p))
+                || (u.subtree && p.starts_with(&format!("{}/", u.name)))
+        });
+        if units.is_empty() {
             anyhow::bail!("Partition '{}' not found in either index", p);
         }
+        if p != ROOT_PARTITION {
+            rel_conditions.push(format!("starts_with(rel, {})", sql_quote(&format!("{}/", p))));
+        }
+    }
+    if let Some(ref re) = args.pattern {
+        rel_conditions.push(format!("regexp_matches(rel, {})", sql_quote(re)));
     }
 
-    let pattern_clause = match args.pattern {
-        Some(ref re) => format!("WHERE regexp_matches(rel, {})", sql_quote(re)),
-        None => String::new(),
+    let pattern_clause = if rel_conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", rel_conditions.join(" AND "))
     };
 
     let stdout = io::stdout();
@@ -243,8 +263,8 @@ fn run(args: Args) -> Result<bool> {
     if !args.files {
         // Per-partition summary
         let mut rows: Vec<Summary> = Vec::new();
-        for p in &partitions {
-            let diff = diff_partition_sql(&old, &new, p, old_set.contains(p), new_set.contains(p));
+        for unit in &units {
+            let diff = diff_partition_sql(&old, &new, unit);
             let sql = format!(
                 "SELECT
                     COALESCE(SUM(size_old), 0)::BIGINT, COALESCE(SUM(size_new), 0)::BIGINT,
@@ -258,7 +278,7 @@ fn run(args: Args) -> Result<bool> {
                  FROM ({diff}) {pattern_clause}"
             );
             let s = conn.query_row(&sql, [], |r| Ok(Summary {
-                name: p.to_string(),
+                name: unit.name.clone(),
                 size_old: r.get(0)?,
                 size_new: r.get(1)?,
                 files_old: r.get(2)?,
@@ -268,7 +288,7 @@ fn run(args: Args) -> Result<bool> {
                 modified: r.get(6)?,
                 meta: r.get(7)?,
                 accessed: r.get(8)?,
-            })).with_context(|| format!("Comparing partition '{}'", p))?;
+            })).with_context(|| format!("Comparing partition '{}'", unit.name))?;
             rows.push(s);
         }
 
@@ -338,8 +358,8 @@ fn run(args: Args) -> Result<bool> {
                 writeln!(out, "{}", line.join("  "))?;
             }
 
-            let only_old: Vec<&&String> = old_set.difference(&new_set).collect();
-            let only_new: Vec<&&String> = new_set.difference(&old_set).collect();
+            let only_new: Vec<&str> = units.iter().filter(|u| !u.in_old).map(|u| u.name.as_str()).collect();
+            let only_old: Vec<&str> = units.iter().filter(|u| !u.in_new).map(|u| u.name.as_str()).collect();
             if args.partition.is_none() && (!only_old.is_empty() || !only_new.is_empty()) {
                 writeln!(out)?;
                 for p in only_new {
@@ -356,9 +376,7 @@ fn run(args: Args) -> Result<bool> {
     // --files: list individual changed files
     let status_list = statuses.iter().map(|s| sql_quote(s)).collect::<Vec<_>>().join(", ");
     let mut conditions = vec![format!("status IN ({})", status_list)];
-    if let Some(ref re) = args.pattern {
-        conditions.push(format!("regexp_matches(rel, {})", sql_quote(re)));
-    }
+    conditions.extend(rel_conditions);
     if let Some(n) = min_delta {
         conditions.push(format!("abs(delta) >= {}", n));
     }
@@ -373,8 +391,8 @@ fn run(args: Args) -> Result<bool> {
 
     let mut files: Vec<FileDiff> = Vec::new();
     let mut any_changes = false;
-    for p in &partitions {
-        let diff = diff_partition_sql(&old, &new, p, old_set.contains(p), new_set.contains(p));
+    for unit in &units {
+        let diff = diff_partition_sql(&old, &new, unit);
         let sql = format!(
             "SELECT rel, status, size_old, size_new, delta, mtime_old, mtime_new, uid
              FROM ({diff}) WHERE {} ORDER BY {order_by} {limit_clause}",

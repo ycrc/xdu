@@ -6,7 +6,7 @@ use chrono::DateTime;
 use clap::Parser;
 use duckdb::Connection;
 
-use xdu::{format_bytes, QueryFilters};
+use xdu::{format_bytes, index_glob, partition_key_sql, sql_quote, QueryFilters};
 
 const VALID_FIELDS: &[&str] = &["path", "size", "atime", "mtime", "ctime", "uid", "gid", "mode"];
 
@@ -30,7 +30,7 @@ struct Args {
     #[arg(short, long, value_name = "REGEX")]
     pattern: Option<String>,
 
-    /// Filter by partition (user directory name)
+    /// Filter by partition (e.g. a user directory, or a nested path like projects/big); includes nested partitions
     #[arg(short = 'u', long, value_name = "NAME")]
     partition: Option<String>,
 
@@ -163,11 +163,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("Index directory not found: {}", args.index.display()))?;
 
     // Build the glob pattern for Parquet files
-    let glob_pattern = if let Some(ref partition) = args.partition {
-        format!("{}/{}/*.parquet", index_path.display(), partition)
-    } else {
-        format!("{}/*/*.parquet", index_path.display())
-    };
+    let glob_pattern = sql_quote(&index_glob(&index_path, args.partition.as_deref()));
 
     // Connect to DuckDB (in-memory)
     let conn = Connection::open_in_memory()?;
@@ -204,13 +200,13 @@ fn main() -> Result<()> {
     if let Some(n) = args.top {
         let sql = format!(
             "SELECT
-                regexp_extract(filename, '.*/([^/]+)/[^/]+\\.parquet$', 1) as partition,
+                {} as partition,
                 COUNT(*) as file_count
-            FROM read_parquet('{}', filename=true) {}
+            FROM read_parquet({}, filename=true) {}
             GROUP BY partition
             ORDER BY file_count DESC
             LIMIT {}",
-            glob_pattern, where_clause, n
+            partition_key_sql(&index_path), glob_pattern, where_clause, n
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
@@ -224,7 +220,7 @@ fn main() -> Result<()> {
     // --count mode
     if args.count {
         let sql = format!(
-            "SELECT COUNT(*) FROM read_parquet('{}') {}",
+            "SELECT COUNT(*) FROM read_parquet({}) {}",
             glob_pattern, where_clause
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -239,7 +235,7 @@ fn main() -> Result<()> {
     // Build SELECT query from requested fields
     let select_clause = fields.join(", ");
     let sql = format!(
-        "SELECT {} FROM read_parquet('{}') {} {}",
+        "SELECT {} FROM read_parquet({}) {} {}",
         select_clause, glob_pattern, where_clause, limit_clause
     );
 

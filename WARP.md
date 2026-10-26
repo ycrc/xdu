@@ -48,7 +48,9 @@ cargo build --release
 ## Design Decisions
 
 - **Shared-pool concurrent walks**: A single rayon thread pool is shared across all jwalk walkers. Driver threads consume walker iterators and write buffers; rayon work-stealing balances directory reads across all active partitions. Thread budget: N pool + C drivers + 1 main.
-- **Partition by top-level subdirectory**: Enables per-user queries without full scans. `--partition` allows incremental re-indexing of specific partitions.
+- **Partition by split point**: By default each top-level subdirectory is a partition, which enables per-user queries without full scans. `--split`/`--split-depth` add deeper split points; partitions nest as `outdir/<relative path>/`, and each file belongs to the deepest split point containing it. Each walker skips subdirectories that are split points (jwalk `process_read_dir`), so every file is indexed exactly once. Files directly in the root go to `__root__`. `--partition` (with `-r`) re-indexes specific partitions.
+- **Manifest**: `outdir/_xdu.json` records the crawl root, split spec and size mode. Later runs reuse the spec; readers use the root, and `xdu-diff` uses the spec to decide between per-partition and per-top-level-subtree comparison. Indexes without a manifest are treated as depth-1 indexes.
+- **Reader globs**: Use `outdir/**/*.parquet` (all) or `outdir/<p>/**/*.parquet` (a subtree). The helpers live in `lib.rs` (`all_parquet_glob`, `subtree_glob`, `partition_key_sql`, ...).
 - **Atomic writes**: Chunks are written as `.partial` files, then renamed to `.parquet` on finalization. Stale chunks from previous runs are pruned.
 - **Buffered writes**: Accumulate records in memory to reduce I/O overhead
 - **Unix-only**: Uses `MetadataExt` for atime; not portable to Windows

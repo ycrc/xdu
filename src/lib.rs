@@ -719,33 +719,343 @@ pub fn sql_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// List partition directories (those containing at least one `.parquet` file), sorted.
-pub fn list_partitions(index: &Path) -> anyhow::Result<Vec<String>> {
-    let mut partitions = Vec::new();
-    for entry in std::fs::read_dir(index)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
+// ---------------------------------------------------------------------------
+// Index layout
+//
+// A partition is identified by its directory path relative to the crawl root
+// (`alice`, `projects/bigproj`), or `__root__` for files directly in the root.
+// Its chunks live in `<index>/<key>/NNNNNN.parquet`. A file belongs to the
+// deepest partition containing it, so partition directories can nest.
+// ---------------------------------------------------------------------------
+
+/// Name of the index manifest file, stored at the top of the index directory.
+pub const MANIFEST_FILE: &str = "_xdu.json";
+
+/// Current manifest format version.
+pub const MANIFEST_VERSION: u64 = 1;
+
+/// Which directories become partitions (split points).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitSpec {
+    /// Every directory at depth 1..=depth below the root is a split point.
+    pub depth: usize,
+    /// Additional split points, relative to the root. Components may use `*` and `?`.
+    pub patterns: Vec<String>,
+}
+
+impl Default for SplitSpec {
+    /// One partition per top-level directory (the original xdu layout).
+    fn default() -> Self {
+        Self { depth: 1, patterns: Vec::new() }
+    }
+}
+
+impl SplitSpec {
+    /// Canonical form (patterns trimmed, sorted, deduplicated) for comparison and storage.
+    pub fn normalized(&self) -> Self {
+        let mut patterns: Vec<String> = self.patterns.iter()
+            .map(|p| p.trim().trim_matches('/').to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        patterns.sort();
+        patterns.dedup();
+        Self { depth: self.depth, patterns }
+    }
+
+    /// True if both specs assign every path to the same partition.
+    pub fn same_layout(&self, other: &SplitSpec) -> bool {
+        self.normalized() == other.normalized()
+    }
+}
+
+/// Index metadata written by `xdu` to `<index>/_xdu.json`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Manifest {
+    pub version: u64,
+    /// The crawl root (directory passed to `xdu`), without a trailing slash.
+    pub root: String,
+    pub split: SplitSpec,
+    /// Size calculation mode, for information (e.g. "disk-usage").
+    pub size_mode: String,
+}
+
+impl Manifest {
+    /// Read the manifest of an index, or None if it has none (indexes from older xdu versions).
+    pub fn load(index: &Path) -> anyhow::Result<Option<Manifest>> {
+        let path = index.join(MANIFEST_FILE);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("Reading {}", path.display()))),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("Invalid manifest {}: {}", path.display(), e))?;
+        let version = v["version"].as_u64().unwrap_or(0);
+        if version > MANIFEST_VERSION {
+            anyhow::bail!("{} has version {}; this xdu supports up to {}", path.display(), version, MANIFEST_VERSION);
         }
-        let has_parquet = std::fs::read_dir(entry.path())?
-            .filter_map(|e| e.ok())
-            .any(|e| e.path().extension().is_some_and(|ext| ext == "parquet"));
-        if has_parquet {
-            partitions.push(entry.file_name().to_string_lossy().to_string());
+        let root = v["root"].as_str()
+            .ok_or_else(|| anyhow::anyhow!("Manifest {} has no root", path.display()))?
+            .trim_end_matches('/')
+            .to_string();
+        let depth = v["split"]["depth"].as_u64().unwrap_or(1) as usize;
+        let patterns = v["split"]["patterns"].as_array()
+            .map(|a| a.iter().filter_map(|p| p.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        Ok(Some(Manifest {
+            version,
+            root,
+            split: SplitSpec { depth, patterns },
+            size_mode: v["size_mode"].as_str().unwrap_or("").to_string(),
+        }))
+    }
+
+    /// Write the manifest atomically.
+    pub fn save(&self, index: &Path) -> anyhow::Result<()> {
+        let split = self.split.normalized();
+        let v = serde_json::json!({
+            "version": self.version,
+            "root": self.root,
+            "split": { "depth": split.depth, "patterns": split.patterns },
+            "size_mode": self.size_mode,
+        });
+        let path = index.join(MANIFEST_FILE);
+        let tmp = index.join(format!("{}.partial", MANIFEST_FILE));
+        std::fs::write(&tmp, format!("{}\n", serde_json::to_string_pretty(&v)?))?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+}
+
+/// The split spec an index was built with (the default for indexes without a manifest).
+pub fn index_split_spec(index: &Path) -> anyhow::Result<SplitSpec> {
+    Ok(Manifest::load(index)?.map(|m| m.split).unwrap_or_default())
+}
+
+/// Match a single path component against a pattern with `*` and `?` wildcards.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp + 1;
+            ni = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
         }
     }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
+/// Real (non-symlink) subdirectories of `dir`, by name. Unreadable directories yield nothing.
+fn subdirs(dir: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut names: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Describe why `rel` is not a real directory under `root`, naming the first bad component.
+fn explain_missing_dir(root: &Path, rel: &str) -> String {
+    let mut path = root.to_path_buf();
+    for comp in rel.split('/') {
+        path.push(comp);
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return format!("{} does not exist", path.display());
+            }
+            Err(e) => return format!("cannot access {}: {}", path.display(), e),
+            Ok(m) if m.file_type().is_symlink() => {
+                let target = std::fs::read_link(&path).map(|t| t.display().to_string()).unwrap_or_default();
+                return format!(
+                    "{} is a symlink (to {}); symlinks are not followed, so nothing below it is indexed",
+                    path.display(), target
+                );
+            }
+            Ok(m) if !m.is_dir() => return format!("{} is not a directory", path.display()),
+            Ok(_) => {}
+        }
+    }
+    format!("{} is not a directory", path.display())
+}
+
+/// Resolve a split spec against the directory tree under `root`.
+///
+/// Returns the split points as sorted relative paths (the root itself is implied and not
+/// included), plus warnings for wildcard patterns that matched nothing. A literal path that
+/// is not a real directory (missing, a file, or a symlink) is an error.
+pub fn resolve_split_points(root: &Path, spec: &SplitSpec) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let mut points = std::collections::BTreeSet::new();
+    let mut warnings = Vec::new();
+
+    // Depth-based split points: breadth-first to `spec.depth` levels.
+    let mut level: Vec<String> = vec![String::new()];
+    for _ in 0..spec.depth {
+        let mut next = Vec::new();
+        for rel in &level {
+            for name in subdirs(&root.join(rel)) {
+                let child = if rel.is_empty() { name } else { format!("{}/{}", rel, name) };
+                points.insert(child.clone());
+                next.push(child);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        level = next;
+    }
+
+    // Explicit split points, with wildcards expanded component by component.
+    for pattern in &spec.normalized().patterns {
+        let comps: Vec<&str> = pattern.split('/').collect();
+        if comps.iter().any(|c| c.is_empty() || *c == "." || *c == "..") {
+            anyhow::bail!("Invalid split path '{}': use a relative path without '.' or '..'", pattern);
+        }
+        if pattern.contains("**") {
+            anyhow::bail!(
+                "Invalid split path '{}': '**' is not supported, because wildcards match a single path \
+                 component. Use '*' for one level (e.g. 'a/*'), list deeper levels explicitly \
+                 (e.g. 'a/*,a/*/*'), or use --split-depth",
+                pattern
+            );
+        }
+        let mut matches: Vec<String> = vec![String::new()];
+        for comp in comps {
+            let mut next = Vec::new();
+            for rel in &matches {
+                let dir = root.join(rel);
+                let join = |name: &str| if rel.is_empty() { name.to_string() } else { format!("{}/{}", rel, name) };
+                if comp.contains(['*', '?']) {
+                    next.extend(subdirs(&dir).iter().filter(|n| glob_match(comp, n)).map(|n| join(n)));
+                } else if std::fs::symlink_metadata(dir.join(comp)).is_ok_and(|m| m.is_dir()) {
+                    next.push(join(comp));
+                }
+            }
+            matches = next;
+        }
+        if matches.is_empty() {
+            if pattern.contains(['*', '?']) {
+                warnings.push(format!("split path '{}' matched no directories", pattern));
+            } else {
+                anyhow::bail!("Split path '{}': {}", pattern, explain_missing_dir(root, pattern));
+            }
+        }
+        points.extend(matches);
+    }
+
+    if points.contains(ROOT_PARTITION) {
+        anyhow::bail!("A top-level directory named '{}' conflicts with the root partition", ROOT_PARTITION);
+    }
+    Ok((points.into_iter().collect(), warnings))
+}
+
+/// Index directory as a string, without a trailing slash, for building globs.
+pub fn index_str(index: &Path) -> String {
+    let s = index.to_string_lossy();
+    let t = s.trim_end_matches('/');
+    if t.is_empty() { "/".to_string() } else { t.to_string() }
+}
+
+/// Glob matching every chunk in an index, at any depth.
+pub fn all_parquet_glob(index: &Path) -> String {
+    format!("{}/**/*.parquet", index_str(index))
+}
+
+/// Glob matching the chunks of one partition (not including nested partitions).
+pub fn partition_glob(index: &Path, key: &str) -> String {
+    format!("{}/{}/*.parquet", index_str(index), key)
+}
+
+/// Glob matching the chunks of a partition and every partition nested below it.
+pub fn subtree_glob(index: &Path, key: &str) -> String {
+    format!("{}/{}/**/*.parquet", index_str(index), key)
+}
+
+/// Glob for querying an index: the subtree of `partition` if given, else everything.
+pub fn index_glob(index: &Path, partition: Option<&str>) -> String {
+    match partition.map(|p| p.trim_matches('/')) {
+        Some(p) if !p.is_empty() => subtree_glob(index, p),
+        _ => all_parquet_glob(index),
+    }
+}
+
+/// SQL expression giving the partition key of each row, for `read_parquet(..., filename=true)`
+/// over a glob rooted at `index`.
+pub fn partition_key_sql(index: &Path) -> String {
+    format!(
+        "regexp_extract(substr(filename, {}), '^(.*)/[^/]+\\.parquet$', 1)",
+        index_str(index).chars().count() + 2
+    )
+}
+
+/// SQL expression giving the top-level directory of each row's partition (see [`partition_key_sql`]).
+pub fn top_level_key_sql(index: &Path) -> String {
+    format!("split_part({}, '/', 1)", partition_key_sql(index))
+}
+
+/// First component of a partition key (`projects/bigproj` -> `projects`).
+pub fn top_level(key: &str) -> &str {
+    key.split('/').next().unwrap_or(key)
+}
+
+/// List partitions (directories containing at least one `.parquet` file, at any depth)
+/// as sorted keys relative to the index directory.
+pub fn list_partitions(index: &Path) -> anyhow::Result<Vec<String>> {
+    fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) -> anyhow::Result<()> {
+        let mut has_parquet = false;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let child = if rel.is_empty() { name } else { format!("{}/{}", rel, name) };
+                walk(&entry.path(), &child, out)?;
+            } else if !rel.is_empty() && entry.path().extension().is_some_and(|ext| ext == "parquet") {
+                has_parquet = true;
+            }
+        }
+        if has_parquet {
+            out.push(rel.to_string());
+        }
+        Ok(())
+    }
+    let mut partitions = Vec::new();
+    walk(index, "", &mut partitions)?;
     partitions.sort();
     Ok(partitions)
+}
+
+/// Distinct top-level directories of a set of partition keys, sorted.
+pub fn top_level_partitions(partitions: &[String]) -> Vec<String> {
+    let set: std::collections::BTreeSet<&str> = partitions.iter().map(|p| top_level(p)).collect();
+    set.into_iter().map(String::from).collect()
 }
 
 /// Discover the crawl root of an index (the directory that was passed to `xdu`),
 /// without a trailing slash.
 ///
-/// Files in partition `p` live at `<root>/p/...` and files in `__root__` at `<root>/file`.
-/// The root is recovered from the longest common directory prefix of all paths; if the
-/// index has a single non-root partition, that prefix is trimmed back to `<root>`.
+/// Uses the manifest when present. Otherwise (indexes from older xdu versions), files in
+/// partition `p` live at `<root>/p/...` and files in `__root__` at `<root>/file`; the root
+/// is recovered from the longest common directory prefix of all paths, and if the index
+/// has a single top-level partition, that prefix is trimmed back to `<root>`.
 pub fn discover_index_root(conn: &Connection, index: &Path, partitions: &[String]) -> anyhow::Result<String> {
-    let glob = format!("{}/*/*.parquet", index.display());
+    if let Some(m) = Manifest::load(index)? {
+        return Ok(m.root);
+    }
+    let glob = all_parquet_glob(index);
     let sql = format!("SELECT min(path), max(path) FROM read_parquet({})", sql_quote(&glob));
     let (lo, hi): (Option<String>, Option<String>) =
         conn.query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?)))?;
@@ -764,8 +1074,9 @@ pub fn discover_index_root(conn: &Connection, index: &Path, partitions: &[String
         None => String::new(),
     };
 
-    let named: Vec<&String> = partitions.iter().filter(|p| *p != ROOT_PARTITION).collect();
-    let has_root_files = partitions.iter().any(|p| p == ROOT_PARTITION);
+    let tops = top_level_partitions(partitions);
+    let named: Vec<&String> = tops.iter().filter(|p| *p != ROOT_PARTITION).collect();
+    let has_root_files = tops.iter().any(|p| p == ROOT_PARTITION);
     if named.len() == 1 && !has_root_files {
         // Common prefix is somewhere inside the only partition: cut back to "<root>/<p>".
         let marker = format!("/{}", named[0]);
@@ -784,26 +1095,64 @@ pub struct DiffSide {
     pub root: String,
 }
 
+/// A unit of comparison: one partition, or a partition together with all nested ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffUnit {
+    /// Partition key (or top-level directory when `subtree` is set).
+    pub name: String,
+    /// Include partitions nested below `name`.
+    pub subtree: bool,
+    pub in_old: bool,
+    pub in_new: bool,
+}
+
+/// Units to compare two indexes by, given their partition keys.
+///
+/// When both indexes were built with the same split spec, every file belongs to the same
+/// partition in both, so partitions are compared one-to-one. Otherwise a file may sit in
+/// different partitions on each side, so whole top-level subtrees are compared instead.
+pub fn diff_units(old: &[String], new: &[String], same_layout: bool) -> Vec<DiffUnit> {
+    let (old_keys, new_keys, subtree) = if same_layout {
+        (old.to_vec(), new.to_vec(), false)
+    } else {
+        (top_level_partitions(old), top_level_partitions(new), true)
+    };
+    let all: std::collections::BTreeSet<&String> = old_keys.iter().chain(new_keys.iter()).collect();
+    all.into_iter()
+        .map(|name| DiffUnit {
+            name: name.clone(),
+            // The root partition never has nested partitions.
+            subtree: subtree && name != ROOT_PARTITION,
+            in_old: old_keys.contains(name),
+            in_new: new_keys.contains(name),
+        })
+        .collect()
+}
+
 impl DiffSide {
-    /// SQL relation for one partition of this side, keyed by path relative to the root.
-    /// Yields a typed empty relation when the partition is absent.
-    fn relation(&self, partition: &str, present: bool) -> String {
+    /// SQL relation for one unit of this side, keyed by path relative to the root.
+    /// Yields a typed empty relation when the unit is absent.
+    fn relation(&self, unit: &DiffUnit, present: bool) -> String {
         if !present {
             return "SELECT NULL::VARCHAR AS rel, NULL::BIGINT AS size, NULL::BIGINT AS atime, \
                     NULL::BIGINT AS mtime, NULL::BIGINT AS ctime, NULL::INTEGER AS uid, \
                     NULL::INTEGER AS gid, NULL::INTEGER AS mode WHERE false".to_string();
         }
-        let glob = format!("{}/{}/*.parquet", self.index.display(), partition);
+        let glob = if unit.subtree {
+            subtree_glob(&self.index, &unit.name)
+        } else {
+            partition_glob(&self.index, &unit.name)
+        };
         format!(
             "SELECT substr(path, {start}) AS rel, size, atime, mtime, ctime, uid, gid, mode \
              FROM read_parquet({glob})",
-            start = self.root.len() + 2,
+            start = self.root.chars().count() + 2,
             glob = sql_quote(&glob),
         )
     }
 }
 
-/// Build a query comparing one partition between an old and new index.
+/// Build a query comparing one unit (see [`diff_units`]) between an old and new index.
 ///
 /// Files are matched on their path relative to each index's root, so indices taken
 /// from different snapshot mount points (e.g. `.snapshots/@GMT-...`) line up.
@@ -811,13 +1160,7 @@ impl DiffSide {
 /// Output columns: `rel, status, size_old, size_new, delta, mtime_old, mtime_new`, plus
 /// `atime, mtime, ctime, uid, gid, mode` taken from the new index (or the old one for
 /// removed files). Sizes of the missing side are 0; `status` is one of [`DIFF_STATUSES`].
-pub fn diff_partition_sql(
-    old: &DiffSide,
-    new: &DiffSide,
-    partition: &str,
-    in_old: bool,
-    in_new: bool,
-) -> String {
+pub fn diff_partition_sql(old: &DiffSide, new: &DiffSide, unit: &DiffUnit) -> String {
     format!(
         r#"
         WITH a AS ({rel_a}), b AS ({rel_b})
@@ -844,26 +1187,20 @@ pub fn diff_partition_sql(
             COALESCE(b.mode, a.mode) AS mode
         FROM a FULL OUTER JOIN b ON a.rel = b.rel
         "#,
-        rel_a = old.relation(partition, in_old),
-        rel_b = new.relation(partition, in_new),
+        rel_a = old.relation(unit, unit.in_old),
+        rel_b = new.relation(unit, unit.in_new),
     )
 }
 
 /// Like [`diff_partition_sql`], but shaped like an index so existing index queries can run
 /// on it: `path` is absolute under the new root (removed files included), `size` is the
 /// new size, and `size_old` and `status` are added.
-pub fn diff_as_index_sql(
-    old: &DiffSide,
-    new: &DiffSide,
-    partition: &str,
-    in_old: bool,
-    in_new: bool,
-) -> String {
+pub fn diff_as_index_sql(old: &DiffSide, new: &DiffSide, unit: &DiffUnit) -> String {
     format!(
         "SELECT {root} || '/' || rel AS path, size_new AS size, size_old, \
          atime, mtime, ctime, uid, gid, mode, status FROM ({diff})",
         root = sql_quote(&new.root),
-        diff = diff_partition_sql(old, new, partition, in_old, in_new),
+        diff = diff_partition_sql(old, new, unit),
     )
 }
 
