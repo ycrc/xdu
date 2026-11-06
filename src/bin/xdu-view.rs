@@ -1,20 +1,17 @@
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::collapsible_else_if)]
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{stdout, BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, stdout};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
+    event::{self, Event, KeyCode, KeyEventKind},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use duckdb::Connection;
 use ratatui::{
@@ -22,10 +19,13 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
+use xdu::cli::XduViewArgs;
+use xdu::diff::discover_index_root;
+use xdu::layout::{list_partitions, normalize_partition_arg, top_level};
+use xdu::view_query::{self, Compare, DirEntry, Relation};
 use xdu::{
-    all_parquet_glob, diff_as_index_sql, diff_units, discover_index_root, format_bytes, format_bytes_signed,
-    format_count, list_partitions, parse_size, sql_quote, subtree_glob, top_level_key_sql, DiffSide, DiffUnit,
-    QueryFilters, SortMode,
+    IndexLocator, QueryFilters, ROOT_PARTITION, SortMode, format_bytes, format_bytes_signed,
+    format_count, glob_to_regex, group_name, open_index, parse_size, user_name,
 };
 
 /// Detect file type from magic bytes, shebangs, text content, and extension.
@@ -65,8 +65,10 @@ fn detect_file_type(sniff_buf: &[u8], file_path: &str) -> (String, bool) {
     // Mach-O enrichment (infer may not detect all variants)
     if sniff_buf.len() >= 8 {
         let magic = &sniff_buf[..4];
-        if magic == b"\xCF\xFA\xED\xFE" || magic == b"\xFE\xED\xFA\xCF"
-            || magic == b"\xCE\xFA\xED\xFE" || magic == b"\xFE\xED\xFA\xCE"
+        if magic == b"\xCF\xFA\xED\xFE"
+            || magic == b"\xFE\xED\xFA\xCF"
+            || magic == b"\xCE\xFA\xED\xFE"
+            || magic == b"\xFE\xED\xFA\xCE"
         {
             if let Some(desc) = describe_macho(sniff_buf) {
                 return (desc, false);
@@ -166,10 +168,10 @@ fn describe_macho(buf: &[u8]) -> Option<String> {
     }
     let magic = &buf[..4];
     let (class, le) = match magic {
-        b"\xCF\xFA\xED\xFE" => ("64-bit", true),   // MH_MAGIC_64 (LE)
-        b"\xFE\xED\xFA\xCF" => ("64-bit", false),  // MH_MAGIC_64 (BE)
-        b"\xCE\xFA\xED\xFE" => ("32-bit", true),   // MH_MAGIC (LE)
-        b"\xFE\xED\xFA\xCE" => ("32-bit", false),  // MH_MAGIC (BE)
+        b"\xCF\xFA\xED\xFE" => ("64-bit", true),  // MH_MAGIC_64 (LE)
+        b"\xFE\xED\xFA\xCF" => ("64-bit", false), // MH_MAGIC_64 (BE)
+        b"\xCE\xFA\xED\xFE" => ("32-bit", true),  // MH_MAGIC (LE)
+        b"\xFE\xED\xFA\xCE" => ("32-bit", false), // MH_MAGIC (BE)
         _ => return None,
     };
     let cpu_type = if le {
@@ -178,12 +180,12 @@ fn describe_macho(buf: &[u8]) -> Option<String> {
         u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])
     };
     let arch = match cpu_type {
-        7 => "x86",                     // CPU_TYPE_X86
-        0x0100_0007 => "x86-64",        // CPU_TYPE_X86_64
-        12 => "ARM",                    // CPU_TYPE_ARM
-        0x0100_000C => "ARM64",         // CPU_TYPE_ARM64
-        18 => "PowerPC",                // CPU_TYPE_POWERPC
-        0x0100_0012 => "PowerPC64",     // CPU_TYPE_POWERPC64
+        7 => "x86",                 // CPU_TYPE_X86
+        0x0100_0007 => "x86-64",    // CPU_TYPE_X86_64
+        12 => "ARM",                // CPU_TYPE_ARM
+        0x0100_000C => "ARM64",     // CPU_TYPE_ARM64
+        18 => "PowerPC",            // CPU_TYPE_POWERPC
+        0x0100_0012 => "PowerPC64", // CPU_TYPE_POWERPC64
         _ => "unknown-arch",
     };
     // file_type at offset 12 (4 bytes)
@@ -213,7 +215,10 @@ fn describe_macho(buf: &[u8]) -> Option<String> {
 /// Parse a shebang line to identify the script type.
 fn describe_shebang(buf: &[u8]) -> Option<String> {
     // Find the end of the first line
-    let end = buf.iter().position(|&b| b == b'\n').unwrap_or(buf.len().min(256));
+    let end = buf
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(buf.len().min(256));
     let line = std::str::from_utf8(&buf[2..end]).ok()?.trim();
     if line.is_empty() {
         return None;
@@ -224,10 +229,7 @@ fn describe_shebang(buf: &[u8]) -> Option<String> {
         line.split_whitespace().last()?
     } else {
         // "/usr/bin/perl" -> "perl", "/bin/bash" -> "bash"
-        line.split_whitespace()
-            .next()?
-            .rsplit('/')
-            .next()?
+        line.split_whitespace().next()?.rsplit('/').next()?
     };
 
     let desc = match interpreter {
@@ -307,81 +309,31 @@ fn describe_text_by_extension(path: &str) -> Option<&'static str> {
     Some(desc)
 }
 
-/// Resolve a uid to a username using getpwuid_r, with a process-lifetime cache.
-fn resolve_username(uid: i32) -> String {
-    static CACHE: OnceLock<Mutex<HashMap<i32, String>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = cache.lock().unwrap();
-    if let Some(name) = map.get(&uid) {
-        return name.clone();
+/// Format a uid as user name ("-" for mixed owners and the parent entry).
+fn format_uid(uid: i64, _is_dir: bool) -> String {
+    if uid < 0 {
+        "-".to_string()
+    } else {
+        user_name(uid)
     }
-    let name = unsafe {
-        let mut buf = vec![0i8; 4096];
-        let mut pwd: libc::passwd = std::mem::zeroed();
-        let mut result: *mut libc::passwd = std::ptr::null_mut();
-        libc::getpwuid_r(
-            uid as libc::uid_t,
-            &mut pwd,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &mut result,
-        );
-        if !result.is_null() {
-            std::ffi::CStr::from_ptr((*result).pw_name)
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            uid.to_string()
-        }
-    };
-    map.insert(uid, name.clone());
-    name
 }
 
-/// Resolve a gid to a group name using getgrgid_r, with a process-lifetime cache.
-fn resolve_groupname(gid: i32) -> String {
-    static CACHE: OnceLock<Mutex<HashMap<i32, String>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = cache.lock().unwrap();
-    if let Some(name) = map.get(&gid) {
-        return name.clone();
+/// Format a gid as group name ("-" for mixed groups and the parent entry).
+fn format_gid(gid: i64, _is_dir: bool) -> String {
+    if gid < 0 {
+        "-".to_string()
+    } else {
+        group_name(gid)
     }
-    let name = unsafe {
-        let mut buf = vec![0i8; 4096];
-        let mut grp: libc::group = std::mem::zeroed();
-        let mut result: *mut libc::group = std::ptr::null_mut();
-        libc::getgrgid_r(
-            gid as libc::gid_t,
-            &mut grp,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &mut result,
-        );
-        if !result.is_null() {
-            std::ffi::CStr::from_ptr((*result).gr_name)
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            gid.to_string()
-        }
-    };
-    map.insert(gid, name.clone());
-    name
-}
-
-/// Format a uid as username ("-" for the parent entry sentinel).
-fn format_uid(uid: i32, _is_dir: bool) -> String {
-    if uid < 0 { "-".to_string() } else { resolve_username(uid) }
-}
-
-/// Format a gid as group name ("-" for the parent entry sentinel).
-fn format_gid(gid: i32, _is_dir: bool) -> String {
-    if gid < 0 { "-".to_string() } else { resolve_groupname(gid) }
 }
 
 /// Format a mode value in octal ("-" for directories/parent entry).
-fn format_mode(mode: i32, is_dir: bool) -> String {
-    if is_dir || mode < 0 { "-".to_string() } else { format!("{:o}", mode & 0o7777) }
+fn format_mode(mode: i64, is_dir: bool) -> String {
+    if is_dir || mode < 0 {
+        "-".to_string()
+    } else {
+        format!("{:o}", mode & 0o7777)
+    }
 }
 
 /// Format file count with K/M/B suffixes
@@ -436,117 +388,6 @@ fn marker_style(marker: char) -> Style {
     }
 }
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "xdu-view",
-    about = "Interactive TUI for exploring a file metadata index",
-    after_help = "\
-Examples:
-  xdu-view -i /index/scratch
-  xdu-view -i /index/scratch -u alice
-  xdu-view -i /index/scratch --older-than 90 --sort size
-  xdu-view -i /index/snap-wed --compare /index/snap-mon --sort delta"
-)]
-struct Args {
-    /// Path to the Parquet index directory
-    #[arg(short, long, value_name = "DIR", env = "XDU_INDEX")]
-    index: PathBuf,
-
-    /// Initial partition to view (optional, shows partition list if omitted)
-    #[arg(short = 'u', long, value_name = "NAME")]
-    partition: Option<String>,
-
-    /// Regular expression pattern to match paths
-    #[arg(short, long, value_name = "REGEX")]
-    pattern: Option<String>,
-
-    /// Minimum file size (e.g., 1K, 10M, 1G)
-    #[arg(long, value_name = "SIZE")]
-    min_size: Option<String>,
-
-    /// Maximum file size (e.g., 1K, 10M, 1G)
-    #[arg(long, value_name = "SIZE")]
-    max_size: Option<String>,
-
-    /// Files not accessed in N days
-    #[arg(long, value_name = "DAYS")]
-    older_than: Option<u64>,
-
-    /// Files accessed within N days
-    #[arg(long, value_name = "DAYS")]
-    newer_than: Option<u64>,
-
-    /// Sort order: name, size-asc, size-desc, count-asc, count-desc, age-asc, age-desc,
-    /// delta-desc, delta-asc (delta sorts require --compare)
-    #[arg(short, long, default_value = "name")]
-    sort: String,
-
-    /// Compare against an earlier index of the same tree (e.g. an older snapshot) and
-    /// show size changes and added/removed files
-    #[arg(long, value_name = "DIR")]
-    compare: Option<PathBuf>,
-}
-
-/// Represents a directory entry in the view
-#[derive(Clone, Debug)]
-struct DirEntry {
-    name: String,
-    path: String,
-    is_dir: bool,
-    total_size: i64,
-    file_count: i64,
-    latest_atime: i64,
-    latest_mtime: i64,
-    latest_ctime: i64,
-    uid: i32,
-    gid: i32,
-    mode: i32,
-    /// Size in the comparison (old) index; equals `total_size` when not comparing
-    size_old: i64,
-    /// File count in the comparison (old) index; equals `file_count` when not comparing
-    files_old: i64,
-    /// Number of files added, removed, or modified relative to the old index
-    changed: i64,
-}
-
-impl DirEntry {
-    fn size_delta(&self) -> i64 { self.total_size - self.size_old }
-    fn files_delta(&self) -> i64 { self.file_count - self.files_old }
-
-    /// Change marker for compare mode: `+` new, `-` gone, `~` changed, blank if unchanged.
-    fn change_marker(&self) -> char {
-        if self.changed == 0 {
-            ' '
-        } else if self.files_old == 0 {
-            '+'
-        } else if self.file_count == 0 {
-            '-'
-        } else {
-            '~'
-        }
-    }
-
-    /// Entry for "..", which has no stats.
-    fn parent() -> Self {
-        DirEntry {
-            name: "..".to_string(),
-            path: "..".to_string(),
-            is_dir: true,
-            total_size: 0,
-            file_count: 0,
-            latest_atime: 0,
-            latest_mtime: 0,
-            latest_ctime: 0,
-            uid: -1,
-            gid: -1,
-            mode: -1,
-            size_old: 0,
-            files_old: 0,
-            changed: 0,
-        }
-    }
-}
-
 /// Which files to include when comparing two indices.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum StatusFilter {
@@ -589,48 +430,6 @@ impl StatusFilter {
     }
 }
 
-/// State for comparing the viewed index against an earlier one.
-struct Compare {
-    old: DiffSide,
-    new: DiffSide,
-    /// Top-level directory -> comparison unit covering its whole subtree
-    units: BTreeMap<String, DiffUnit>,
-    /// Partition name -> temp table holding its materialized diff
-    tables: RefCell<HashMap<String, String>>,
-}
-
-impl Compare {
-    fn partitions(&self) -> impl Iterator<Item = &String> {
-        self.units.keys()
-    }
-
-    fn has_partition(&self, partition: &str) -> bool {
-        self.units.contains_key(partition)
-    }
-
-    /// Unmaterialized diff of one partition, shaped like an index.
-    fn diff_sql(&self, partition: &str) -> String {
-        diff_as_index_sql(&self.old, &self.new, &self.units[partition])
-    }
-
-    /// Name of a temp table holding the diff of `partition`, creating it on first use so
-    /// navigating within a partition doesn't redo the join.
-    fn table(&self, conn: &Connection, partition: &str) -> Result<String> {
-        if let Some(name) = self.tables.borrow().get(partition) {
-            return Ok(name.clone());
-        }
-        let name = format!("xdu_diff_{}", self.tables.borrow().len());
-        conn.execute_batch(&format!(
-            "CREATE TEMP TABLE {} AS {}",
-            name,
-            self.diff_sql(partition)
-        ))
-        .with_context(|| format!("Comparing partition '{}'", partition))?;
-        self.tables.borrow_mut().insert(partition.to_string(), name.clone());
-        Ok(name)
-    }
-}
-
 /// Which timestamp column is currently displayed.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum TimestampCol {
@@ -665,6 +464,15 @@ struct VisibleExtras {
     mode: bool,
 }
 
+/// Overlay target for list-mode Space. Directories are excluded so Space on a
+/// dir is a no-op rather than a preview of something that has no text; Enter
+/// and → still drill in.
+fn list_preview_entry(entries: &[DirEntry], selected: Option<usize>) -> Option<&DirEntry> {
+    let idx = selected?;
+    let entry = entries.get(idx)?;
+    if entry.is_dir { None } else { Some(entry) }
+}
+
 /// Input mode for interactive filter entry
 #[derive(Clone, Debug, PartialEq)]
 enum InputMode {
@@ -682,18 +490,21 @@ enum InputMode {
     MaxSize,
     /// Selecting sort mode
     SortSelect,
+    /// List-mode file preview overlay. Distinct from SortSelect so Esc
+    /// dismisses the overlay instead of quitting.
+    ListPreview,
 }
 
 impl InputMode {
     fn prompt(&self) -> String {
         match self {
             InputMode::Normal => String::new(),
-            InputMode::Pattern => "Pattern (regex): ".to_string(),
+            InputMode::Pattern => "Pattern (glob): ".to_string(),
             InputMode::OlderThan(ts) => format!("Older than (days, {}): ", ts.label()),
             InputMode::NewerThan(ts) => format!("Newer than (days, {}): ", ts.label()),
             InputMode::MinSize => "Min size (e.g., 1M): ".to_string(),
             InputMode::MaxSize => "Max size (e.g., 1G): ".to_string(),
-            InputMode::SortSelect => String::new(),
+            InputMode::SortSelect | InputMode::ListPreview => String::new(),
         }
     }
 }
@@ -732,7 +543,9 @@ fn strip_ansi(s: &str) -> String {
                 Some(']') => {
                     chars.next();
                     while let Some(ch) = chars.next() {
-                        if ch == '\x07' { break; } // BEL terminator
+                        if ch == '\x07' {
+                            break;
+                        } // BEL terminator
                         if ch == '\x1B' {
                             if chars.peek() == Some(&'\\') {
                                 chars.next(); // consume \
@@ -742,7 +555,9 @@ fn strip_ansi(s: &str) -> String {
                     }
                 }
                 // Two-byte ESC sequence: ESC + one character
-                Some(_) => { chars.next(); }
+                Some(_) => {
+                    chars.next();
+                }
                 // Bare ESC at end of string
                 None => {}
             }
@@ -752,9 +567,6 @@ fn strip_ansi(s: &str) -> String {
     }
     out
 }
-
-/// Special partition name for files directly in the top-level directory.
-const ROOT_PARTITION: &str = "__root__";
 
 /// Maximum lines to keep in the sliding window buffer.
 const MAX_BUFFER_LINES: usize = 100_000;
@@ -808,35 +620,36 @@ struct Column {
 /// Application state
 struct App {
     conn: Connection,
-    index_path: PathBuf,
+    index: IndexLocator,
 
-    /// Crawl root of the index (partition `p` lives at `<index_root>/p`)
-    index_root: String,
+    /// Crawl root of the index (partition `p` lives at `<index_root>/p`), when known: from a
+    /// local index's manifest or paths. An S3 index finds each partition's root by query.
+    index_root: Option<String>,
 
     /// Comparison against an earlier index, if `--compare` was given
     compare: Option<Compare>,
 
     /// Which files to show when comparing
     status_filter: StatusFilter,
-    
+
     /// Current absolute path prefix (the root path for the current partition)
     partition_root: String,
-    
+
     /// Current directory path (absolute, empty = partition list)
     current_path: String,
-    
+
     /// Current partition being viewed (None = viewing partition list)
     current_partition: Option<String>,
-    
+
     /// Entries in the current view
     entries: Vec<DirEntry>,
-    
+
     /// List selection state
     list_state: ListState,
-    
+
     /// Whether we're currently loading
     loading: bool,
-    
+
     /// Status message
     status: String,
 
@@ -870,6 +683,10 @@ struct App {
     /// Whether the preview pane pager is focused (less-like scroll mode)
     preview_focused: bool,
 
+    /// List-mode overlay. Separate from `file_preview` so tree state cannot leak
+    /// into the overlay (and vice versa) across a view-mode toggle.
+    list_preview: Option<FilePreview>,
+
     /// Which timestamp column is currently displayed
     timestamp_col: TimestampCol,
 
@@ -884,8 +701,8 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     fn new(
         conn: Connection,
-        index_path: PathBuf,
-        index_root: String,
+        index: IndexLocator,
+        index_root: Option<String>,
         compare: Option<Compare>,
         initial_partition: Option<String>,
         filters: QueryFilters,
@@ -893,7 +710,7 @@ impl App {
     ) -> Result<Self> {
         let mut app = App {
             conn,
-            index_path,
+            index,
             index_root,
             compare,
             status_filter: StatusFilter::default(),
@@ -914,75 +731,46 @@ impl App {
             active_column: 0,
             file_preview: None,
             preview_focused: false,
+            list_preview: None,
             timestamp_col: TimestampCol::Atime,
             visible_extras: VisibleExtras::default(),
             show_help: false,
         };
-        
+
         if let Some(partition) = initial_partition {
-            app.current_partition = Some(partition);
+            // The view navigates by top-level directory; a nested path opens inside its own.
+            let partition = normalize_partition_arg(&partition);
+            let top = top_level(&partition).to_string();
+            app.current_partition = Some(top.clone());
+            if top != partition {
+                app.partition_root = app.partition_root_path(&top)?;
+                app.current_path =
+                    format!("{}/{}", app.partition_root, &partition[top.len() + 1..]);
+            }
             app.load_directory()?;
         } else {
             app.load_partitions()?;
         }
-        
+
         if !app.entries.is_empty() {
             app.list_state.select(Some(0));
         }
-        
+
         Ok(app)
     }
-    
-    /// SQL relation with the files of one partition, or None if the partition doesn't exist.
-    /// When comparing, this is the partition's diff (with `size_old` and `status` columns).
-    fn partition_source(&self, partition: &str) -> Result<Option<String>> {
-        match self.compare {
-            Some(ref cmp) => {
-                if !cmp.has_partition(partition) {
-                    return Ok(None);
-                }
-                Ok(Some(cmp.table(&self.conn, partition)?))
-            }
-            None => {
-                // Includes partitions nested below this one.
-                if !self.index_path.join(partition).is_dir() {
-                    return Ok(None);
-                }
-                let glob = subtree_glob(&self.index_path, partition);
-                Ok(Some(format!("read_parquet({})", sql_quote(&glob))))
-            }
-        }
-    }
 
-    /// SQL relation with the files of all partitions plus a `partition` column.
-    fn all_partitions_source(&self) -> String {
+    /// The files of one top-level partition, or `None` when it does not exist. When comparing,
+    /// this is the partition's diff, with `size_old` and `status` columns.
+    fn relation(&self, partition: &str) -> Result<Option<Relation>> {
         match self.compare {
-            Some(ref cmp) => {
-                // Reuse partitions already materialized; join the rest on the fly.
-                let tables = cmp.tables.borrow();
-                let parts: Vec<String> = cmp.partitions()
-                    .filter(|p| p.as_str() != ROOT_PARTITION)
-                    .map(|p| {
-                        let source = match tables.get(p) {
-                            Some(table) => table.clone(),
-                            None => format!("({})", cmp.diff_sql(p)),
-                        };
-                        format!("SELECT {} AS partition, * FROM {}", sql_quote(p), source)
-                    })
-                    .collect();
-                if parts.is_empty() {
-                    "(SELECT NULL::VARCHAR AS partition, NULL::BIGINT AS size WHERE false)".to_string()
-                } else {
-                    format!("({})", parts.join(" UNION ALL "))
-                }
-            }
+            Some(ref cmp) => cmp.relation(&self.conn, partition),
             None => {
-                // Nested partitions are grouped under their top-level directory.
-                format!(
-                    "(SELECT *, {} AS partition FROM read_parquet({}, filename=true))",
-                    top_level_key_sql(&self.index_path),
-                    sql_quote(&all_parquet_glob(&self.index_path))
-                )
+                if let IndexLocator::Local(ref path) = self.index
+                    && !path.join(partition).is_dir()
+                {
+                    return Ok(None);
+                }
+                Ok(Some(Relation::index(&self.index, Some(partition))))
             }
         }
     }
@@ -1000,153 +788,52 @@ impl App {
 
     /// Whether any filter (including the status filter) is narrowing the view.
     fn is_filtered(&self) -> bool {
-        self.filters.is_active() || (self.compare.is_some() && self.status_filter != StatusFilter::All)
-    }
-
-    /// Aggregate columns shared by the partition and directory queries, read back by
-    /// [`App::read_stats`]. Removed files (compare mode) count toward the old index only.
-    fn aggregate_columns(&self) -> &'static str {
-        if self.compare.is_some() {
-            r#"
-                SUM(size) as total_size,
-                COUNT(*) FILTER (WHERE status <> 'removed') as file_count,
-                MAX(atime) as latest_atime,
-                MAX(mtime) as latest_mtime,
-                MAX(ctime) as latest_ctime,
-                CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
-                CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
-                MIN(mode) as min_mode,
-                SUM(size_old) as total_size_old,
-                COUNT(*) FILTER (WHERE status <> 'added') as files_old,
-                COUNT(*) FILTER (WHERE status IN ('added', 'removed', 'modified', 'meta')) as changed,
-                SUM(size) - SUM(size_old) as size_delta"#
-        } else {
-            r#"
-                SUM(size) as total_size,
-                COUNT(*) as file_count,
-                MAX(atime) as latest_atime,
-                MAX(mtime) as latest_mtime,
-                MAX(ctime) as latest_ctime,
-                CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
-                CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
-                MIN(mode) as min_mode,
-                SUM(size) as total_size_old,
-                COUNT(*) as files_old,
-                0 as changed,
-                0 as size_delta"#
-        }
-    }
-
-    /// Build a DirEntry from the columns of [`App::aggregate_columns`], starting at `col`.
-    fn read_stats(row: &duckdb::Row, col: usize, name: String, path: String, is_dir: bool) -> duckdb::Result<DirEntry> {
-        Ok(DirEntry {
-            name,
-            path,
-            is_dir,
-            total_size: row.get(col)?,
-            file_count: row.get(col + 1)?,
-            latest_atime: row.get(col + 2)?,
-            latest_mtime: row.get(col + 3)?,
-            latest_ctime: row.get(col + 4)?,
-            uid: row.get(col + 5)?,
-            gid: row.get(col + 6)?,
-            mode: row.get(col + 7)?,
-            size_old: row.get(col + 8)?,
-            files_old: row.get(col + 9)?,
-            changed: row.get(col + 10)?,
-        })
+        self.filters.is_active()
+            || (self.compare.is_some() && self.status_filter != StatusFilter::All)
     }
 
     /// Query individual files from the __root__ partition.
-    /// Returns DirEntry items with is_dir=false and file_count=1.
     fn query_root_files(&self) -> Result<Vec<DirEntry>> {
-        let Some(source) = self.partition_source(ROOT_PARTITION)? else {
-            return Ok(Vec::new());
-        };
-        let conditions = self.conditions();
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        };
-        // Per-file equivalents of the aggregate columns
-        let stats = if self.compare.is_some() {
-            "size, CASE WHEN status = 'removed' THEN 0 ELSE 1 END, atime, mtime, ctime, uid, gid, mode, \
-             size_old, CASE WHEN status = 'added' THEN 0 ELSE 1 END, \
-             CASE WHEN status IN ('added', 'removed', 'modified', 'meta') THEN 1 ELSE 0 END"
-        } else {
-            "size, 1, atime, mtime, ctime, uid, gid, mode, size, 1, 0"
-        };
-
-        let sql = format!("SELECT path, {stats} FROM {source} {where_clause}");
-
-        let mut entries = Vec::new();
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let path: String = row.get(0)?;
-            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-            entries.push(Self::read_stats(row, 1, name, path, false)?);
+        match self.relation(ROOT_PARTITION)? {
+            Some(rel) => view_query::root_files_in(&self.conn, &rel, &self.conditions()),
+            None => Ok(Vec::new()),
         }
-
-        Ok(entries)
     }
 
     /// Sort entries in-place according to the current SortMode.
     fn sort_entries(entries: &mut [DirEntry], sort_mode: SortMode) {
+        use std::cmp::Reverse;
         match sort_mode {
             SortMode::Name => {
                 // Directories first, then alphabetical by name
-                entries.sort_by(|a, b| {
-                    b.is_dir.cmp(&a.is_dir)
-                        .then_with(|| a.name.cmp(&b.name))
-                });
+                entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
             }
-            SortMode::SizeDesc => entries.sort_by(|a, b| b.total_size.cmp(&a.total_size)),
-            SortMode::SizeAsc => entries.sort_by(|a, b| a.total_size.cmp(&b.total_size)),
-            SortMode::CountDesc => entries.sort_by(|a, b| b.file_count.cmp(&a.file_count)),
-            SortMode::CountAsc => entries.sort_by(|a, b| a.file_count.cmp(&b.file_count)),
-            SortMode::AgeDesc => entries.sort_by(|a, b| a.latest_atime.cmp(&b.latest_atime)), // oldest first
-            SortMode::AgeAsc => entries.sort_by(|a, b| b.latest_atime.cmp(&a.latest_atime)),  // newest first
-            SortMode::MtimeDesc => entries.sort_by(|a, b| a.latest_mtime.cmp(&b.latest_mtime)),
-            SortMode::MtimeAsc  => entries.sort_by(|a, b| b.latest_mtime.cmp(&a.latest_mtime)),
-            SortMode::CtimeDesc => entries.sort_by(|a, b| a.latest_ctime.cmp(&b.latest_ctime)),
-            SortMode::CtimeAsc  => entries.sort_by(|a, b| b.latest_ctime.cmp(&a.latest_ctime)),
-            SortMode::UidAsc    => entries.sort_by(|a, b| a.uid.cmp(&b.uid)),
-            SortMode::GidAsc    => entries.sort_by(|a, b| a.gid.cmp(&b.gid)),
-            SortMode::ModeAsc   => entries.sort_by(|a, b| a.mode.cmp(&b.mode)),
-            SortMode::DeltaDesc => entries.sort_by(|a, b| b.size_delta().cmp(&a.size_delta())),
-            SortMode::DeltaAsc  => entries.sort_by(|a, b| a.size_delta().cmp(&b.size_delta())),
+            SortMode::SizeDesc => entries.sort_by_key(|a| Reverse(a.total_size)),
+            SortMode::SizeAsc => entries.sort_by_key(|a| a.total_size),
+            SortMode::CountDesc => entries.sort_by_key(|a| Reverse(a.file_count)),
+            SortMode::CountAsc => entries.sort_by_key(|a| a.file_count),
+            SortMode::AgeDesc => entries.sort_by_key(|a| a.latest_atime), // oldest first
+            SortMode::AgeAsc => entries.sort_by_key(|a| Reverse(a.latest_atime)), // newest first
+            SortMode::MtimeDesc => entries.sort_by_key(|a| a.latest_mtime),
+            SortMode::MtimeAsc => entries.sort_by_key(|a| Reverse(a.latest_mtime)),
+            SortMode::CtimeDesc => entries.sort_by_key(|a| a.latest_ctime),
+            SortMode::CtimeAsc => entries.sort_by_key(|a| Reverse(a.latest_ctime)),
+            SortMode::UidAsc => entries.sort_by_key(|a| a.uid),
+            SortMode::GidAsc => entries.sort_by_key(|a| a.gid),
+            SortMode::ModeAsc => entries.sort_by_key(|a| a.mode),
+            SortMode::DeltaDesc => entries.sort_by_key(|a| Reverse(a.size_delta())),
+            SortMode::DeltaAsc => entries.sort_by_key(|a| a.size_delta()),
         }
     }
 
     /// Query the partition list (with __root__ files merged in as individual entries).
     fn query_partition_entries(&self) -> Result<Vec<DirEntry>> {
-        let mut conditions = self.conditions();
-        // Exclude __root__ — its files are merged as individual entries
-        conditions.push(format!("partition IS NOT NULL AND partition != '' AND partition != '{}'", ROOT_PARTITION));
-
-        let sql = format!(
-            r#"
-            SELECT partition, {aggregates}
-            FROM {source}
-            WHERE {conditions}
-            GROUP BY partition
-            ORDER BY {order}
-            "#,
-            aggregates = self.aggregate_columns(),
-            source = self.all_partitions_source(),
-            conditions = conditions.join(" AND "),
-            order = self.sort_mode.to_partition_order_by()
-        );
-
-        let mut entries = Vec::new();
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let name: String = row.get(0)?;
-            entries.push(Self::read_stats(row, 1, name.clone(), name, true)?);
-        }
+        let rel = match self.compare {
+            Some(ref cmp) => cmp.partitions_relation(),
+            None => Relation::index_partitions(&self.index),
+        };
+        let mut entries =
+            view_query::partitions_in(&self.conn, &rel, &self.conditions(), self.sort_mode)?;
 
         // Merge individual files from the __root__ partition
         let root_files = self.query_root_files()?;
@@ -1159,63 +846,12 @@ impl App {
 
     /// Query the entries (subdirectories and files) directly under `path` in a partition.
     fn query_directory_entries(&self, partition: &str, path: &str) -> Result<Vec<DirEntry>> {
-        let Some(source) = self.partition_source(partition)? else {
-            return Ok(Vec::new());
-        };
-
-        // Path prefix we're looking at (with trailing slash for LIKE).
-        // We extract the next path component after it.
-        let prefix = format!("{}/", path);
-        let prefix_len = prefix.len();
-
-        let mut conditions = vec![format!("starts_with(path, {})", sql_quote(&prefix))];
-        conditions.extend(self.conditions());
-
-        let order_by = self.sort_mode.to_order_by(self.sort_mode == SortMode::Name);
-
-        let sql = format!(
-            r#"
-            WITH files AS (
-                SELECT * FROM {source}
-                WHERE {conditions}
-            ),
-            components AS (
-                SELECT
-                    *,
-                    CASE
-                        WHEN position('/' IN substr(path, {prefix_len} + 1)) > 0
-                        THEN substr(path, {prefix_len} + 1, position('/' IN substr(path, {prefix_len} + 1)) - 1)
-                        ELSE substr(path, {prefix_len} + 1)
-                    END as component,
-                    CASE
-                        WHEN position('/' IN substr(path, {prefix_len} + 1)) > 0 THEN true
-                        ELSE false
-                    END as is_dir
-                FROM files
-            )
-            SELECT
-                component,
-                bool_or(is_dir) as is_dir,
-                {aggregates}
-            FROM components
-            WHERE component != '' AND component IS NOT NULL
-            GROUP BY component
-            ORDER BY {order_by}
-            "#,
-            conditions = conditions.join(" AND "),
-            aggregates = self.aggregate_columns(),
-        );
-
-        let mut entries = Vec::new();
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let component: String = row.get(0)?;
-            let is_dir: bool = row.get(1)?;
-            let entry_path = format!("{}/{}", path, component);
-            entries.push(Self::read_stats(row, 2, component, entry_path, is_dir)?);
+        match self.relation(partition)? {
+            Some(rel) => {
+                view_query::directory_in(&self.conn, &rel, path, &self.conditions(), self.sort_mode)
+            }
+            None => Ok(Vec::new()),
         }
-        Ok(entries)
     }
 
     /// Load the list of partitions
@@ -1225,14 +861,22 @@ impl App {
 
         self.entries = self.query_partition_entries()?;
 
-        self.status = format!("{} entries loaded in {:.2}s", self.entries.len(), start.elapsed().as_secs_f64());
+        self.status = format!(
+            "{} entries loaded in {:.2}s",
+            self.entries.len(),
+            start.elapsed().as_secs_f64()
+        );
         self.loading = false;
         Ok(())
     }
 
-    /// Root directory of a partition (`<index_root>/<partition>`).
-    fn partition_root_path(&self, partition: &str) -> String {
-        format!("{}/{}", self.index_root, partition)
+    /// Root directory of a partition: `<index_root>/<partition>` when the crawl root is
+    /// known, else the directory of the partition's shortest path.
+    fn partition_root_path(&self, partition: &str) -> Result<String> {
+        match self.index_root {
+            Some(ref root) => Ok(format!("{}/{}", root, partition)),
+            None => view_query::partition_root(&self.conn, &self.index, partition),
+        }
     }
 
     /// Load directory contents for the current path
@@ -1244,7 +888,7 @@ impl App {
 
         // If we don't have a partition root yet, start there
         if self.partition_root.is_empty() {
-            self.partition_root = self.partition_root_path(&partition);
+            self.partition_root = self.partition_root_path(&partition)?;
             self.current_path = self.partition_root.clone();
         }
 
@@ -1254,8 +898,17 @@ impl App {
         self.entries = entries;
 
         let elapsed = start.elapsed().as_secs_f64();
-        let filter_info = if self.is_filtered() { " (filtered)" } else { "" };
-        self.status = format!("{} entries in {:.2}s{}", self.entries.len(), elapsed, filter_info);
+        let filter_info = if self.is_filtered() {
+            " (filtered)"
+        } else {
+            ""
+        };
+        self.status = format!(
+            "{} entries in {:.2}s{}",
+            self.entries.len(),
+            elapsed,
+            filter_info
+        );
         self.loading = false;
         Ok(())
     }
@@ -1343,13 +996,27 @@ impl App {
     /// Confirm input and apply filter
     fn confirm_input(&mut self) -> Result<()> {
         let value = self.input_buffer.trim().to_string();
-        
+
         match self.input_mode {
             InputMode::Pattern => {
                 if value.is_empty() {
                     self.filters.pattern = None;
+                    self.filters.pattern_display = None;
                 } else {
-                    self.filters.pattern = Some(value);
+                    // The prompt speaks the same glob dialect as the flag; the stored
+                    // field stays regex whichever entry point set it.
+                    match glob_to_regex(&value) {
+                        Ok(translated) => {
+                            self.filters.pattern = Some(translated);
+                            self.filters.pattern_display = Some(value);
+                        }
+                        Err(e) => {
+                            self.status = format!("Invalid pattern: {}", e);
+                            self.input_mode = InputMode::Normal;
+                            self.input_buffer.clear();
+                            return Ok(());
+                        }
+                    }
                 }
             }
             InputMode::OlderThan(ts) => {
@@ -1432,9 +1099,9 @@ impl App {
                     }
                 }
             }
-            InputMode::Normal | InputMode::SortSelect => {}
+            InputMode::Normal | InputMode::SortSelect | InputMode::ListPreview => {}
         }
-        
+
         self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
         self.reload()
@@ -1445,7 +1112,7 @@ impl App {
         self.filters.clear();
         self.reload()
     }
-    
+
     fn select_next(&mut self) {
         if self.entries.is_empty() {
             return;
@@ -1456,7 +1123,7 @@ impl App {
         };
         self.list_state.select(Some(i));
     }
-    
+
     fn select_prev(&mut self) {
         if self.entries.is_empty() {
             return;
@@ -1480,27 +1147,60 @@ impl App {
         }
     }
 
-    fn cycle_timestamp(&mut self) { self.timestamp_col = self.timestamp_col.next(); }
-    fn toggle_uid(&mut self)      { self.visible_extras.uid  = !self.visible_extras.uid; }
-    fn toggle_gid(&mut self)      { self.visible_extras.gid  = !self.visible_extras.gid; }
-    fn toggle_mode(&mut self)     { self.visible_extras.mode = !self.visible_extras.mode; }
-    fn toggle_help(&mut self)     { self.show_help = !self.show_help; }
-    
+    fn open_list_preview(&mut self) {
+        let Some(entry) = list_preview_entry(&self.entries, self.list_state.selected()) else {
+            return;
+        };
+        // Clone before load: `entry` borrows `self.entries`.
+        let path = entry.path.clone();
+        let size = entry.total_size;
+        let atime = entry.latest_atime;
+        let size_old = self
+            .compare
+            .as_ref()
+            .and_then(|_| (entry.files_old > 0).then_some(entry.size_old));
+        let mut preview = Self::load_file_preview(&path, size, atime);
+        preview.size_old = size_old;
+        self.list_preview = Some(preview);
+        self.input_mode = InputMode::ListPreview;
+    }
+
+    fn close_list_preview(&mut self) {
+        self.list_preview = None;
+        self.input_mode = InputMode::Normal;
+    }
+
+    fn cycle_timestamp(&mut self) {
+        self.timestamp_col = self.timestamp_col.next();
+    }
+    fn toggle_uid(&mut self) {
+        self.visible_extras.uid = !self.visible_extras.uid;
+    }
+    fn toggle_gid(&mut self) {
+        self.visible_extras.gid = !self.visible_extras.gid;
+    }
+    fn toggle_mode(&mut self) {
+        self.visible_extras.mode = !self.visible_extras.mode;
+    }
+    fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+    }
+
     fn enter_selected(&mut self) -> Result<()> {
         let Some(idx) = self.list_state.selected() else {
             return Ok(());
         };
-        
+
         let entry = &self.entries[idx];
-        
+
         if !entry.is_dir {
             return Ok(());
         }
-        
+
         if entry.name == ".." {
             return self.go_up();
         }
-        
+
         // If we're at the partition list, enter the partition
         if self.current_partition.is_none() {
             self.current_partition = Some(entry.name.clone());
@@ -1512,17 +1212,17 @@ impl App {
             self.current_path = format!("{}/{}", self.current_path, entry.name);
             self.load_directory()?;
         }
-        
+
         self.list_state.select(Some(0));
         Ok(())
     }
-    
+
     fn go_up(&mut self) -> Result<()> {
         if self.current_partition.is_none() {
             // Already at root
             return Ok(());
         }
-        
+
         if self.current_path == self.partition_root || self.current_path.is_empty() {
             // Go back to partition list
             self.current_partition = None;
@@ -1538,11 +1238,11 @@ impl App {
             }
             self.load_directory()?;
         }
-        
+
         self.list_state.select(Some(0));
         Ok(())
     }
-    
+
     // ---- Tree (Miller columns) mode ----
 
     /// Create a Column for the partition list.
@@ -1566,7 +1266,7 @@ impl App {
 
     /// Create a Column for a partition's root directory.
     fn make_partition_root_column(&self, partition: &str) -> Result<Column> {
-        let partition_root = self.partition_root_path(partition);
+        let partition_root = self.partition_root_path(partition)?;
         self.make_directory_column_tree(partition, &partition_root, &partition_root)
     }
 
@@ -1665,7 +1365,13 @@ impl App {
         };
 
         match action {
-            PreviewAction::Directory { is_partition_list, name, partition, partition_root, path } => {
+            PreviewAction::Directory {
+                is_partition_list,
+                name,
+                partition,
+                partition_root,
+                path,
+            } => {
                 let new_col = if is_partition_list {
                     self.make_partition_root_column(&name)?
                 } else {
@@ -1675,7 +1381,12 @@ impl App {
                 };
                 self.columns.push(new_col);
             }
-            PreviewAction::File { path, size, atime, size_old } => {
+            PreviewAction::File {
+                path,
+                size,
+                atime,
+                size_old,
+            } => {
                 let mut preview = Self::load_file_preview(&path, size, atime);
                 if self.compare.is_some() {
                     preview.size_old = size_old;
@@ -1970,7 +1681,11 @@ impl App {
         let partition = partition.clone();
 
         // Select the matching partition in column 0
-        if let Some(idx) = self.columns[0].entries.iter().position(|e| e.name == partition) {
+        if let Some(idx) = self.columns[0]
+            .entries
+            .iter()
+            .position(|e| e.name == partition)
+        {
             self.columns[0].list_state.select(Some(idx));
         }
 
@@ -1987,7 +1702,9 @@ impl App {
                 // Select the matching entry in the current active column
                 let col = &self.columns[self.active_column];
                 if let Some(idx) = col.entries.iter().position(|e| e.name == *component) {
-                    self.columns[self.active_column].list_state.select(Some(idx));
+                    self.columns[self.active_column]
+                        .list_state
+                        .select(Some(idx));
                     self.tree_update_preview()?;
                     // Move into the newly expanded column
                     if self.active_column + 1 < self.columns.len() {
@@ -2019,7 +1736,9 @@ impl App {
         }
 
         let col = &self.columns[self.active_column];
-        let selected_name = col.list_state.selected()
+        let selected_name = col
+            .list_state
+            .selected()
             .and_then(|idx| col.entries.get(idx))
             .map(|e| e.name.clone());
 
@@ -2064,11 +1783,11 @@ impl App {
         if atime == 0 {
             return String::new();
         }
-        
+
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
         let time = UNIX_EPOCH + Duration::from_secs(atime as u64);
         let now = SystemTime::now();
-        
+
         if let Ok(duration) = now.duration_since(time) {
             let days = duration.as_secs() / 86400;
             if days == 0 {
@@ -2099,84 +1818,103 @@ impl App {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
-    
-    // Resolve index path
-    let index_path = args.index.canonicalize()
-        .with_context(|| format!("Index directory not found: {}", args.index.display()))?;
-    
+    let args = XduViewArgs::parse();
+
     // Parse sort mode
-    let sort_mode: SortMode = args.sort.parse()
-        .map_err(|e: String| anyhow::anyhow!(e))?;
+    let sort_mode: SortMode = args.sort.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     if sort_mode.is_compare_only() && args.compare.is_none() {
         anyhow::bail!("--sort {} requires --compare", sort_mode);
     }
-    
-    // Build filters from CLI args
+
+    // Build filters from CLI args. This runs before the terminal is touched, so an
+    // invalid pattern exits without ever owning raw mode or the alternate screen.
     let filters = QueryFilters::new()
-        .with_pattern(args.pattern)
+        .with_path_pattern(args.pattern, args.regex)
+        .map_err(|e| anyhow::anyhow!(e))?
         .with_older_than(args.older_than)
         .with_newer_than(args.newer_than)
         .with_min_size(args.min_size.as_deref())
         .map_err(|e| anyhow::anyhow!(e))?
         .with_max_size(args.max_size.as_deref())
         .map_err(|e| anyhow::anyhow!(e))?;
-    
-    // Connect to DuckDB
-    let conn = Connection::open_in_memory()?;
 
-    let partitions = list_partitions(&index_path)?;
-    let index_root = discover_index_root(&conn, &index_path, &partitions)?;
+    // Every refusal and warning comes before the terminal is touched, so the diagnostic
+    // survives on the terminal instead of being wiped with the alternate screen.
+    let (index, conn) = open_index(&args.index)?;
 
-    let compare = match args.compare {
-        Some(ref old_path) => {
-            let old_index = old_path.canonicalize()
-                .with_context(|| format!("Comparison index not found: {}", old_path.display()))?;
-            let old_partitions = list_partitions(&old_index)?;
-            let old_root = discover_index_root(&conn, &old_index, &old_partitions)?;
-            // The view navigates by top-level directory, so compare whole subtrees.
-            let units = diff_units(&old_partitions, &partitions, false)
-                .into_iter()
-                .map(|u| (u.name.clone(), u))
-                .collect();
-            Some(Compare {
-                old: DiffSide { index: old_index, root: old_root },
-                new: DiffSide { index: index_path.clone(), root: index_root.clone() },
-                units,
-                tables: RefCell::new(HashMap::new()),
-            })
+    // A local index knows its crawl root, so every partition opens at its top; a comparison
+    // needs the root to line files up, and so needs a local index on both sides.
+    let (index_root, compare) = match index {
+        IndexLocator::Local(ref index_path) => {
+            let partitions = list_partitions(index_path)?;
+            let index_root = discover_index_root(&conn, index_path, &partitions)?;
+            let compare = match args.compare {
+                Some(ref old_path) => {
+                    if let IndexLocator::S3(_) = IndexLocator::parse(old_path.as_os_str())? {
+                        anyhow::bail!("--compare takes a local index: {}", old_path.display());
+                    }
+                    let old_index = old_path.canonicalize().with_context(|| {
+                        format!("Comparison index not found: {}", old_path.display())
+                    })?;
+                    if let Some(error) = xdu::index_version_error(&old_index) {
+                        anyhow::bail!(error);
+                    }
+                    Some(Compare::open(
+                        &conn,
+                        index_path,
+                        &index_root,
+                        &partitions,
+                        &old_index,
+                    )?)
+                }
+                None => None,
+            };
+            (Some(index_root), compare)
         }
-        None => None,
+        IndexLocator::S3(_) => {
+            if args.compare.is_some() {
+                anyhow::bail!("--compare requires a local index");
+            }
+            (None, None)
+        }
     };
 
     // Initialize app
-    let mut app = App::new(conn, index_path, index_root, compare, args.partition, filters, sort_mode)?;
-    
+    let mut app = App::new(
+        conn,
+        index,
+        index_root,
+        compare,
+        args.partition,
+        filters,
+        sort_mode,
+    )?;
+
     // Setup terminal
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
-    
+
     // Main loop
     let result = run_app(&mut terminal, &mut app);
-    
+
     // Restore terminal
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
-    
+
     result
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|f| ui(f, app))?;
-        
+
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                
+
                 // Handle sort selection mode
                 if app.input_mode == InputMode::SortSelect {
                     match key.code {
@@ -2189,8 +1927,21 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                         KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
                             app.sort_select_prev();
                         }
-                        KeyCode::Down | KeyCode::Char('j') | KeyCode::Right | KeyCode::Char('s') => {
+                        KeyCode::Down
+                        | KeyCode::Char('j')
+                        | KeyCode::Right
+                        | KeyCode::Char('s') => {
                             app.sort_select_next();
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if app.input_mode == InputMode::ListPreview {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char(' ') | KeyCode::Char('q') => {
+                            app.close_list_preview();
                         }
                         _ => {}
                     }
@@ -2216,7 +1967,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                     }
                     continue;
                 }
-                
+
                 // Handle preview pager focus mode (tree view file preview)
                 if app.preview_focused {
                     match key.code {
@@ -2257,7 +2008,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                         KeyCode::Char('G') => {
                             if let Some(ref mut preview) = app.file_preview {
                                 App::preview_load_to_eof(preview);
-                                preview.scroll_offset = preview.total_lines_loaded.saturating_sub(1);
+                                preview.scroll_offset =
+                                    preview.total_lines_loaded.saturating_sub(1);
                             }
                         }
                         KeyCode::Char('d') => {
@@ -2266,7 +2018,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                                 preview.scroll_offset += 20;
                                 // Load more if needed
                                 let last_loaded = preview.first_line_number + preview.lines.len();
-                                if preview.scroll_offset + 40 >= last_loaded && !preview.eof_reached {
+                                if preview.scroll_offset + 40 >= last_loaded && !preview.eof_reached
+                                {
                                     App::preview_load_more_lines(preview);
                                 }
                                 let max_offset = preview.total_lines_loaded.saturating_sub(1);
@@ -2300,7 +2053,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     // Toggle list ↔ tree view
-                    KeyCode::Char('m') => {
+                    KeyCode::Char('t') => {
                         if let Err(e) = app.toggle_view_mode() {
                             app.status = format!("Error: {}", e);
                         }
@@ -2308,10 +2061,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                     // Help overlay
                     KeyCode::Char('?') => app.toggle_help(),
                     // Cycle timestamp column (both modes)
-                    KeyCode::Char('t') => app.cycle_timestamp(),
+                    KeyCode::Char('a') => app.cycle_timestamp(),
                     // Extra column toggles (both modes)
                     KeyCode::Char('u') => app.toggle_uid(),
-                    KeyCode::Char('g') => app.toggle_gid(),
+                    KeyCode::Char('r') => app.toggle_gid(),
                     KeyCode::Char('x') => app.toggle_mode(),
                     // Sort mode selection (both modes)
                     KeyCode::Char('s') => app.start_sort_select(),
@@ -2355,11 +2108,14 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                         ViewMode::List => match key.code {
                             KeyCode::Down | KeyCode::Char('j') => app.select_next(),
                             KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
-                            KeyCode::Enter | KeyCode::Right | KeyCode::Char(' ') => {
+                            KeyCode::Char('g') => app.select_first(),
+                            KeyCode::Char('G') => app.select_last(),
+                            KeyCode::Enter | KeyCode::Right => {
                                 if let Err(e) = app.enter_selected() {
                                     app.status = format!("Error: {}", e);
                                 }
                             }
+                            KeyCode::Char(' ') => app.open_list_preview(),
                             KeyCode::Left | KeyCode::Backspace => {
                                 if let Err(e) = app.go_up() {
                                     app.status = format!("Error: {}", e);
@@ -2378,6 +2134,16 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                                     app.status = format!("Error: {}", e);
                                 }
                             }
+                            KeyCode::Char('g') => {
+                                if let Err(e) = app.tree_select_first() {
+                                    app.status = format!("Error: {}", e);
+                                }
+                            }
+                            KeyCode::Char('G') => {
+                                if let Err(e) = app.tree_select_last() {
+                                    app.status = format!("Error: {}", e);
+                                }
+                            }
                             KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => {
                                 // If a file is selected, activate pager mode
                                 if app.file_preview.is_some() {
@@ -2393,7 +2159,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                             }
                             _ => {}
                         },
-                    }
+                    },
                 }
             }
         }
@@ -2404,14 +2170,19 @@ fn ui(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),     // Content
-            Constraint::Length(1),  // Status bar
+            Constraint::Min(1),    // Content
+            Constraint::Length(1), // Status bar
         ])
         .split(f.area());
 
     // Render content based on view mode
     match app.view_mode {
-        ViewMode::List => render_list_content(f, app, chunks[0]),
+        ViewMode::List => {
+            render_list_content(f, app, chunks[0]);
+            if app.list_preview.is_some() {
+                render_list_preview_overlay(f, app, chunks[0]);
+            }
+        }
         ViewMode::Tree => render_tree_content(f, app, chunks[0]),
     }
 
@@ -2430,40 +2201,110 @@ fn render_help_overlay(f: &mut Frame) {
     let popup_h = 20u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
-    let popup_area = Rect { x, y, width: popup_w, height: popup_h };
+    let popup_area = Rect {
+        x,
+        y,
+        width: popup_w,
+        height: popup_h,
+    };
 
     f.render_widget(Clear, popup_area);
 
     let help_text = vec![
         Line::from(vec![
-            Span::styled("Navigation", Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow)),
+            Span::styled(
+                "Navigation",
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Yellow),
+            ),
             Span::raw("              "),
-            Span::styled("Display / Filter", Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow)),
+            Span::styled(
+                "Display / Filter",
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Yellow),
+            ),
         ]),
         Line::from("──────────────────────  ──────────────────────────"),
-        Line::from(vec![Span::raw("j/↓  next               "), Span::styled("t", Style::default().fg(Color::Cyan)), Span::raw("   cycle timestamp (accessed/modified/changed)")]),
-        Line::from(vec![Span::raw("k/↑  prev               "), Span::styled("u", Style::default().fg(Color::Cyan)), Span::raw("   toggle user column")]),
-        Line::from(vec![Span::raw("PgUp first              "), Span::styled("g", Style::default().fg(Color::Cyan)), Span::raw("   toggle group column")]),
-        Line::from(vec![Span::raw("PgDn last               "), Span::styled("x", Style::default().fg(Color::Cyan)), Span::raw("   toggle mode column")]),
-        Line::from(vec![Span::raw("←/BS up / collapse      "), Span::styled("s", Style::default().fg(Color::Cyan)), Span::raw("   sort selector")]),
-        Line::from(vec![Span::raw("→/Enter enter/expand    "), Span::styled("/", Style::default().fg(Color::Cyan)), Span::raw("   filter by pattern")]),
-        Line::from(vec![Span::raw("m    list ↔ tree         "), Span::styled("o", Style::default().fg(Color::Cyan)), Span::raw("   older than N days (active timestamp)")]),
-        Line::from(vec![Span::raw("q    quit                "), Span::styled("n", Style::default().fg(Color::Cyan)), Span::raw("   newer than N days (active timestamp)")]),
-        Line::from(vec![Span::raw("?    this help           "), Span::styled(">", Style::default().fg(Color::Cyan)), Span::raw("   min size")]),
-        Line::from(vec![Span::raw("                         "), Span::styled("<", Style::default().fg(Color::Cyan)), Span::raw("   max size")]),
-        Line::from(vec![Span::raw("                         "), Span::styled("c", Style::default().fg(Color::Cyan)), Span::raw("   clear filters")]),
-        Line::from(vec![Span::raw("                         "), Span::styled("d", Style::default().fg(Color::Cyan)), Span::raw("   cycle changes shown (--compare)")]),
+        Line::from(vec![
+            Span::raw("j/↓  next                "),
+            Span::styled("a", Style::default().fg(Color::Cyan)),
+            Span::raw("   cycle timestamp (accessed/modified/changed)"),
+        ]),
+        Line::from(vec![
+            Span::raw("k/↑  prev                "),
+            Span::styled("u", Style::default().fg(Color::Cyan)),
+            Span::raw("   toggle user column"),
+        ]),
+        Line::from(vec![
+            Span::raw("g/PgUp first             "),
+            Span::styled("r", Style::default().fg(Color::Cyan)),
+            Span::raw("   toggle group column"),
+        ]),
+        Line::from(vec![
+            Span::raw("G/PgDn last              "),
+            Span::styled("x", Style::default().fg(Color::Cyan)),
+            Span::raw("   toggle mode column"),
+        ]),
+        Line::from(vec![
+            Span::raw("←/BS up / collapse       "),
+            Span::styled("s", Style::default().fg(Color::Cyan)),
+            Span::raw("   sort selector"),
+        ]),
+        Line::from(vec![
+            Span::raw("→/Enter enter/expand     "),
+            Span::styled("/", Style::default().fg(Color::Cyan)),
+            Span::raw("   filter by pattern (glob)"),
+        ]),
+        Line::from(vec![
+            Span::raw("␣    preview file (list) "),
+            Span::styled("o", Style::default().fg(Color::Cyan)),
+            Span::raw("   older than N days (active timestamp)"),
+        ]),
+        Line::from(vec![
+            Span::raw("t    list ↔ tree         "),
+            Span::styled("n", Style::default().fg(Color::Cyan)),
+            Span::raw("   newer than N days (active timestamp)"),
+        ]),
+        Line::from(vec![
+            Span::raw("q    quit                "),
+            Span::styled(">", Style::default().fg(Color::Cyan)),
+            Span::raw("   min size"),
+        ]),
+        Line::from(vec![
+            Span::raw("?    this help           "),
+            Span::styled("<", Style::default().fg(Color::Cyan)),
+            Span::raw("   max size"),
+        ]),
+        Line::from(vec![
+            Span::raw("                         "),
+            Span::styled("c", Style::default().fg(Color::Cyan)),
+            Span::raw("   clear filters"),
+        ]),
+        Line::from(vec![
+            Span::raw("                         "),
+            Span::styled("d", Style::default().fg(Color::Cyan)),
+            Span::raw("   cycle changes shown (--compare)"),
+        ]),
         Line::from(""),
-        Line::from(Span::styled("  Press any key to close", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            "  Press any key to close",
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
 
-    let paragraph = Paragraph::new(help_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue))
-                .title(Span::styled(" Keyboard Shortcuts ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)))
-        );
+    let paragraph = Paragraph::new(help_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Blue))
+            .title(Span::styled(
+                " Keyboard Shortcuts ",
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            )),
+    );
     f.render_widget(paragraph, popup_area);
 }
 
@@ -2485,7 +2326,10 @@ fn render_list_content(f: &mut Frame, app: &App, area: Rect) {
             ""
         };
         if app.loading {
-            format!(" {}{} (loading...){} ", partition, display_path, filter_suffix)
+            format!(
+                " {}{} (loading...){} ",
+                partition, display_path, filter_suffix
+            )
         } else {
             format!(" {}{}{} ", partition, display_path, filter_suffix)
         }
@@ -2513,57 +2357,168 @@ fn render_list_content(f: &mut Frame, app: &App, area: Rect) {
         gid: String,
         mode_s: String,
     }
-    let formatted: Vec<EntryFmt> = app.entries.iter().map(|entry| {
-        let prefix = if entry.is_dir && entry.name != ".." {
-            "▸ "
-        } else if entry.name == ".." {
-            "◂ "
-        } else {
-            "  "
-        };
-        let is_blank = entry.name == "..";
-        let marker = if comparing && !is_blank { entry.change_marker() } else { ' ' };
-        let name = if comparing {
-            format!("{} {}{}", marker, prefix, entry.name)
-        } else {
-            format!("{}{}", prefix, entry.name)
-        };
-        let name_style = marker_style(marker);
-        let (delta, dfiles) = if comparing && !is_blank {
-            (format_size_delta(entry), format_count_delta(entry.files_delta()))
-        } else {
-            (String::new(), String::new())
-        };
-        let delta_style = delta_style(entry.size_delta());
-        let dfiles_style = self::delta_style(entry.files_delta());
+    let formatted: Vec<EntryFmt> = app
+        .entries
+        .iter()
+        .map(|entry| {
+            let prefix = if entry.is_dir && entry.name != ".." {
+                "▸ "
+            } else if entry.name == ".." {
+                "◂ "
+            } else {
+                "  "
+            };
+            let is_blank = entry.name == "..";
+            let marker = if comparing && !is_blank {
+                entry.change_marker()
+            } else {
+                ' '
+            };
+            let name = if comparing {
+                format!("{} {}{}", marker, prefix, entry.name)
+            } else {
+                format!("{}{}", prefix, entry.name)
+            };
+            let name_style = marker_style(marker);
+            let (delta, dfiles) = if comparing && !is_blank {
+                (
+                    format_size_delta(entry),
+                    format_count_delta(entry.files_delta()),
+                )
+            } else {
+                (String::new(), String::new())
+            };
+            let delta_style = delta_style(entry.size_delta());
+            let dfiles_style = self::delta_style(entry.files_delta());
 
-        let size = if is_blank { String::new() } else { format_bytes(entry.total_size as u64) };
-        let count = if is_blank { String::new() } else { format_file_count(entry.file_count) };
-        let ts = if is_blank { String::new() } else {
-            match app.timestamp_col {
-                TimestampCol::Atime => app.format_atime(entry.latest_atime),
-                TimestampCol::Mtime => app.format_atime(entry.latest_mtime),
-                TimestampCol::Ctime => app.format_atime(entry.latest_ctime),
+            let size = if is_blank {
+                String::new()
+            } else {
+                format_bytes(entry.total_size as u64)
+            };
+            let count = if is_blank {
+                String::new()
+            } else {
+                format_file_count(entry.file_count)
+            };
+            let ts = if is_blank {
+                String::new()
+            } else {
+                match app.timestamp_col {
+                    TimestampCol::Atime => app.format_atime(entry.latest_atime),
+                    TimestampCol::Mtime => app.format_atime(entry.latest_mtime),
+                    TimestampCol::Ctime => app.format_atime(entry.latest_ctime),
+                }
+            };
+            let uid = if is_blank || !app.visible_extras.uid {
+                String::new()
+            } else {
+                format_uid(entry.uid, entry.is_dir)
+            };
+            let gid = if is_blank || !app.visible_extras.gid {
+                String::new()
+            } else {
+                format_gid(entry.gid, entry.is_dir)
+            };
+            let mode_s = if is_blank || !app.visible_extras.mode {
+                String::new()
+            } else {
+                format_mode(entry.mode, entry.is_dir)
+            };
+            EntryFmt {
+                name,
+                name_style,
+                size,
+                delta,
+                delta_style,
+                count,
+                dfiles,
+                dfiles_style,
+                ts,
+                uid,
+                gid,
+                mode_s,
             }
-        };
-        let uid = if is_blank || !app.visible_extras.uid { String::new() } else { format_uid(entry.uid, entry.is_dir) };
-        let gid = if is_blank || !app.visible_extras.gid { String::new() } else { format_gid(entry.gid, entry.is_dir) };
-        let mode_s = if is_blank || !app.visible_extras.mode { String::new() } else { format_mode(entry.mode, entry.is_dir) };
-        EntryFmt { name, name_style, size, delta, delta_style, count, dfiles, dfiles_style, ts, uid, gid, mode_s }
-    }).collect();
+        })
+        .collect();
 
     // Calculate dynamic column widths based on content (with minimum widths)
-    let size_width  = formatted.iter().map(|f| f.size.len()).max().unwrap_or(0).max(10);
-    let delta_width = if comparing { formatted.iter().map(|f| f.delta.len()).max().unwrap_or(0).max(10) } else { 0 };
-    let count_width = formatted.iter().map(|f| f.count.len()).max().unwrap_or(0).max(8);
-    let dfiles_width = if comparing { formatted.iter().map(|f| f.dfiles.len()).max().unwrap_or(0).max(6) } else { 0 };
-    let ts_width    = formatted.iter().map(|f| f.ts.len()).max().unwrap_or(0).max(12);
-    let uid_width   = if app.visible_extras.uid  { formatted.iter().map(|f| f.uid.len()).max().unwrap_or(0).max(4).max("user".len()) } else { 0 };
-    let gid_width   = if app.visible_extras.gid  { formatted.iter().map(|f| f.gid.len()).max().unwrap_or(0).max(5).max("group".len()) } else { 0 };
-    let mode_width  = if app.visible_extras.mode { formatted.iter().map(|f| f.mode_s.len()).max().unwrap_or(0).max(6) } else { 0 };
+    let size_width = formatted
+        .iter()
+        .map(|f| f.size.len())
+        .max()
+        .unwrap_or(0)
+        .max(10);
+    let delta_width = if comparing {
+        formatted
+            .iter()
+            .map(|f| f.delta.len())
+            .max()
+            .unwrap_or(0)
+            .max(10)
+    } else {
+        0
+    };
+    let count_width = formatted
+        .iter()
+        .map(|f| f.count.len())
+        .max()
+        .unwrap_or(0)
+        .max(8);
+    let dfiles_width = if comparing {
+        formatted
+            .iter()
+            .map(|f| f.dfiles.len())
+            .max()
+            .unwrap_or(0)
+            .max(6)
+    } else {
+        0
+    };
+    let ts_width = formatted
+        .iter()
+        .map(|f| f.ts.len())
+        .max()
+        .unwrap_or(0)
+        .max(12);
+    let uid_width = if app.visible_extras.uid {
+        formatted
+            .iter()
+            .map(|f| f.uid.len())
+            .max()
+            .unwrap_or(0)
+            .max(4)
+            .max("user".len())
+    } else {
+        0
+    };
+    let gid_width = if app.visible_extras.gid {
+        formatted
+            .iter()
+            .map(|f| f.gid.len())
+            .max()
+            .unwrap_or(0)
+            .max(5)
+            .max("group".len())
+    } else {
+        0
+    };
+    let mode_width = if app.visible_extras.mode {
+        formatted
+            .iter()
+            .map(|f| f.mode_s.len())
+            .max()
+            .unwrap_or(0)
+            .max(6)
+    } else {
+        0
+    };
 
     let extra_cols = [uid_width, gid_width, mode_width, delta_width, dfiles_width]
-        .iter().filter(|&&w| w > 0).map(|&w| w + 2).sum::<usize>();
+        .iter()
+        .filter(|&&w| w > 0)
+        .map(|&w| w + 2)
+        .sum::<usize>();
 
     // Calculate available width for names
     let area_width = area.width.saturating_sub(2) as usize;
@@ -2571,42 +2526,67 @@ fn render_list_content(f: &mut Frame, app: &App, area: Rect) {
     let name_width = area_width.saturating_sub(fixed_cols);
 
     // Entry list
-    let items: Vec<ListItem> = formatted.iter().map(|f| {
-        let name_display = if f.name.len() > name_width {
-            format!("{}…", &f.name[..name_width.saturating_sub(1)])
-        } else {
-            f.name.clone()
-        };
+    let items: Vec<ListItem> = formatted
+        .iter()
+        .map(|f| {
+            let name_display = if f.name.len() > name_width {
+                format!("{}…", &f.name[..name_width.saturating_sub(1)])
+            } else {
+                f.name.clone()
+            };
 
-        let mut spans = vec![
-            Span::styled(format!("{:<name_width$}", name_display), f.name_style),
-            Span::raw(format!("  {:>size_width$}", f.size)),
-        ];
-        if comparing {
-            spans.push(Span::styled(format!("  {:>delta_width$}", f.delta), f.delta_style));
-        }
-        spans.push(Span::raw(format!("  {:>count_width$}", f.count)));
-        if comparing {
-            spans.push(Span::styled(format!("  {:>dfiles_width$}", f.dfiles), f.dfiles_style));
-        }
-        let mut rest = format!("  {:>ts_width$}", f.ts);
-        if app.visible_extras.uid  { rest += &format!("  {:>uid_width$}",  f.uid,    uid_width  = uid_width);  }
-        if app.visible_extras.gid  { rest += &format!("  {:>gid_width$}",  f.gid,    gid_width  = gid_width);  }
-        if app.visible_extras.mode { rest += &format!("  {:>mode_width$}", f.mode_s, mode_width = mode_width); }
-        spans.push(Span::raw(rest));
+            let mut spans = vec![
+                Span::styled(format!("{:<name_width$}", name_display), f.name_style),
+                Span::raw(format!("  {:>size_width$}", f.size)),
+            ];
+            if comparing {
+                spans.push(Span::styled(
+                    format!("  {:>delta_width$}", f.delta),
+                    f.delta_style,
+                ));
+            }
+            spans.push(Span::raw(format!("  {:>count_width$}", f.count)));
+            if comparing {
+                spans.push(Span::styled(
+                    format!("  {:>dfiles_width$}", f.dfiles),
+                    f.dfiles_style,
+                ));
+            }
+            let mut rest = format!("  {:>ts_width$}", f.ts);
+            if app.visible_extras.uid {
+                rest += &format!("  {:>uid_width$}", f.uid, uid_width = uid_width);
+            }
+            if app.visible_extras.gid {
+                rest += &format!("  {:>gid_width$}", f.gid, gid_width = gid_width);
+            }
+            if app.visible_extras.mode {
+                rest += &format!("  {:>mode_width$}", f.mode_s, mode_width = mode_width);
+            }
+            spans.push(Span::raw(rest));
 
-        ListItem::new(Line::from(spans))
-    }).collect();
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
 
     // Build header string using same widths as data rows
     let mut header = format!("{:<name_width$}  {:>size_width$}", "name", "size");
-    if comparing { header += &format!("  {:>delta_width$}", "Δsize"); }
+    if comparing {
+        header += &format!("  {:>delta_width$}", "Δsize");
+    }
     header += &format!("  {:>count_width$}", "files");
-    if comparing { header += &format!("  {:>dfiles_width$}", "Δfiles"); }
+    if comparing {
+        header += &format!("  {:>dfiles_width$}", "Δfiles");
+    }
     header += &format!("  {:>ts_width$}", app.timestamp_col.label());
-    if app.visible_extras.uid  { header += &format!("  {:>uid_width$}",  "user",  uid_width  = uid_width);  }
-    if app.visible_extras.gid  { header += &format!("  {:>gid_width$}",  "group", gid_width  = gid_width);  }
-    if app.visible_extras.mode { header += &format!("  {:>mode_width$}", "mode",  mode_width = mode_width); }
+    if app.visible_extras.uid {
+        header += &format!("  {:>uid_width$}", "user", uid_width = uid_width);
+    }
+    if app.visible_extras.gid {
+        header += &format!("  {:>gid_width$}", "group", gid_width = gid_width);
+    }
+    if app.visible_extras.mode {
+        header += &format!("  {:>mode_width$}", "mode", mode_width = mode_width);
+    }
 
     // Render block separately so we can split the inner area
     let block = Block::default().borders(Borders::ALL).title(title);
@@ -2619,8 +2599,11 @@ fn render_list_content(f: &mut Frame, app: &App, area: Rect) {
         .split(inner);
 
     f.render_widget(
-        Paragraph::new(header)
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Paragraph::new(header).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         inner_chunks[0],
     );
 
@@ -2644,8 +2627,7 @@ fn render_tree_content(f: &mut Frame, app: &App, area: Rect) {
 
     // Determine whether the rightmost slot is a file preview or a directory column.
     // The preview pane occupies one slot regardless.
-    let has_preview_pane = app.file_preview.is_some()
-        || app.columns.len() > app.active_column + 1; // dir preview column exists
+    let has_preview_pane = app.file_preview.is_some() || app.columns.len() > app.active_column + 1; // dir preview column exists
     let need_extra_slot = app.file_preview.is_some(); // file preview needs its own slot
 
     // Total pane count: directory columns + (1 extra if file preview occupies a separate slot)
@@ -2660,7 +2642,8 @@ fn render_tree_content(f: &mut Frame, app: &App, area: Rect) {
     // Ensure the active column + its preview are visible
     let slots_after_active = if has_preview_pane { 2 } else { 1 };
     let start_idx = if app.active_column + slots_after_active > num_visible {
-        (app.active_column + slots_after_active).saturating_sub(num_visible)
+        (app.active_column + slots_after_active)
+            .saturating_sub(num_visible)
             .min(total_panes.saturating_sub(num_visible))
     } else {
         0
@@ -2722,85 +2705,211 @@ fn render_tree_content(f: &mut Frame, app: &App, area: Rect) {
             gid: String,
             mode_s: String,
         }
-        let formatted: Vec<TFmt> = col.entries.iter().map(|entry| {
-            let prefix = if entry.is_dir { "▸ " } else { "  " };
-            let marker = if comparing { entry.change_marker() } else { ' ' };
-            let name = if comparing {
-                format!("{}{}{}", marker, prefix, entry.name)
-            } else {
-                format!("{}{}", prefix, entry.name)
-            };
-            let name_style = marker_style(marker);
-            let delta = if comparing { format_size_delta(entry) } else { String::new() };
-            let delta_style = delta_style(entry.size_delta());
-            let size = format_bytes(entry.total_size as u64);
-            let count = format_file_count(entry.file_count);
-            let ts = match app.timestamp_col {
-                TimestampCol::Atime => app.format_atime(entry.latest_atime),
-                TimestampCol::Mtime => app.format_atime(entry.latest_mtime),
-                TimestampCol::Ctime => app.format_atime(entry.latest_ctime),
-            };
-            let uid = if app.visible_extras.uid  { format_uid(entry.uid, entry.is_dir) }  else { String::new() };
-            let gid = if app.visible_extras.gid  { format_gid(entry.gid, entry.is_dir) }  else { String::new() };
-            let mode_s = if app.visible_extras.mode { format_mode(entry.mode, entry.is_dir) } else { String::new() };
-            TFmt { name, name_style, size, delta, delta_style, count, ts, uid, gid, mode_s }
-        }).collect();
+        let formatted: Vec<TFmt> = col
+            .entries
+            .iter()
+            .map(|entry| {
+                let prefix = if entry.is_dir { "▸ " } else { "  " };
+                let marker = if comparing {
+                    entry.change_marker()
+                } else {
+                    ' '
+                };
+                let name = if comparing {
+                    format!("{}{}{}", marker, prefix, entry.name)
+                } else {
+                    format!("{}{}", prefix, entry.name)
+                };
+                let name_style = marker_style(marker);
+                let delta = if comparing {
+                    format_size_delta(entry)
+                } else {
+                    String::new()
+                };
+                let delta_style = delta_style(entry.size_delta());
+                let size = format_bytes(entry.total_size as u64);
+                let count = format_file_count(entry.file_count);
+                let ts = match app.timestamp_col {
+                    TimestampCol::Atime => app.format_atime(entry.latest_atime),
+                    TimestampCol::Mtime => app.format_atime(entry.latest_mtime),
+                    TimestampCol::Ctime => app.format_atime(entry.latest_ctime),
+                };
+                let uid = if app.visible_extras.uid {
+                    format_uid(entry.uid, entry.is_dir)
+                } else {
+                    String::new()
+                };
+                let gid = if app.visible_extras.gid {
+                    format_gid(entry.gid, entry.is_dir)
+                } else {
+                    String::new()
+                };
+                let mode_s = if app.visible_extras.mode {
+                    format_mode(entry.mode, entry.is_dir)
+                } else {
+                    String::new()
+                };
+                TFmt {
+                    name,
+                    name_style,
+                    size,
+                    delta,
+                    delta_style,
+                    count,
+                    ts,
+                    uid,
+                    gid,
+                    mode_s,
+                }
+            })
+            .collect();
 
-        let size_w  = formatted.iter().map(|f| f.size.len()).max().unwrap_or(0).max(6);
-        let delta_w = if comparing { formatted.iter().map(|f| f.delta.len()).max().unwrap_or(0).max(6) } else { 0 };
+        let size_w = formatted
+            .iter()
+            .map(|f| f.size.len())
+            .max()
+            .unwrap_or(0)
+            .max(6);
+        let delta_w = if comparing {
+            formatted
+                .iter()
+                .map(|f| f.delta.len())
+                .max()
+                .unwrap_or(0)
+                .max(6)
+        } else {
+            0
+        };
         // Columns are narrow: when comparing, Δsize takes the place of the file count
-        let count_w = if comparing { 0 } else { formatted.iter().map(|f| f.count.len()).max().unwrap_or(0).max(6) };
-        let ts_w    = formatted.iter().map(|f| f.ts.len()).max().unwrap_or(0).max(6);
-        let uid_w   = if app.visible_extras.uid  { formatted.iter().map(|f| f.uid.len()).max().unwrap_or(0).max("user".len()) } else { 0 };
-        let gid_w   = if app.visible_extras.gid  { formatted.iter().map(|f| f.gid.len()).max().unwrap_or(0).max("group".len()) } else { 0 };
-        let mode_w  = if app.visible_extras.mode { formatted.iter().map(|f| f.mode_s.len()).max().unwrap_or(0).max(5) } else { 0 };
-        let extra_w = [uid_w, gid_w, mode_w, delta_w].iter().filter(|&&w| w > 0).map(|&w| w + 2).sum::<usize>();
+        let count_w = if comparing {
+            0
+        } else {
+            formatted
+                .iter()
+                .map(|f| f.count.len())
+                .max()
+                .unwrap_or(0)
+                .max(6)
+        };
+        let ts_w = formatted
+            .iter()
+            .map(|f| f.ts.len())
+            .max()
+            .unwrap_or(0)
+            .max(6);
+        let uid_w = if app.visible_extras.uid {
+            formatted
+                .iter()
+                .map(|f| f.uid.len())
+                .max()
+                .unwrap_or(0)
+                .max("user".len())
+        } else {
+            0
+        };
+        let gid_w = if app.visible_extras.gid {
+            formatted
+                .iter()
+                .map(|f| f.gid.len())
+                .max()
+                .unwrap_or(0)
+                .max("group".len())
+        } else {
+            0
+        };
+        let mode_w = if app.visible_extras.mode {
+            formatted
+                .iter()
+                .map(|f| f.mode_s.len())
+                .max()
+                .unwrap_or(0)
+                .max(5)
+        } else {
+            0
+        };
+        let extra_w = [uid_w, gid_w, mode_w, delta_w]
+            .iter()
+            .filter(|&&w| w > 0)
+            .map(|&w| w + 2)
+            .sum::<usize>();
         let stat_cols = size_w + count_w + ts_w + extra_w + if comparing { 4 } else { 6 };
         let name_max = content_width.saturating_sub(stat_cols);
 
-        let items: Vec<ListItem> = formatted.iter().map(|f| {
-            let name_display = if f.name.len() > name_max && name_max > 1 {
-                format!("{}…", &f.name[..name_max.saturating_sub(1)])
-            } else if name_max == 0 {
-                String::new()
-            } else {
-                f.name.clone()
-            };
+        let items: Vec<ListItem> = formatted
+            .iter()
+            .map(|f| {
+                let name_display = if f.name.len() > name_max && name_max > 1 {
+                    format!("{}…", &f.name[..name_max.saturating_sub(1)])
+                } else if name_max == 0 {
+                    String::new()
+                } else {
+                    f.name.clone()
+                };
 
-            let mut spans = vec![
-                Span::styled(format!("{:<name_w$}", name_display, name_w = name_max), f.name_style),
-                Span::raw(format!("  {:>size_w$}", f.size)),
-            ];
-            if comparing {
-                spans.push(Span::styled(format!("  {:>delta_w$}", f.delta), f.delta_style));
-            }
-            let mut rest = if comparing {
-                format!("  {:>ts_w$}", f.ts)
-            } else {
-                format!("  {:>count_w$}  {:>ts_w$}", f.count, f.ts)
-            };
-            if app.visible_extras.uid  { rest += &format!("  {:>uid_w$}",  f.uid,    uid_w  = uid_w);  }
-            if app.visible_extras.gid  { rest += &format!("  {:>gid_w$}",  f.gid,    gid_w  = gid_w);  }
-            if app.visible_extras.mode { rest += &format!("  {:>mode_w$}", f.mode_s, mode_w = mode_w); }
-            spans.push(Span::raw(rest));
+                let mut spans = vec![
+                    Span::styled(
+                        format!("{:<name_w$}", name_display, name_w = name_max),
+                        f.name_style,
+                    ),
+                    Span::raw(format!("  {:>size_w$}", f.size)),
+                ];
+                if comparing {
+                    spans.push(Span::styled(
+                        format!("  {:>delta_w$}", f.delta),
+                        f.delta_style,
+                    ));
+                }
+                let mut rest = if comparing {
+                    format!("  {:>ts_w$}", f.ts)
+                } else {
+                    format!("  {:>count_w$}  {:>ts_w$}", f.count, f.ts)
+                };
+                if app.visible_extras.uid {
+                    rest += &format!("  {:>uid_w$}", f.uid, uid_w = uid_w);
+                }
+                if app.visible_extras.gid {
+                    rest += &format!("  {:>gid_w$}", f.gid, gid_w = gid_w);
+                }
+                if app.visible_extras.mode {
+                    rest += &format!("  {:>mode_w$}", f.mode_s, mode_w = mode_w);
+                }
+                spans.push(Span::raw(rest));
 
-            ListItem::new(Line::from(spans))
-        }).collect();
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
 
         let title_style = if is_active {
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
 
         // Build header string using same widths as data rows
-        let mut col_header = format!("{:<name_w$}  {:>size_w$}", "name", "size", name_w = name_max);
-        if comparing { col_header += &format!("  {:>delta_w$}", "Δsize"); }
-        if !comparing { col_header += &format!("  {:>count_w$}", "files"); }
+        let mut col_header = format!(
+            "{:<name_w$}  {:>size_w$}",
+            "name",
+            "size",
+            name_w = name_max
+        );
+        if comparing {
+            col_header += &format!("  {:>delta_w$}", "Δsize");
+        }
+        if !comparing {
+            col_header += &format!("  {:>count_w$}", "files");
+        }
         col_header += &format!("  {:>ts_w$}", app.timestamp_col.label());
-        if app.visible_extras.uid  { col_header += &format!("  {:>uid_w$}",  "user",  uid_w  = uid_w);  }
-        if app.visible_extras.gid  { col_header += &format!("  {:>gid_w$}",  "group", gid_w  = gid_w);  }
-        if app.visible_extras.mode { col_header += &format!("  {:>mode_w$}", "mode",  mode_w = mode_w); }
+        if app.visible_extras.uid {
+            col_header += &format!("  {:>uid_w$}", "user", uid_w = uid_w);
+        }
+        if app.visible_extras.gid {
+            col_header += &format!("  {:>gid_w$}", "group", gid_w = gid_w);
+        }
+        if app.visible_extras.mode {
+            col_header += &format!("  {:>mode_w$}", "mode", mode_w = mode_w);
+        }
 
         // Render block separately so we can split the inner area
         let block = Block::default()
@@ -2816,8 +2925,11 @@ fn render_tree_content(f: &mut Frame, app: &App, area: Rect) {
             .split(inner);
 
         f.render_widget(
-            Paragraph::new(col_header)
-                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Paragraph::new(col_header).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             col_inner_chunks[0],
         );
 
@@ -2841,7 +2953,10 @@ fn render_file_preview_pane(f: &mut Frame, app: &App, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(" Preview ", Style::default().fg(Color::DarkGray)));
+            .title(Span::styled(
+                " Preview ",
+                Style::default().fg(Color::DarkGray),
+            ));
         f.render_widget(block, area);
         return;
     };
@@ -2852,7 +2967,9 @@ fn render_file_preview_pane(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::Cyan)
     };
     let title_style = if app.preview_focused {
-        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Cyan)
     };
@@ -2879,7 +2996,11 @@ fn render_file_preview_pane(f: &mut Frame, app: &App, area: Rect) {
     )));
     if app.compare.is_some() {
         let was = match preview.size_old {
-            Some(old) => format!("{} ({})", format_bytes(old as u64), format_bytes_signed(preview.size - old)),
+            Some(old) => format!(
+                "{} ({})",
+                format_bytes(old as u64),
+                format_bytes_signed(preview.size - old)
+            ),
             None => "(new file)".to_string(),
         };
         text_lines.push(Line::from(Span::styled(
@@ -2901,7 +3022,7 @@ fn render_file_preview_pane(f: &mut Frame, app: &App, area: Rect) {
         let deque_end = (deque_start + content_height).min(preview.lines.len());
 
         for i in deque_start..deque_end {
-            text_lines.push(Line::from(Span::raw(format!("  {}", &preview.lines[i]))));
+            text_lines.push(Line::from(Span::raw(format!("  {}", preview.lines[i]))));
         }
 
         // Scroll indicator with global position and EOF status
@@ -2909,23 +3030,148 @@ fn render_file_preview_pane(f: &mut Frame, app: &App, area: Rect) {
         let total = preview.total_lines_loaded;
         if total > content_height {
             let max_scroll = total.saturating_sub(content_height);
-            let pct = if max_scroll == 0 { 100 } else {
-                (global_start * 100) / max_scroll
-            };
+            let pct = (global_start * 100).checked_div(max_scroll).unwrap_or(100);
             text_lines.push(Line::from(Span::styled(
-                format!("  ── {}% ({}/{} lines) ({}) ──", pct.min(100), global_start + 1, total, eof_indicator),
+                format!(
+                    "  ── {}% ({}/{} lines) ({}) ──",
+                    pct.min(100),
+                    global_start + 1,
+                    total,
+                    eof_indicator
+                ),
                 Style::default().fg(Color::DarkGray),
             )));
         }
     } else if !preview.is_text {
         text_lines.push(Line::from(Span::styled(
             "  (binary file — no preview)",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )));
     }
 
     let paragraph = Paragraph::new(text_lines).block(block);
     f.render_widget(paragraph, area);
+}
+
+/// Center a popup inside `area`. Percentages are of the parent, not absolute cells.
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup[1])[1]
+}
+
+/// Cut on a char boundary. Byte-index slicing panics on a multibyte name, and
+/// ratatui then never restores the terminal.
+fn truncate_to_chars(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
+/// List-mode overlay: type + a short text window over the current list.
+fn render_list_preview_overlay(f: &mut Frame, app: &App, area: Rect) {
+    let Some(ref preview) = app.list_preview else {
+        return;
+    };
+
+    let overlay = centered_rect(80, 70, area);
+    f.render_widget(Clear, overlay);
+
+    let file_name = preview.path.rsplit('/').next().unwrap_or(&preview.path);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            format!(" {} ", file_name),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(overlay);
+    let inner_width = inner.width as usize;
+    let inner_height = inner.height as usize;
+
+    let mut text_lines: Vec<Line> = Vec::new();
+    text_lines.push(Line::from(Span::styled(
+        truncate_to_chars(
+            &format!("  Type: {}", preview.type_description),
+            inner_width,
+        ),
+        Style::default().fg(Color::Yellow),
+    )));
+    text_lines.push(Line::from(Span::styled(
+        truncate_to_chars(
+            &format!("  Size: {}", format_bytes(preview.size as u64)),
+            inner_width,
+        ),
+        Style::default().fg(Color::Green),
+    )));
+    if app.compare.is_some() {
+        let was = match preview.size_old {
+            Some(old) => format!(
+                "{} ({})",
+                format_bytes(old as u64),
+                format_bytes_signed(preview.size - old)
+            ),
+            None => "(new file)".to_string(),
+        };
+        text_lines.push(Line::from(Span::styled(
+            truncate_to_chars(&format!("  Was:  {}", was), inner_width),
+            Style::default().fg(Color::Magenta),
+        )));
+    }
+    text_lines.push(Line::from(Span::styled(
+        truncate_to_chars(
+            &format!("  Atime: {}", app.format_atime(preview.atime)),
+            inner_width,
+        ),
+        Style::default().fg(Color::Cyan),
+    )));
+    text_lines.push(Line::from(""));
+
+    if preview.is_text && !preview.lines.is_empty() {
+        let content_height = inner_height.saturating_sub(text_lines.len());
+        for line in preview.lines.iter().take(content_height) {
+            text_lines.push(Line::from(Span::raw(truncate_to_chars(
+                &format!("  {line}"),
+                inner_width,
+            ))));
+        }
+    } else if !preview.is_text {
+        text_lines.push(Line::from(Span::styled(
+            "  (binary file — no preview)",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+
+    let paragraph = Paragraph::new(text_lines).block(block);
+    f.render_widget(paragraph, overlay);
 }
 
 /// Render the shared status bar.
@@ -2943,7 +3189,20 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 }
             })
             .collect();
-        format!(" Sort: {}  (s/→:next  ←:prev  Enter:apply  Esc:cancel)", options.join(""))
+        format!(
+            " Sort: {}  (s/→:next  ←:prev  Enter:apply  Esc:cancel)",
+            options.join("")
+        )
+    } else if app.input_mode == InputMode::ListPreview {
+        if let Some(ref preview) = app.list_preview {
+            let file_name = preview.path.rsplit('/').next().unwrap_or(&preview.path);
+            format!(
+                " {} │ {} │ Esc/Space: close",
+                file_name, preview.type_description
+            )
+        } else {
+            " Esc/Space: close".to_string()
+        }
     } else if app.input_mode != InputMode::Normal {
         format!(" {}{}", app.input_mode.prompt(), app.input_buffer)
     } else if app.preview_focused {
@@ -2952,8 +3211,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             let file_name = preview.path.rsplit('/').next().unwrap_or(&preview.path);
             format!(
                 " ▶ {} │ {} │ jk↑↓:scroll d/u:page g/G:top/bottom Esc/←/q/␣:back",
-                file_name,
-                preview.type_description
+                file_name, preview.type_description
             )
         } else {
             " Esc:back".to_string()
@@ -2968,7 +3226,9 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         // In tree mode, show breadcrumb and selected entry info
         let context_info = if app.view_mode == ViewMode::Tree && !app.columns.is_empty() {
             // Build breadcrumb from column titles
-            let breadcrumb: Vec<&str> = app.columns.iter()
+            let breadcrumb: Vec<&str> = app
+                .columns
+                .iter()
                 .take(app.active_column + 1)
                 .map(|c| c.title.as_str())
                 .collect();
@@ -3016,10 +3276,25 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 
         // Build extras indicator
         let extras: Vec<&str> = [
-            if app.visible_extras.uid  { Some("user")  } else { None },
-            if app.visible_extras.gid  { Some("group") } else { None },
-            if app.visible_extras.mode { Some("mode")  } else { None },
-        ].iter().filter_map(|x| *x).collect();
+            if app.visible_extras.uid {
+                Some("user")
+            } else {
+                None
+            },
+            if app.visible_extras.gid {
+                Some("group")
+            } else {
+                None
+            },
+            if app.visible_extras.mode {
+                Some("mode")
+            } else {
+                None
+            },
+        ]
+        .iter()
+        .filter_map(|x| *x)
+        .collect();
         let extras_str = if extras.is_empty() {
             String::new()
         } else {
@@ -3029,12 +3304,20 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         let compare_str = match app.compare {
             Some(ref cmp) => format!(
                 " │ vs {} show:{}",
-                cmp.old.index.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                cmp.old
+                    .index
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
                 app.status_filter.label(),
             ),
             None => String::new(),
         };
-        let compare_keys = if app.compare.is_some() { " d:changes" } else { "" };
+        let compare_keys = if app.compare.is_some() {
+            " d:changes"
+        } else {
+            ""
+        };
 
         format!(
             " {}{}{} │ sort:{} {} {} {} │ q:quit jk:nav ←→:cd /:pat s:sort m:view t:{}{} ?:help c:clear",
@@ -3051,7 +3334,9 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let status_style = if app.input_mode == InputMode::SortSelect {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else if app.input_mode != InputMode::Normal {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
@@ -3060,4 +3345,49 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 
     let status = Paragraph::new(status_text).style(status_style);
     f.render_widget(status, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str, is_dir: bool) -> DirEntry {
+        DirEntry {
+            name: name.to_string(),
+            path: name.to_string(),
+            is_dir,
+            ..DirEntry::parent()
+        }
+    }
+
+    #[test]
+    fn list_preview_entry_file() {
+        let entries = [entry("a.txt", false)];
+        let got = list_preview_entry(&entries, Some(0));
+        assert_eq!(got.map(|e| e.name.as_str()), Some("a.txt"));
+    }
+
+    #[test]
+    fn list_preview_entry_directory() {
+        let entries = [entry("subdir", true)];
+        assert!(list_preview_entry(&entries, Some(0)).is_none());
+    }
+
+    #[test]
+    fn list_preview_entry_dotdot() {
+        let entries = [entry("..", true)];
+        assert!(list_preview_entry(&entries, Some(0)).is_none());
+    }
+
+    #[test]
+    fn list_preview_entry_no_selection() {
+        let entries = [entry("a.txt", false)];
+        assert!(list_preview_entry(&entries, None).is_none());
+    }
+
+    #[test]
+    fn list_preview_entry_empty() {
+        let entries: [DirEntry; 0] = [];
+        assert!(list_preview_entry(&entries, Some(0)).is_none());
+    }
 }

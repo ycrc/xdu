@@ -1,189 +1,112 @@
 use std::io::{self, Write};
-use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use chrono::DateTime;
 use clap::Parser;
-use duckdb::Connection;
+use duckdb::params_from_iter;
 
-use xdu::{format_bytes, index_glob, partition_key_sql, sql_quote, QueryFilters};
-
-const VALID_FIELDS: &[&str] = &["path", "size", "atime", "mtime", "ctime", "uid", "gid", "mode"];
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "xdu-find",
-    about = "Query a file metadata index for matching paths",
-    after_help = "Examples:
-  xdu-find -i /index/scratch -p '\\.py$' --min-size 1M
-  xdu-find -i /index/scratch --older-than 90 -f path,size,atime
-  xdu-find -i /index/scratch -u alice --count
-  xdu-find -i /index/scratch --top 10
-  xdu-find -i /index/scratch -f path,size,mtime,uid --csv"
-)]
-struct Args {
-    /// Path to the Parquet index directory
-    #[arg(short, long, value_name = "DIR", env = "XDU_INDEX")]
-    index: PathBuf,
-
-    /// Regular expression pattern to match paths
-    #[arg(short, long, value_name = "REGEX")]
-    pattern: Option<String>,
-
-    /// Filter by partition (e.g. a user directory, or a nested path like projects/big); includes nested partitions
-    #[arg(short = 'u', long, value_name = "NAME")]
-    partition: Option<String>,
-
-    /// Minimum file size (e.g., 1K, 10M, 1G)
-    #[arg(long, value_name = "SIZE")]
-    min_size: Option<String>,
-
-    /// Maximum file size (e.g., 1K, 10M, 1G)
-    #[arg(long, value_name = "SIZE")]
-    max_size: Option<String>,
-
-    /// Files not accessed in N days
-    #[arg(long, value_name = "DAYS")]
-    older_than: Option<u64>,
-
-    /// Files accessed within N days
-    #[arg(long, value_name = "DAYS")]
-    newer_than: Option<u64>,
-
-    /// Files not modified in N days
-    #[arg(long, value_name = "DAYS")]
-    modified_older_than: Option<u64>,
-
-    /// Files modified within N days
-    #[arg(long, value_name = "DAYS")]
-    modified_newer_than: Option<u64>,
-
-    /// Files whose ctime is older than N days
-    #[arg(long, value_name = "DAYS")]
-    changed_older_than: Option<u64>,
-
-    /// Files whose ctime is within N days
-    #[arg(long, value_name = "DAYS")]
-    changed_newer_than: Option<u64>,
-
-    /// Filter by owner user ID
-    #[arg(long, value_name = "UID")]
-    uid: Option<u32>,
-
-    /// Filter by owner group ID
-    #[arg(long, value_name = "GID")]
-    gid: Option<u32>,
-
-    /// Filter by exact file mode bits (decimal integer, e.g. 33188 for 0o100644)
-    #[arg(long, value_name = "MODE")]
-    mode: Option<u32>,
-
-    /// Comma-separated list of fields to output: path, size, atime, mtime, ctime, uid, gid, mode
-    #[arg(short, long, default_value = "path", value_name = "FIELDS")]
-    format: String,
-
-    /// Output as CSV with a header row (raw values). Default is human-readable tab-separated.
-    #[arg(long)]
-    csv: bool,
-
-    /// Limit number of results
-    #[arg(short, long)]
-    limit: Option<usize>,
-
-    /// Count matching records instead of listing them
-    #[arg(short, long)]
-    count: bool,
-
-    /// Show top N partitions by file count (for identifying large partitions)
-    #[arg(long, value_name = "N")]
-    top: Option<usize>,
-}
-
-/// Format a Unix epoch timestamp as "YYYY-MM-DD HH:MM:SS".
-fn format_timestamp(epoch: i64) -> String {
-    match DateTime::from_timestamp(epoch, 0) {
-        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-        None => epoch.to_string(),
-    }
-}
-
-/// Escape and quote a value for CSV output if needed.
-fn csv_escape(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
-    }
-}
-
-/// Read and format a single field value from a DuckDB row.
-fn read_field(field: &str, row: &duckdb::Row, col_idx: usize, human: bool) -> Result<String> {
-    Ok(match field {
-        "path" => {
-            let v: String = row.get(col_idx)?;
-            v
-        }
-        "size" => {
-            let v: i64 = row.get(col_idx)?;
-            if human { format_bytes(v as u64) } else { v.to_string() }
-        }
-        "atime" | "mtime" | "ctime" => {
-            let v: i64 = row.get(col_idx)?;
-            if human { format_timestamp(v) } else { v.to_string() }
-        }
-        "uid" | "gid" => {
-            let v: i32 = row.get(col_idx)?;
-            v.to_string()
-        }
-        "mode" => {
-            let v: i32 = row.get(col_idx)?;
-            if human { format!("{:o}", v) } else { v.to_string() }
-        }
-        _ => unreachable!("field validated earlier: {}", field),
-    })
-}
+use xdu::cli::XduFindArgs;
+use xdu::layout::partition_key_sql;
+use xdu::s3::ProcessEnv;
+use xdu::{
+    FindOutput, IndexLocator, QueryFilters, S3Settings, csv_escape, format_field_value,
+    index_completion_warning, index_version_error, marker_completion_warning, marker_version_error,
+    parquet_source, parse_find_output, read_completion_marker_s3, resolve_group, resolve_user,
+};
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = XduFindArgs::parse();
 
-    // Parse and validate field list
-    let fields: Vec<&str> = args.format.split(',').map(|s| s.trim()).collect();
-    for f in &fields {
-        if !VALID_FIELDS.contains(f) {
-            anyhow::bail!(
-                "Unknown field '{}'. Valid fields: {}",
-                f,
-                VALID_FIELDS.join(", ")
-            );
-        }
+    // An unknown format or field fails before the index is opened.
+    let output = parse_find_output(&args.format).map_err(|e| anyhow::anyhow!(e))?;
+    if args.csv && !matches!(output, FindOutput::Fields(_)) {
+        anyhow::bail!("--csv applies to a field list (e.g. -f path,size); use -f csv for CSV");
     }
 
-    // Resolve index path
-    let index_path = args.index.canonicalize()
-        .with_context(|| format!("Index directory not found: {}", args.index.display()))?;
+    // The index argument is classified on its bytes before anything else. An s3:// locator
+    // resolves its credentials and opens its connection first, so a missing extension or
+    // credential is the first thing an operator hears about; every other argument is a local
+    // path and takes the path below unchanged, loading no extension.
+    let (index, conn) = match IndexLocator::parse(args.index.as_os_str())? {
+        IndexLocator::S3(locator) => {
+            let settings = S3Settings::resolve(&ProcessEnv)?;
+            let conn = xdu::engine::open_s3_connection(&settings)?;
 
-    // Build the glob pattern for Parquet files
-    let glob_pattern = sql_quote(&index_glob(&index_path, args.partition.as_deref()));
+            // The marker is read once, a round trip per statement, and both gates judge that
+            // one read. A missing prefix, bucket or endpoint fails here, before any row.
+            let marker = read_completion_marker_s3(&conn, &locator)?;
+            let shown = locator.to_string();
+            if let Some(error) = marker_version_error(&marker, &shown) {
+                return Err(anyhow::anyhow!(error));
+            }
+            if let Some(warning) = marker_completion_warning(&marker, &shown) {
+                eprintln!("{}", warning);
+            }
+            (IndexLocator::S3(locator), conn)
+        }
+        IndexLocator::Local(_) => {
+            // Resolve index path
+            let index_path = args
+                .index
+                .canonicalize()
+                .with_context(|| format!("Index directory not found: {}", args.index.display()))?;
 
-    // Connect to DuckDB (in-memory)
-    let conn = Connection::open_in_memory()?;
+            // Refuse an index whose format version is unknown or unsupported before any
+            // query: rows of an unknown layout must never be read, let alone trusted.
+            if let Some(error) = index_version_error(&index_path) {
+                return Err(anyhow::anyhow!(error));
+            }
 
-    // Build filters
+            // An index can be incomplete two ways — a run that never finished, or one that
+            // finished under --allow-errors having skipped what it could not read. Either is
+            // still queryable, so this warns rather than refusing; it goes to stderr so piped
+            // results stay clean.
+            if let Some(warning) = index_completion_warning(&index_path) {
+                eprintln!("{}", warning);
+            }
+
+            // Connect to DuckDB (in-memory)
+            let conn = xdu::engine::open_connection()?;
+            (IndexLocator::Local(index_path), conn)
+        }
+    };
+
+    // Every statement reads the index through this one source: the glob written into the
+    // text for a local index, a bound parameter for an S3 one.
+    let source = |filename: bool| parquet_source(&index, args.partition.as_deref(), filename);
+
+    // Build filters using shared QueryFilters. A glob is translated here; an invalid
+    // one fails before any query is built rather than at the database. Owner and
+    // group names resolve to ids up front for the same reason: only integers
+    // reach SQL, and an unresolvable name exits non-zero having printed no rows.
+    let owner_uid = args
+        .owner
+        .as_deref()
+        .map(resolve_user)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let group_gid = args
+        .group
+        .as_deref()
+        .map(resolve_group)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!(e))?;
     let filters = QueryFilters::new()
-        .with_pattern(args.pattern.clone())
+        .with_path_pattern(args.pattern.clone(), args.regex)
+        .map_err(|e| anyhow::anyhow!(e))?
         .with_older_than(args.older_than)
         .with_newer_than(args.newer_than)
-        .with_mtime_older_than(args.modified_older_than)
-        .with_mtime_newer_than(args.modified_newer_than)
-        .with_ctime_older_than(args.changed_older_than)
-        .with_ctime_newer_than(args.changed_newer_than)
-        .with_uid(args.uid)
-        .with_gid(args.gid)
-        .with_mode(args.mode)
         .with_min_size(args.min_size.as_deref())
         .map_err(|e| anyhow::anyhow!(e))?
         .with_max_size(args.max_size.as_deref())
-        .map_err(|e| anyhow::anyhow!(e))?;
+        .map_err(|e| anyhow::anyhow!(e))?
+        .with_owner_uid(owner_uid)
+        .with_group_gid(group_gid)
+        .with_mode(args.mode.as_deref())
+        .map_err(|e| anyhow::anyhow!(e))?
+        .with_mtime_older_than(args.mtime_older_than)
+        .with_mtime_newer_than(args.mtime_newer_than)
+        .with_ctime_older_than(args.ctime_older_than)
+        .with_ctime_newer_than(args.ctime_newer_than);
 
     let where_clause = filters.to_full_where_clause();
 
@@ -193,23 +116,29 @@ fn main() -> Result<()> {
         String::new()
     };
 
+    // Build and execute query based on format
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    // --top mode
+    // Handle --top mode: show top N partitions by file count. The partition is the chunk's
+    // directory below the index root, so a nested partition is named by its whole key.
     if let Some(n) = args.top {
+        let (from, params) = source(true);
         let sql = format!(
             "SELECT
                 {} as partition,
                 COUNT(*) as file_count
-            FROM read_parquet({}, filename=true) {}
+            FROM {} {}
             GROUP BY partition
             ORDER BY file_count DESC
             LIMIT {}",
-            partition_key_sql(&index_path), glob_pattern, where_clause, n
+            partition_key_sql(&index),
+            from,
+            where_clause,
+            n
         );
         let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query([])?;
+        let mut rows = stmt.query(params_from_iter(&params))?;
         while let Some(row) = rows.next()? {
             let partition: String = row.get(0)?;
             writeln!(out, "{}", partition)?;
@@ -217,14 +146,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // --count mode
+    // Handle count mode
     if args.count {
-        let sql = format!(
-            "SELECT COUNT(*) FROM read_parquet({}) {}",
-            glob_pattern, where_clause
-        );
+        let (from, params) = source(false);
+        let sql = format!("SELECT COUNT(*) FROM {} {}", from, where_clause);
         let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query([])?;
+        let mut rows = stmt.query(params_from_iter(&params))?;
         if let Some(row) = rows.next()? {
             let count: i64 = row.get(0)?;
             writeln!(out, "{}", count)?;
@@ -232,37 +159,166 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Build SELECT query from requested fields
-    let select_clause = fields.join(", ");
-    let sql = format!(
-        "SELECT {} FROM read_parquet({}) {} {}",
-        select_clause, glob_pattern, where_clause, limit_clause
-    );
-
-    let human = !args.csv;
-
-    // CSV header
-    if args.csv {
-        writeln!(out, "{}", fields.join(","))?;
-    }
-
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query([])?;
-
-    while let Some(row) = rows.next()? {
-        let mut values = Vec::with_capacity(fields.len());
-        for (i, field) in fields.iter().enumerate() {
-            let v = read_field(field, row, i, human)?;
-            values.push(v);
+    let format = match output {
+        FindOutput::Format(format) => format,
+        FindOutput::Fields(fields) => {
+            let (from, params) = source(false);
+            let sql = format!(
+                "SELECT {} FROM {} {} {}",
+                fields.join(", "),
+                from,
+                where_clause,
+                limit_clause
+            );
+            if args.csv {
+                writeln!(out, "{}", fields.join(","))?;
+            }
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(&params))?;
+            while let Some(row) = rows.next()? {
+                let mut values = Vec::with_capacity(fields.len());
+                for (i, field) in fields.iter().enumerate() {
+                    values.push(if field == "path" {
+                        let path: String = row.get(i)?;
+                        if args.csv { csv_escape(&path) } else { path }
+                    } else {
+                        format_field_value(field, row.get(i)?, !args.csv)
+                    });
+                }
+                let sep = if args.csv { "," } else { "\t" };
+                writeln!(out, "{}", values.join(sep))?;
+            }
+            return Ok(());
         }
+    };
 
-        if args.csv {
-            let escaped: Vec<String> = fields.iter().zip(values.iter()).map(|(f, v)| {
-                if *f == "path" { csv_escape(v) } else { v.clone() }
-            }).collect();
-            writeln!(out, "{}", escaped.join(","))?;
-        } else {
-            writeln!(out, "{}", values.join("\t"))?;
+    match format.as_str() {
+        "path" => {
+            let (from, params) = source(false);
+            let sql = format!(
+                "SELECT path FROM {} {} {}",
+                from, where_clause, limit_clause
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(&params))?;
+            while let Some(row) = rows.next()? {
+                let path: String = row.get(0)?;
+                writeln!(out, "{}", path)?;
+            }
+        }
+        "size" => {
+            let (from, params) = source(false);
+            let sql = format!(
+                "SELECT path, size FROM {} {} ORDER BY size DESC {}",
+                from, where_clause, limit_clause
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(&params))?;
+            while let Some(row) = rows.next()? {
+                let path: String = row.get(0)?;
+                let size: i64 = row.get(1)?;
+                writeln!(out, "{}\t{}", size, path)?;
+            }
+        }
+        "atime" => {
+            let (from, params) = source(false);
+            let sql = format!(
+                "SELECT path, atime FROM {} {} ORDER BY atime ASC {}",
+                from, where_clause, limit_clause
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(&params))?;
+            while let Some(row) = rows.next()? {
+                let path: String = row.get(0)?;
+                let atime: i64 = row.get(1)?;
+                writeln!(out, "{}\t{}", atime, path)?;
+            }
+        }
+        "csv" => {
+            let (from, params) = source(false);
+            let sql = format!(
+                "SELECT path, size, uid, gid, mode, atime, mtime, ctime FROM {} {} {}",
+                from, where_clause, limit_clause
+            );
+            writeln!(out, "path,size,uid,gid,mode,atime,mtime,ctime")?;
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(&params))?;
+            while let Some(row) = rows.next()? {
+                let path: String = row.get(0)?;
+                let size: i64 = row.get(1)?;
+                let uid: i64 = row.get(2)?;
+                let gid: i64 = row.get(3)?;
+                let mode: i64 = row.get(4)?;
+                let atime: i64 = row.get(5)?;
+                let mtime: i64 = row.get(6)?;
+                let ctime: i64 = row.get(7)?;
+                // Escape commas and quotes in path for CSV
+                if path.contains(',') || path.contains('"') {
+                    writeln!(
+                        out,
+                        "\"{}\",{},{},{},{},{},{},{}",
+                        path.replace('"', "\"\""),
+                        size,
+                        uid,
+                        gid,
+                        mode,
+                        atime,
+                        mtime,
+                        ctime
+                    )?;
+                } else {
+                    writeln!(
+                        out,
+                        "{},{},{},{},{},{},{},{}",
+                        path, size, uid, gid, mode, atime, mtime, ctime
+                    )?;
+                }
+            }
+        }
+        "json" => {
+            let (from, params) = source(false);
+            let sql = format!(
+                "SELECT path, size, uid, gid, mode, atime, mtime, ctime FROM {} {} {}",
+                from, where_clause, limit_clause
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(&params))?;
+            let mut first = true;
+            writeln!(out, "[")?;
+            while let Some(row) = rows.next()? {
+                let path: String = row.get(0)?;
+                let size: i64 = row.get(1)?;
+                let uid: i64 = row.get(2)?;
+                let gid: i64 = row.get(3)?;
+                let mode: i64 = row.get(4)?;
+                let atime: i64 = row.get(5)?;
+                let mtime: i64 = row.get(6)?;
+                let ctime: i64 = row.get(7)?;
+                if !first {
+                    writeln!(out, ",")?;
+                }
+                first = false;
+                // Escape JSON special characters in path
+                let escaped_path = path
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+                    .replace('\t', "\\t");
+                write!(
+                    out,
+                    "  {{\"path\":\"{}\",\"size\":{},\"uid\":{},\"gid\":{},\"mode\":{},\"atime\":{},\"mtime\":{},\"ctime\":{}}}",
+                    escaped_path, size, uid, gid, mode, atime, mtime, ctime
+                )?;
+            }
+            writeln!(out)?;
+            writeln!(out, "]")?;
+        }
+        _ => {
+            anyhow::bail!(
+                "Unknown format: {}. Use: path, size, atime, csv, json",
+                args.format
+            );
         }
     }
 

@@ -1,273 +1,83 @@
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::{HashSet, VecDeque};
-use std::fs::{self, File};
-use std::io::{stderr, IsTerminal};
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::HashSet;
+use std::fs;
+use std::io::{IsTerminal, stderr};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use arrow::array::{Int32Array, Int64Array, StringBuilder};
 use arrow::datatypes::Schema;
-use arrow::record_batch::RecordBatch;
 use clap::Parser;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use jwalk::{Parallelism, WalkDir};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
 use rayon::ThreadPoolBuilder;
 
-use xdu::{
-    format_bytes, format_count, format_speed, get_schema, list_partitions, parse_size, resolve_split_points,
-    FileRecord, Manifest, SizeMode, SplitSpec, MANIFEST_VERSION, ROOT_PARTITION,
+use xdu::cli::XduArgs;
+use xdu::crawl::{
+    CrawlStats, EntryError, IndexSink, LocalSink, PartitionBuffer, SplitSkip, TopEntry,
+    build_split_work_queue, classify_io_error, completion_marker_contents_for, file_measurements,
+    lossy_path, remove_stale_partition,
 };
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "xdu",
-    about = "Build a distributed file metadata index in Parquet format",
-    after_help = "\
-Examples:
-  xdu /data/scratch -o /index/scratch -j 8
-  xdu /data/scratch -o /index/scratch --partition alice,bob
-  xdu /data/scratch -o /index/scratch --split 'projects/*'
-  xdu /data/scratch -o /index/scratch --split-depth 2
-  xdu /data/scratch -o /index/scratch --apparent-size
-  xdu /data/scratch -o /index/scratch --block-size 128K
-
-Partitioning:
-  Each split point (a directory relative to DIR) gets its own partition, stored in
-  OUTDIR/<path>/. A file goes to the deepest split point containing it; files directly
-  in DIR go to OUTDIR/__root__/. By default every top-level directory is a split point.
-  The split settings are saved in OUTDIR/_xdu.json and reused by later runs."
-)]
-struct Args {
-    /// Top-level directory to index
-    #[arg(value_name = "DIR")]
-    dir: PathBuf,
-
-    /// Output directory for the Parquet index
-    #[arg(short, long, value_name = "DIR")]
-    outdir: PathBuf,
-
-    /// Number of parallel threads
-    #[arg(short, long, default_value = "4", env = "XDU_JOBS")]
-    jobs: usize,
-
-    /// Number of records per output chunk
-    #[arg(short = 'B', long, default_value = "100000")]
-    buffsize: usize,
-
-    /// Report apparent sizes (file length) rather than disk usage.
-    /// By default, xdu reports actual disk usage from st_blocks.
-    #[arg(long)]
-    apparent_size: bool,
-
-    /// Round sizes up to this block size (e.g., 128K, 1M).
-    /// Useful when st_blocks is inaccurate (e.g., over NFS) and you know the filesystem block size.
-    /// Implies --apparent-size for the base size, then rounds up.
-    #[arg(short = 'k', long, value_name = "SIZE")]
-    block_size: Option<String>,
-
-    /// Index only specific partitions (comma-separated, e.g. alice,projects/big, or __root__).
-    #[arg(short, long, value_name = "NAMES", value_delimiter = ',')]
-    partition: Option<Vec<String>>,
-
-    /// With --partition, also re-index the partitions nested below the given ones.
-    #[arg(short, long, requires = "partition")]
-    recursive: bool,
-
-    /// Make every directory down to depth N its own partition (0 = only --split paths).
-    /// [default: the existing index's setting, or 1]
-    #[arg(long, value_name = "N")]
-    split_depth: Option<usize>,
-
-    /// Extra directories to make their own partitions (relative to DIR, comma-separated).
-    /// `*` and `?` match within a path component, e.g. 'projects/*'.
-    #[arg(long, value_name = "PATHS", value_delimiter = ',')]
-    split: Vec<String>,
-
-    /// Read --split paths from a file (one per line; blank lines and # comments ignored).
-    #[arg(long, value_name = "FILE")]
-    split_file: Option<PathBuf>,
-}
-
-/// Per-partition buffer that accumulates records and flushes to Parquet.
-struct PartitionBuffer {
-    partition: String,
-    outdir: PathBuf,
-    records: Vec<FileRecord>,
-    buffsize: usize,
-    chunk_counter: usize,
-    schema: Arc<Schema>,
-    /// Track all .partial files written for atomic finalization
-    partial_files: Vec<PathBuf>,
-    /// Track statistics for this partition
-    file_count: u64,
-    byte_count: u64,
-}
-
-impl PartitionBuffer {
-    fn new(partition: String, outdir: PathBuf, buffsize: usize, schema: Arc<Schema>) -> Self {
-        Self {
-            partition,
-            outdir,
-            records: Vec::with_capacity(buffsize),
-            buffsize,
-            chunk_counter: 0,
-            schema,
-            partial_files: Vec::new(),
-            file_count: 0,
-            byte_count: 0,
-        }
-    }
-
-    fn add(&mut self, record: FileRecord) -> Result<()> {
-        self.file_count += 1;
-        self.byte_count += record.size as u64;
-        self.records.push(record);
-        if self.records.len() >= self.buffsize {
-            self.flush()?;
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        if self.records.is_empty() {
-            return Ok(());
-        }
-
-        let chunk_id = self.chunk_counter;
-        self.chunk_counter += 1;
-        let partition_dir = self.outdir.join(&self.partition);
-        fs::create_dir_all(&partition_dir)
-            .with_context(|| format!("Failed to create partition dir: {}", partition_dir.display()))?;
-
-        // Write to .partial file first
-        let partial_path = partition_dir.join(format!("{:06}.parquet.partial", chunk_id));
-
-        let mut path_builder = StringBuilder::new();
-        let mut size_builder  = Vec::with_capacity(self.records.len());
-        let mut atime_builder = Vec::with_capacity(self.records.len());
-        let mut mtime_builder = Vec::with_capacity(self.records.len());
-        let mut ctime_builder = Vec::with_capacity(self.records.len());
-        let mut uid_builder   = Vec::with_capacity(self.records.len());
-        let mut gid_builder   = Vec::with_capacity(self.records.len());
-        let mut mode_builder  = Vec::with_capacity(self.records.len());
-
-        for record in &self.records {
-            path_builder.append_value(&record.path);
-            size_builder.push(record.size);
-            atime_builder.push(record.atime);
-            mtime_builder.push(record.mtime);
-            ctime_builder.push(record.ctime);
-            uid_builder.push(record.uid as i32);
-            gid_builder.push(record.gid as i32);
-            mode_builder.push(record.mode as i32);
-        }
-
-        let batch = RecordBatch::try_new(
-            self.schema.clone(),
-            vec![
-                Arc::new(path_builder.finish()),
-                Arc::new(Int64Array::from(size_builder)),
-                Arc::new(Int64Array::from(atime_builder)),
-                Arc::new(Int64Array::from(mtime_builder)),
-                Arc::new(Int64Array::from(ctime_builder)),
-                Arc::new(Int32Array::from(uid_builder)),
-                Arc::new(Int32Array::from(gid_builder)),
-                Arc::new(Int32Array::from(mode_builder)),
-            ],
-        )?;
-
-        let file = File::create(&partial_path)
-            .with_context(|| format!("Failed to create file: {}", partial_path.display()))?;
-
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-
-        let mut writer = ArrowWriter::try_new(file, self.schema.clone(), Some(props))?;
-        writer.write(&batch)?;
-        writer.close()?;
-
-        self.partial_files.push(partial_path);
-        self.records.clear();
-        Ok(())
-    }
-
-    /// Atomically finalize all .partial files by renaming them and pruning stale chunks.
-    fn finalize(&self) -> Result<usize> {
-        let partition_dir = self.outdir.join(&self.partition);
-        let num_chunks = self.partial_files.len();
-
-        // Rename all .partial files to .parquet (atomic on POSIX)
-        for partial_path in &self.partial_files {
-            let final_path = partial_path.with_extension(""); // removes .partial, leaves .parquet
-            fs::rename(partial_path, &final_path)
-                .with_context(|| format!("Failed to rename {} to {}", partial_path.display(), final_path.display()))?;
-        }
-
-        // Prune any stale chunks beyond what we just wrote
-        let mut pruned = 0;
-        for chunk_id in num_chunks.. {
-            let stale_path = partition_dir.join(format!("{:06}.parquet", chunk_id));
-            if stale_path.exists() {
-                fs::remove_file(&stale_path)
-                    .with_context(|| format!("Failed to remove stale chunk: {}", stale_path.display()))?;
-                pruned += 1;
-            } else {
-                break; // No more consecutive chunks
-            }
-        }
-
-        Ok(pruned)
-    }
-}
-
-/// A unit of work for a driver thread: one partition to crawl.
-struct WorkItem {
-    path: PathBuf,
-    partition: String,
-    /// Depth of `path` below the crawl root.
-    depth: usize,
-}
-
-/// Split-point directories, which every walker must skip (they are crawled separately).
-struct SplitDirs {
-    paths: HashSet<PathBuf>,
-    /// Deepest split point below the crawl root; walkers stop checking below this.
-    max_depth: usize,
-}
-
-/// Statistics returned from a crawl operation.
-struct CrawlStats {
-    files: u64,
-    bytes: u64,
-    pruned: usize,
-}
+use xdu::layout::{
+    MANIFEST_VERSION, Manifest, SplitPoint, SplitSpec, is_nested, list_partitions,
+    normalize_partition_arg, resolve_split_points, split_keys,
+};
+use xdu::s3::{IndexLocator, ProcessEnv, S3Settings, S3Sink};
+use xdu::{
+    INDEX_FORMAT_VERSION, LogLevel, NESTED_INDEX_FORMAT_VERSION, ROOT_PARTITION, SizeMode,
+    format_bytes, format_count, format_log_record, format_partition_progress, format_speed,
+    get_schema, parse_size,
+};
 
 /// Crawl a directory tree using concurrent per-partition walks with a shared thread pool.
 ///
-/// Architecture: A shared rayon thread pool (N threads) handles directory reads across all
-/// active walkers. C driver threads (std::threads) each pull partitions from a work queue
-/// and iterate their walker. Rayon work-stealing naturally balances load across all active
-/// walkers. Thread budget: N pool + C drivers + 1 main.
+/// Concurrency contract (must be preserved):
+/// - A single shared rayon thread pool (N threads) backs *all* jwalk walkers, so
+///   work-stealing balances directory reads across active partitions and one huge
+///   partition can't starve the rest.
+/// - C driver threads (`std::thread`s, joined by `thread::scope`) each pull partitions
+///   from the `Mutex<VecDeque>` work queue and consume their walker serially.
+/// - `thread::scope` propagates the first driver `Err` (or panic under unwind) as the
+///   run's error. Thread budget: N pool + C drivers + 1 main.
+///
+/// The pure classification/ordering (`build_work_queue`), per-file measurement
+/// (`file_measurements`, `lossy_path`), and Parquet finalization (`PartitionBuffer`)
+/// live in `xdu::crawl` so they are unit-testable; this function is the orchestrator.
+/// Nothing builds an intermediate row struct — the measured columns are appended
+/// straight into the Arrow builders.
+///
+/// The run-level completion marker is cleared once pre-flight passes and written by
+/// `main` only on the success path, so an index this run abandons carries no
+/// attestation, while a run rejected before it crawls leaves the previous marker intact.
+/// Every write goes through `sink`, a local directory or an S3 prefix.
+/// Short label for the size mode in the run-start log record.
+///
+/// Mirrors the flag that selected it (`--apparent-size`, `--block-size SIZE`), defaulting
+/// to disk usage. Bin-local: only this binary's log renders it, and the record shape —
+/// including this token — is locked by the log-shape integration test.
+fn size_mode_label(mode: SizeMode) -> String {
+    match mode {
+        SizeMode::DiskUsage => "disk-usage".to_string(),
+        SizeMode::ApparentSize => "apparent-size".to_string(),
+        SizeMode::BlockRounded(block_size) => format!("block-rounded({block_size})"),
+    }
+}
+
 fn crawl(
     top_dir: &Path,
-    outdir: &Path,
+    sink: &Arc<dyn IndexSink>,
     jobs: usize,
     buffsize: usize,
     size_mode: SizeMode,
     schema: &Arc<Schema>,
-    work_queue: VecDeque<WorkItem>,
-    split_dirs: Arc<SplitDirs>,
-    filter_desc: &str,
+    split_points: &[SplitPoint],
+    partition_filter: Option<&HashSet<String>>,
+    recursive: bool,
+    allow_errors: bool,
     is_tty: bool,
 ) -> Result<CrawlStats> {
     // Build shared rayon thread pool for jwalk walkers
@@ -275,13 +85,44 @@ fn crawl(
         ThreadPoolBuilder::new()
             .num_threads(jobs)
             .build()
-            .context("Failed to build thread pool")?
+            .context("Failed to build thread pool")?,
     );
 
-    let num_items = work_queue.len();
-    if num_items == 0 {
-        anyhow::bail!("No partitions found in {}", top_dir.display());
+    // Enumerate top-level entries. The directory I/O stays here; the pure classification
+    // and ordering decision (partition vs loose file, --partition filter, __root__-first,
+    // sort, empty-check) lives in `build_work_queue` so it can be unit-tested.
+    let mut entries: Vec<TopEntry> = Vec::new();
+    for entry in fs::read_dir(top_dir)
+        .with_context(|| format!("Failed to read directory: {}", top_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let ft = entry.file_type()?;
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        entries.push(TopEntry {
+            path,
+            name,
+            is_dir: ft.is_dir(),
+            is_file: ft.is_file(),
+            is_symlink: ft.is_symlink(),
+        });
     }
+
+    // A destination that cannot hold a directory's name as a partition refuses it here,
+    // still before the marker is touched.
+    sink.check_top_level(&entries, top_dir)?;
+    let work_queue =
+        build_split_work_queue(entries, top_dir, split_points, partition_filter, recursive)?;
+    let num_items = work_queue.len();
+    let split_skip = Arc::new(SplitSkip::new(split_points));
+
+    // Pre-flight has passed, so from here the index is being rewritten and the previous
+    // run's attestation no longer describes it. Dropping the marker after the last check
+    // that can still reject the run, and before any driver writes, means a crash below
+    // leaves an index that is visibly unattested rather than one that still claims to be
+    // complete — while a run rejected without touching the index leaves an
+    // already-complete index still attested.
+    sink.clear_marker()?;
 
     // Progress display
     let mp = MultiProgress::new();
@@ -289,10 +130,27 @@ fn crawl(
         mp.set_draw_target(ProgressDrawTarget::hidden());
     }
 
-    if is_tty {
-        eprintln!("{:>12} {}{}", style("Indexing").green().bold(), top_dir.display(), filter_desc);
+    let filter_desc = if partition_filter.is_some() {
+        let names: Vec<&str> = queue_names(&work_queue);
+        format!(" (partitions: {})", names.join(", "))
     } else {
-        eprintln!("Indexing {}{}", top_dir.display(), filter_desc);
+        String::new()
+    };
+
+    if is_tty {
+        eprintln!(
+            "{:>12} {}{}",
+            style("Indexing").green().bold(),
+            top_dir.display(),
+            filter_desc
+        );
+    } else {
+        let mut opts = format!("jobs={jobs}, size={}", size_mode_label(size_mode));
+        if allow_errors {
+            opts.push_str(", allow-errors");
+        }
+        let msg = format!("Indexing {}{} ({opts})", top_dir.display(), filter_desc);
+        eprintln!("{}", format_log_record(LogLevel::Info, &msg));
     }
 
     // Global summary bar (positioned last, below per-partition bars)
@@ -308,31 +166,45 @@ fn crawl(
     let global_files = Arc::new(AtomicU64::new(0));
     let global_bytes = Arc::new(AtomicU64::new(0));
     let global_pruned = Arc::new(AtomicUsize::new(0));
+    // Benign vanished-file races vs. hard (permission/IO) errors. A hard error fails
+    // the run unless --allow-errors; both are surfaced in the summary (all on stderr).
+    let global_vanished = Arc::new(AtomicU64::new(0));
+    let global_errors = Arc::new(AtomicU64::new(0));
+    // Paths stored with U+FFFD replacements: counted and reported, never fatal.
+    let global_lossy = Arc::new(AtomicU64::new(0));
+
+    // Raised by the first driver that fails. The others stop pulling partitions
+    // rather than growing an index this run will never mark complete.
+    let cancel = Arc::new(AtomicBool::new(false));
 
     // Global speed tracking (shared across drivers, protected by single Mutex)
     let global_speed_state = Arc::new(Mutex::new((
-        Instant::now(),  // last sample time
-        0_u64,           // last sample file count
-        0.0_f64,         // current speed
-        0.0_f64,         // peak speed
+        Instant::now(), // last sample time
+        0_u64,          // last sample file count
+        0.0_f64,        // current speed
+        0.0_f64,        // peak speed
     )));
 
     let num_drivers = jobs.min(num_items).max(1);
 
     std::thread::scope(|s| -> Result<()> {
         let handles: Vec<_> = (0..num_drivers)
-            .map(|driver_id| {
+            .map(|_| {
                 let pool = pool.clone();
                 let queue = queue.clone();
                 let global_files = global_files.clone();
                 let global_bytes = global_bytes.clone();
                 let global_pruned = global_pruned.clone();
+                let global_vanished = global_vanished.clone();
+                let global_errors = global_errors.clone();
+                let global_lossy = global_lossy.clone();
+                let cancel = cancel.clone();
                 let global_speed_state = global_speed_state.clone();
                 let schema = schema.clone();
                 let mp_ref = &mp;
                 let global_bar_ref = &global_bar;
-                let outdir = outdir.to_path_buf();
-                let split_dirs = split_dirs.clone();
+                let sink = Arc::clone(sink);
+                let split_skip = Arc::clone(&split_skip);
 
                 s.spawn(move || -> Result<()> {
                     let bar_style = ProgressStyle::default_spinner()
@@ -342,198 +214,352 @@ fn crawl(
                     bar.set_style(bar_style);
                     bar.enable_steady_tick(Duration::from_millis(100));
 
-                    loop {
-                        let item = {
-                            let mut q = queue.lock().unwrap();
-                            q.pop_front()
-                        };
-                        let item = match item {
-                            Some(i) => i,
-                            None => break,
-                        };
+                    // Emit a diagnostic to stderr, coordinating with the progress bars in
+                    // TTY mode (stdout stays clean and pipeable). Off-TTY the record
+                    // carries a timestamp and severity tag; on a TTY the styled line
+                    // stands as is.
+                    let report = |level: LogLevel, msg: &str| {
+                        if is_tty {
+                            let _ = mp_ref.println(msg);
+                        } else {
+                            eprintln!("{}", format_log_record(level, msg));
+                        }
+                    };
 
-                        bar.set_message(format!("{}: scanning...", item.partition));
-
-                        // Leave split-point subdirectories to their own work items.
-                        let skip = split_dirs.clone();
-                        let base_depth = item.depth;
-                        let walker = WalkDir::new(&item.path)
-                            .parallelism(Parallelism::RayonExistingPool {
-                                pool: pool.clone(),
-                                busy_timeout: None,
-                            })
-                            .skip_hidden(false)
-                            .follow_links(false)
-                            .process_read_dir(move |depth, dir, _, children| {
-                                // `depth` is None for the walk root itself, which must be kept.
-                                let Some(depth) = depth else { return };
-                                if base_depth + depth + 1 > skip.max_depth {
-                                    return;
-                                }
-                                children.retain(|child| match child {
-                                    Ok(e) => !(e.file_type.is_dir() && skip.paths.contains(&dir.join(&e.file_name))),
-                                    Err(_) => true,
-                                });
-                            });
-
-                        let mut buffer = PartitionBuffer::new(
-                            item.partition.clone(),
-                            outdir.clone(),
-                            buffsize,
-                            schema.clone(),
-                        );
-
-                        let mut last_bar_update = Instant::now();
-                        let bar_interval = Duration::from_millis(100);
-
-                        // Per-partition speed tracking (1s rolling window)
-                        let mut speed_sample_count: u64 = 0;
-                        let mut speed_sample_time = Instant::now();
-                        let mut current_speed: f64 = 0.0;
-                        let mut peak_speed: f64 = 0.0;
-
-                        for entry in walker {
-                            let entry = match entry {
-                                Ok(e) => e,
-                                Err(_) => continue,
-                            };
-
-                            if !entry.file_type.is_file() {
-                                continue;
+                    // The queue drain is its own closure so a first error can raise the
+                    // shared cancel flag before this driver returns.
+                    let drain_queue = || -> Result<()> {
+                        loop {
+                            // Another driver has already failed: this run cannot produce a
+                            // complete index, so stop taking on new partitions.
+                            if cancel.load(Ordering::Relaxed) {
+                                break;
                             }
 
-                            let metadata = match fs::metadata(entry.path()) {
-                                Ok(m) => m,
-                                Err(_) => continue,
+                            let item = {
+                                let mut q = queue.lock().unwrap();
+                                q.pop_front()
+                            };
+                            let item = match item {
+                                Some(i) => i,
+                                None => break,
                             };
 
-                            let disk_usage = metadata.blocks() * 512;
-                            let file_len = metadata.len();
-                            let atime = metadata.atime();
-                            let mtime = metadata.mtime();
-                            let ctime = metadata.ctime();
-                            let uid   = metadata.uid();
-                            let gid   = metadata.gid();
-                            let mode  = metadata.mode();
-                            let file_size = size_mode.calculate(disk_usage, file_len);
+                            bar.set_message(format!("{}: scanning...", item.partition));
 
-                            let record = FileRecord {
-                                path: entry.path().to_string_lossy().to_string(),
-                                size: file_size as i64,
-                                atime,
-                                mtime,
-                                ctime,
-                                uid,
-                                gid,
-                                mode,
-                            };
-
-                            buffer.add(record)?;
-
-                            // Update global atomics
-                            global_files.fetch_add(1, Ordering::Relaxed);
-                            global_bytes.fetch_add(file_size, Ordering::Relaxed);
-
-                            // Update progress bars periodically
-                            let now = Instant::now();
-                            if now.duration_since(last_bar_update) >= bar_interval {
-                                // Per-partition speed: 1-second rolling window
-                                let speed_elapsed = now.duration_since(speed_sample_time).as_secs_f64();
-                                if speed_elapsed >= 1.0 {
-                                    let delta = buffer.file_count - speed_sample_count;
-                                    current_speed = delta as f64 / speed_elapsed;
-                                    if current_speed > peak_speed {
-                                        peak_speed = current_speed;
+                            // Leave split-point subdirectories to their own work items, so
+                            // each file is indexed by the deepest partition containing it
+                            // and by no other.
+                            let skip = Arc::clone(&split_skip);
+                            let base_depth = item.depth;
+                            let walker = WalkDir::new(&item.path)
+                                .parallelism(Parallelism::RayonExistingPool {
+                                    pool: pool.clone(),
+                                    busy_timeout: None,
+                                })
+                                .max_depth(item.max_depth.unwrap_or(usize::MAX))
+                                .skip_hidden(false)
+                                .follow_links(false)
+                                .process_read_dir(move |depth, dir, _, children| {
+                                    // `depth` is None for the walk root's own entry, which is
+                                    // always kept.
+                                    let Some(depth) = depth else { return };
+                                    if !skip.checks_children_at(base_depth + depth) {
+                                        return;
                                     }
-                                    speed_sample_count = buffer.file_count;
-                                    speed_sample_time = now;
+                                    children.retain(|child| match child {
+                                        Ok(e) => {
+                                            !(e.file_type.is_dir()
+                                                && skip.skips(&dir.join(&e.file_name)))
+                                        }
+                                        Err(_) => true,
+                                    });
+                                });
+
+                            let mut buffer = PartitionBuffer::new(
+                                item.partition.clone(),
+                                Arc::clone(&sink),
+                                buffsize,
+                                schema.clone(),
+                            );
+
+                            let mut last_bar_update = Instant::now();
+                            let bar_interval = Duration::from_millis(100);
+
+                            // Quiet-partition liveness: directories visited since this
+                            // partition started, plus the start itself for elapsed time.
+                            let part_start = Instant::now();
+                            let mut dirs_visited: u64 = 0;
+
+                            // Per-partition speed tracking (1s rolling window)
+                            let mut speed_sample_count: u64 = 0;
+                            let mut speed_sample_time = Instant::now();
+                            let mut current_speed: f64 = 0.0;
+                            let mut peak_speed: f64 = 0.0;
+
+                            // Per-partition skip/error tallies (folded into the globals below).
+                            let mut part_vanished: u64 = 0;
+                            let mut part_errors: u64 = 0;
+                            let mut part_lossy: u64 = 0;
+
+                            for entry in walker {
+                                let entry = match entry {
+                                    Ok(e) => e,
+                                    // A jwalk error stands in for a whole unreadable subtree: a
+                                    // failed directory read yields one Err in place of all its
+                                    // children. Never drop it silently.
+                                    Err(err) => {
+                                        let kind = err.io_error().map(|e| e.kind());
+                                        match classify_io_error(kind) {
+                                            EntryError::Vanished => part_vanished += 1,
+                                            EntryError::Hard => {
+                                                part_errors += 1;
+                                                let path =
+                                                    err.path().unwrap_or(item.path.as_path());
+                                                let detail = err
+                                                    .io_error()
+                                                    .map(|e| e.to_string())
+                                                    .unwrap_or_else(|| err.to_string());
+                                                report(
+                                                    LogLevel::Error,
+                                                    &format!(
+                                                        "error: {}: {}",
+                                                        path.display(),
+                                                        detail
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                };
+
+                                // A directory jwalk could not descend into (e.g. permission
+                                // denied) is yielded as an Ok entry with the read failure attached
+                                // here — NOT as an iterator Err. This is the load-bearing check
+                                // that turns a silently-dropped subtree into a counted, reported,
+                                // run-failing error.
+                                if let Some(err) = entry.read_children_error.as_ref() {
+                                    let kind = err.io_error().map(|e| e.kind());
+                                    match classify_io_error(kind) {
+                                        EntryError::Vanished => part_vanished += 1,
+                                        EntryError::Hard => {
+                                            part_errors += 1;
+                                            let detail = err
+                                                .io_error()
+                                                .map(|e| e.to_string())
+                                                .unwrap_or_else(|| err.to_string());
+                                            let path = err
+                                                .path()
+                                                .map(|p| p.display().to_string())
+                                                .unwrap_or_else(|| {
+                                                    entry.path().display().to_string()
+                                                });
+                                            report(
+                                                LogLevel::Error,
+                                                &format!("error: {}: {}", path, detail),
+                                            );
+                                        }
+                                    }
                                 }
 
-                                // Global speed: 1-second rolling window
-                                let total_files = global_files.load(Ordering::Relaxed);
-                                let global_speed_str = {
-                                    let mut gs = global_speed_state.lock().unwrap();
-                                    let g_elapsed = now.duration_since(gs.0).as_secs_f64();
-                                    if g_elapsed >= 1.0 {
-                                        let g_delta = total_files.saturating_sub(gs.1);
-                                        gs.2 = g_delta as f64 / g_elapsed;
-                                        if gs.2 > gs.3 {
-                                            gs.3 = gs.2;
+                                if entry.file_type.is_file() {
+                                    // `DirEntry::metadata` is `symlink_metadata` here (the
+                                    // walker sets follow_links(false)), which closes the
+                                    // window where a file could be swapped for a symlink
+                                    // between the directory read and this stat. For a regular
+                                    // file lstat and stat agree, so sizes and atimes are
+                                    // unchanged.
+                                    let metadata = match entry.metadata() {
+                                        Ok(m) => m,
+                                        // The file raced away (ENOENT) or became unreadable
+                                        // between the walk and this stat: benign vs. hard.
+                                        Err(err) => {
+                                            let kind = err.io_error().map(|e| e.kind());
+                                            match classify_io_error(kind) {
+                                                EntryError::Vanished => part_vanished += 1,
+                                                EntryError::Hard => {
+                                                    part_errors += 1;
+                                                    let detail = err
+                                                        .io_error()
+                                                        .map(|e| e.to_string())
+                                                        .unwrap_or_else(|| err.to_string());
+                                                    report(
+                                                        LogLevel::Error,
+                                                        &format!(
+                                                            "error: {}: {}",
+                                                            entry.path().display(),
+                                                            detail
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                            continue;
                                         }
-                                        gs.0 = now;
-                                        gs.1 = total_files;
+                                    };
+
+                                    let (file_size, uid, gid, mode, atime, mtime, ctime) =
+                                        file_measurements(&metadata, size_mode);
+                                    let path = entry.path();
+                                    let (path_str, lossy) = lossy_path(&path);
+
+                                    // The stored path carries U+FFFD in place of the real
+                                    // bytes, so it names no file on disk. Say so once per
+                                    // partition and count the rest — a flood of these would
+                                    // bury the errors that matter.
+                                    if lossy {
+                                        part_lossy += 1;
+                                        if part_lossy == 1 {
+                                            report(
+                                                LogLevel::Warn,
+                                                &format!(
+                                                    "warning: {}: non-UTF-8 path stored with \
+                                         replacement characters; it will not round-trip \
+                                         to xdu-rm (further occurrences in this \
+                                         partition are counted only)",
+                                                    path.display()
+                                                ),
+                                            );
+                                        }
                                     }
-                                    if gs.2 > 0.0 {
+
+                                    buffer.add(
+                                        &path_str, file_size, uid, gid, mode, atime, mtime, ctime,
+                                    )?;
+
+                                    // Update global atomics
+                                    global_files.fetch_add(1, Ordering::Relaxed);
+                                    global_bytes.fetch_add(file_size as u64, Ordering::Relaxed);
+                                } else if entry.file_type.is_dir() {
+                                    // Directories carry no row, but each one proves the walk
+                                    // is alive: count it for the quiet-branch message below.
+                                    dirs_visited += 1;
+                                }
+
+                                // Update progress bars periodically
+                                let now = Instant::now();
+                                if now.duration_since(last_bar_update) >= bar_interval {
+                                    // Per-partition speed: 1-second rolling window
+                                    let speed_elapsed =
+                                        now.duration_since(speed_sample_time).as_secs_f64();
+                                    if speed_elapsed >= 1.0 {
+                                        let delta = buffer.file_count - speed_sample_count;
+                                        current_speed = delta as f64 / speed_elapsed;
+                                        if current_speed > peak_speed {
+                                            peak_speed = current_speed;
+                                        }
+                                        speed_sample_count = buffer.file_count;
+                                        speed_sample_time = now;
+                                    }
+
+                                    // Global speed: 1-second rolling window
+                                    let total_files = global_files.load(Ordering::Relaxed);
+                                    let global_speed_str = {
+                                        let mut gs = global_speed_state.lock().unwrap();
+                                        let g_elapsed = now.duration_since(gs.0).as_secs_f64();
+                                        if g_elapsed >= 1.0 {
+                                            let g_delta = total_files.saturating_sub(gs.1);
+                                            gs.2 = g_delta as f64 / g_elapsed;
+                                            if gs.2 > gs.3 {
+                                                gs.3 = gs.2;
+                                            }
+                                            gs.0 = now;
+                                            gs.1 = total_files;
+                                        }
+                                        if gs.2 > 0.0 {
+                                            format!(
+                                                " | {} (peak: {})",
+                                                format_speed(gs.2),
+                                                format_speed(gs.3)
+                                            )
+                                        } else {
+                                            String::new()
+                                        }
+                                    };
+
+                                    let speed_str = if current_speed > 0.0 {
                                         format!(
                                             " | {} (peak: {})",
-                                            format_speed(gs.2),
-                                            format_speed(gs.3)
+                                            format_speed(current_speed),
+                                            format_speed(peak_speed)
                                         )
                                     } else {
                                         String::new()
-                                    }
-                                };
+                                    };
 
-                                let speed_str = if current_speed > 0.0 {
-                                    format!(
-                                        " | {} (peak: {})",
-                                        format_speed(current_speed),
-                                        format_speed(peak_speed)
-                                    )
-                                } else {
-                                    String::new()
-                                };
+                                    // Files completed select the lively branch; zero of
+                                    // both counters selects waiting, dirs without files
+                                    // select quiet-scanning — all inside the builder.
+                                    bar.set_message(format_partition_progress(
+                                        &item.partition,
+                                        buffer.file_count,
+                                        buffer.byte_count,
+                                        dirs_visited,
+                                        part_start.elapsed().as_secs(),
+                                        &speed_str,
+                                    ));
+                                    global_bar_ref.set_message(format!(
+                                        "{} files, {}{}",
+                                        format_count(total_files),
+                                        format_bytes(global_bytes.load(Ordering::Relaxed)),
+                                        global_speed_str,
+                                    ));
+                                    last_bar_update = now;
+                                }
+                            }
 
-                                bar.set_message(format!(
-                                    "{}: {} files, {}{} [T{}]",
+                            buffer.flush()?;
+                            let pruned = buffer.finalize()?;
+                            global_pruned.fetch_add(pruned, Ordering::Relaxed);
+                            global_vanished.fetch_add(part_vanished, Ordering::Relaxed);
+                            global_errors.fetch_add(part_errors, Ordering::Relaxed);
+                            global_lossy.fetch_add(part_lossy, Ordering::Relaxed);
+
+                            let mut status_info = if pruned > 0 {
+                                format!(", pruned {} stale", pruned)
+                            } else {
+                                String::new()
+                            };
+                            if part_vanished > 0 {
+                                status_info.push_str(&format!(", {} vanished", part_vanished));
+                            }
+                            if part_errors > 0 {
+                                status_info.push_str(&format!(", {} errors", part_errors));
+                            }
+                            if part_lossy > 0 {
+                                status_info.push_str(&format!(", {} non-UTF-8", part_lossy));
+                            }
+
+                            if is_tty {
+                                mp_ref.println(format!(
+                                    "{:>12} {} ({} files, {}{})",
+                                    style("Finished").green().bold(),
                                     item.partition,
                                     format_count(buffer.file_count),
                                     format_bytes(buffer.byte_count),
-                                    speed_str,
-                                    driver_id,
-                                ));
-                                global_bar_ref.set_message(format!(
-                                    "{} files, {}{}",
-                                    format_count(total_files),
-                                    format_bytes(global_bytes.load(Ordering::Relaxed)),
-                                    global_speed_str,
-                                ));
-                                last_bar_update = now;
+                                    status_info,
+                                ))?;
+                            } else {
+                                let msg = format!(
+                                    "Finished {} ({} files, {}{})",
+                                    item.partition,
+                                    format_count(buffer.file_count),
+                                    format_bytes(buffer.byte_count),
+                                    status_info,
+                                );
+                                eprintln!("{}", format_log_record(LogLevel::Info, &msg));
                             }
                         }
+                        Ok(())
+                    };
 
-                        buffer.flush()?;
-                        let pruned = buffer.finalize()?;
-                        global_pruned.fetch_add(pruned, Ordering::Relaxed);
-
-                        let prune_info = if pruned > 0 {
-                            format!(", pruned {} stale", pruned)
-                        } else {
-                            String::new()
-                        };
-
-                        if is_tty {
-                            mp_ref.println(format!(
-                                "{:>12} {} ({} files, {}{})",
-                                style("Finished").green().bold(),
-                                item.partition,
-                                format_count(buffer.file_count),
-                                format_bytes(buffer.byte_count),
-                                prune_info,
-                            ))?;
-                        } else {
-                            eprintln!(
-                                "Finished {} ({} files, {}{})",
-                                item.partition,
-                                format_count(buffer.file_count),
-                                format_bytes(buffer.byte_count),
-                                prune_info,
-                            );
-                        }
+                    let result = drain_queue();
+                    if result.is_err() {
+                        cancel.store(true, Ordering::Relaxed);
                     }
 
                     bar.finish_and_clear();
-                    Ok(())
+                    result
                 })
             })
             .collect();
@@ -548,6 +574,7 @@ fn crawl(
                         first_error = Some(e);
                     }
                 }
+                // Reachable only under unwind (tests/debug); release sets panic="abort".
                 Err(_) => {
                     if first_error.is_none() {
                         first_error = Some(anyhow::anyhow!("Driver thread panicked"));
@@ -568,75 +595,20 @@ fn crawl(
         files: global_files.load(Ordering::Relaxed),
         bytes: global_bytes.load(Ordering::Relaxed),
         pruned: global_pruned.load(Ordering::Relaxed),
+        vanished: global_vanished.load(Ordering::Relaxed),
+        errors: global_errors.load(Ordering::Relaxed),
+        lossy_paths: global_lossy.load(Ordering::Relaxed),
     })
 }
 
-/// Name of a size mode, as recorded in the manifest.
-fn size_mode_name(mode: SizeMode) -> String {
-    match mode {
-        SizeMode::DiskUsage => "disk-usage".to_string(),
-        SizeMode::ApparentSize => "apparent-size".to_string(),
-        SizeMode::BlockRounded(n) => format!("block-rounded:{}", n),
-    }
+/// The partition names of a work queue, in queue order.
+fn queue_names(queue: &std::collections::VecDeque<xdu::crawl::WorkItem>) -> Vec<&str> {
+    queue.iter().map(|i| i.partition.as_str()).collect()
 }
 
-/// True for chunk files written by xdu (`NNNNNN.parquet`).
-fn is_chunk_file(name: &str) -> bool {
-    name.strip_suffix(".parquet")
-        .is_some_and(|stem| stem.len() == 6 && stem.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// Delete the chunk files of one partition, then any directories left empty up to the index root.
-/// Returns the number of chunks removed.
-fn remove_partition_chunks(outdir: &Path, key: &str) -> Result<usize> {
-    let dir = outdir.join(key);
-    let mut removed = 0;
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() && is_chunk_file(&entry.file_name().to_string_lossy()) {
-            fs::remove_file(entry.path())
-                .with_context(|| format!("Failed to remove stale chunk: {}", entry.path().display()))?;
-            removed += 1;
-        }
-    }
-    let mut d = dir.as_path();
-    while d != outdir && fs::remove_dir(d).is_ok() {
-        match d.parent() {
-            Some(p) => d = p,
-            None => break,
-        }
-    }
-    Ok(removed)
-}
-
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let start_time = Instant::now();
-    let is_tty = stderr().is_terminal();
-
-    // Determine size calculation mode
-    let size_mode = if let Some(ref bs) = args.block_size {
-        let block_size = parse_size(bs).map_err(|e| anyhow::anyhow!(e))? as u64;
-        SizeMode::BlockRounded(block_size)
-    } else if args.apparent_size {
-        SizeMode::ApparentSize
-    } else {
-        SizeMode::DiskUsage
-    };
-
-    let top_dir = args.dir.canonicalize()
-        .with_context(|| format!("Failed to resolve directory: {}", args.dir.display()))?;
-
-    fs::create_dir_all(&args.outdir)
-        .with_context(|| format!("Failed to create output directory: {}", args.outdir.display()))?;
-
-    let outdir = args.outdir.canonicalize()?;
-
-    let schema = get_schema();
-
-    // Decide the split spec: command line, else the existing index's, else the default.
-    let existing = Manifest::load(&outdir)?;
-    let existing_spec = existing.as_ref().map(|m| m.split.clone()).unwrap_or_default();
+/// The split spec this run uses: the command line's, else the existing index's, else the
+/// flat layout.
+fn split_spec(args: &XduArgs, existing: Option<&Manifest>) -> Result<SplitSpec> {
     let mut patterns = args.split.clone();
     if let Some(ref file) = args.split_file {
         let text = fs::read_to_string(file)
@@ -648,115 +620,307 @@ fn main() -> Result<()> {
                 .map(String::from),
         );
     }
-    let spec = if args.split_depth.is_some() || !patterns.is_empty() {
-        SplitSpec { depth: args.split_depth.unwrap_or(1), patterns }.normalized()
+    Ok(if args.split_depth.is_some() || !patterns.is_empty() {
+        SplitSpec {
+            depth: args.split_depth.unwrap_or(1),
+            patterns,
+        }
+        .normalized()
     } else {
-        existing_spec.normalized()
+        existing
+            .map(|m| m.split.clone())
+            .unwrap_or_default()
+            .normalized()
+    })
+}
+
+fn main() -> Result<()> {
+    let is_tty = stderr().is_terminal();
+    match run(is_tty) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if is_tty {
+                Err(err)
+            } else {
+                // The shaped record below is the run's only verdict. Returning `Err`
+                // would make the runtime print its own untimestamped `Error:`/`Caused
+                // by:` block after it, breaking the one-record-per-line shape the
+                // non-TTY log promises. Exiting directly keeps the failure loud at
+                // the same status code the `Err` return would have produced, and the
+                // marker ordering is untouched — a failed run stays unattested.
+                eprintln!(
+                    "{}",
+                    format_log_record(LogLevel::Error, &format!("{err:#}"))
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn run(is_tty: bool) -> Result<()> {
+    let args = XduArgs::parse();
+    let start_time = Instant::now();
+
+    // Determine size calculation mode
+    let size_mode = if let Some(ref bs) = args.block_size {
+        let block_size = parse_size(bs).map_err(|e| anyhow::anyhow!(e))? as u64;
+        SizeMode::BlockRounded(block_size)
+    } else if args.apparent_size {
+        SizeMode::ApparentSize
+    } else {
+        SizeMode::DiskUsage
     };
 
-    let existing_partitions = list_partitions(&outdir)?;
-    if args.partition.is_some() && !existing_partitions.is_empty() && !spec.same_layout(&existing_spec) {
+    let top_dir = args
+        .dir
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve directory: {}", args.dir.display()))?;
+
+    // `-o` is an S3 locator only when it starts with `s3://`; anything else is the local
+    // directory it always was, non-UTF-8 bytes included. Nothing is sent to S3 yet.
+    // `local_outdir` is the index directory when there is one: the manifest and the
+    // stale-partition sweep exist only there.
+    let (sink, local_outdir): (Arc<dyn IndexSink>, Option<std::path::PathBuf>) =
+        match IndexLocator::parse(args.outdir.as_os_str())? {
+            IndexLocator::Local(outdir) => {
+                fs::create_dir_all(&outdir).with_context(|| {
+                    format!("Failed to create output directory: {}", outdir.display())
+                })?;
+                let outdir = outdir.canonicalize()?;
+                (Arc::new(LocalSink::new(outdir.clone())), Some(outdir))
+            }
+            IndexLocator::S3(locator) => {
+                let settings = S3Settings::resolve(&ProcessEnv)?;
+                (Arc::new(S3Sink::connect(&locator, &settings)?), None)
+            }
+        };
+
+    let schema = get_schema();
+
+    // The split spec: the command line's, else the one the existing index was built with. A
+    // `--partition` run must use the index's own layout, or its partitions would overlap the
+    // ones already on disk and readers would count files twice.
+    let existing = match local_outdir {
+        Some(ref outdir) => Manifest::load(outdir)?,
+        None => None,
+    };
+    let spec = split_spec(&args, existing.as_ref())?;
+    if local_outdir.is_none() && !spec.is_default() {
         anyhow::bail!(
-            "The split settings differ from those of the existing index in {}; \
-             run without --partition to rebuild it with the new layout",
-            outdir.display()
+            "--split and --split-depth are supported only for a local output directory; an \
+             s3:// index uses one partition per top-level directory"
         );
     }
-    let size_mode_str = size_mode_name(size_mode);
+    let existing_partitions = match local_outdir {
+        Some(ref outdir) => list_partitions(outdir)?,
+        None => Vec::new(),
+    };
+    let existing_spec = existing
+        .as_ref()
+        .map(|m| m.split.clone())
+        .unwrap_or_default();
+    if args.partition.is_some()
+        && !existing_partitions.is_empty()
+        && !spec.same_layout(&existing_spec)
+    {
+        anyhow::bail!(
+            "The split settings differ from those of the existing index in {}; run without \
+             --partition to rebuild it with the new layout",
+            args.outdir.display()
+        );
+    }
+    let size_label = size_mode_label(size_mode);
     if let Some(ref m) = existing
         && args.partition.is_some()
         && !m.size_mode.is_empty()
-        && m.size_mode != size_mode_str
+        && m.size_mode != size_label
     {
-        eprintln!("warning: existing index uses size mode '{}', this run uses '{}'", m.size_mode, size_mode_str);
+        let msg = format!(
+            "warning: the existing index uses size mode '{}', this run uses '{}'",
+            m.size_mode, size_label
+        );
+        if is_tty {
+            eprintln!("{msg}");
+        } else {
+            eprintln!("{}", format_log_record(LogLevel::Warn, &msg));
+        }
     }
 
     let (split_points, warnings) = resolve_split_points(&top_dir, &spec)?;
     for w in &warnings {
-        eprintln!("warning: {}", w);
+        let msg = format!("warning: {w}");
+        if is_tty {
+            eprintln!("{msg}");
+        } else {
+            eprintln!("{}", format_log_record(LogLevel::Warn, &msg));
+        }
+    }
+    let keys = split_keys(&split_points);
+
+    // Build and validate the partition filter: every name must be a partition this layout
+    // has, so a typo fails before anything is written.
+    let partition_filter: Option<HashSet<String>> = args
+        .partition
+        .as_ref()
+        .map(|p| p.iter().map(|n| normalize_partition_arg(n)).collect());
+    if let Some(ref pf) = partition_filter {
+        for name in pf {
+            if name == ROOT_PARTITION || keys.contains(name) {
+                continue;
+            }
+            if top_dir.join(name).is_dir() {
+                anyhow::bail!(
+                    "Partition '{}' is not a split point in {}; its files belong to an \
+                     enclosing partition",
+                    name,
+                    top_dir.display()
+                );
+            }
+            anyhow::bail!("Partition '{}' not found in {}", name, top_dir.display());
+        }
     }
 
-    // One work item per partition: the root, then each split point.
-    let mut items: Vec<WorkItem> = vec![WorkItem { path: top_dir.clone(), partition: ROOT_PARTITION.to_string(), depth: 0 }];
-    items.extend(split_points.iter().map(|key| WorkItem {
-        path: top_dir.join(key),
-        partition: key.clone(),
-        depth: key.split('/').count(),
-    }));
-
-    let split_dirs = Arc::new(SplitDirs {
-        paths: split_points.iter().map(|key| top_dir.join(key)).collect(),
-        max_depth: split_points.iter().map(|key| key.split('/').count()).max().unwrap_or(0),
-    });
-
-    // Restrict to the requested partitions, if any.
-    let filter_desc = if let Some(ref wanted) = args.partition {
-        let wanted: Vec<String> = wanted.iter().map(|p| p.trim_matches('/').to_string()).collect();
-        for w in &wanted {
-            if !items.iter().any(|i| &i.partition == w) {
-                anyhow::bail!("Partition '{}' is not a split point in {}", w, top_dir.display());
-            }
-        }
-        items.retain(|i| {
-            wanted.iter().any(|w| {
-                &i.partition == w
-                    || (args.recursive && w != ROOT_PARTITION && i.partition.starts_with(&format!("{}/", w)))
-            })
-        });
-        let names: Vec<&str> = items.iter().map(|i| i.partition.as_str()).collect();
-        format!(" (partitions: {})", names.join(", "))
-    } else {
-        String::new()
-    };
+    // The destination's own check, after every source-side one: an S3 prefix is listed once,
+    // which reaches the bucket with the credentials, while any existing marker is still in
+    // place. A local directory was created above and needs nothing more.
+    sink.preflight()?;
 
     let stats = crawl(
         &top_dir,
-        &outdir,
+        &sink,
         args.jobs,
         args.buffsize,
         size_mode,
         &schema,
-        items.into_iter().collect(),
-        split_dirs,
-        &filter_desc,
+        &split_points,
+        partition_filter.as_ref(),
+        args.recursive,
+        args.allow_errors,
         is_tty,
     )?;
 
-    // A full crawl owns the whole index: drop partitions that are no longer split points.
-    if args.partition.is_none() {
-        let keep: HashSet<&str> = split_points.iter().map(String::as_str).chain([ROOT_PARTITION]).collect();
-        for key in &existing_partitions {
-            if !keep.contains(key.as_str()) {
-                let n = remove_partition_chunks(&outdir, key)?;
-                if n > 0 {
-                    eprintln!("Removed stale partition {} ({} chunks)", key, n);
+    if let Some(ref outdir) = local_outdir {
+        // A full run owns the whole index: a partition that is no longer a split point
+        // would otherwise be read beside the one that now holds its files.
+        if partition_filter.is_none() {
+            let keep: HashSet<&str> = keys
+                .iter()
+                .map(String::as_str)
+                .chain([ROOT_PARTITION])
+                .collect();
+            for key in &existing_partitions {
+                if !keep.contains(key.as_str()) {
+                    let n = remove_stale_partition(outdir, key)?;
+                    if n > 0 && is_tty {
+                        eprintln!(
+                            "{:>12} stale partition {} ({} chunks)",
+                            style("Removed").yellow().bold(),
+                            key,
+                            n
+                        );
+                    } else if n > 0 {
+                        let msg = format!("Removed stale partition {} ({} chunks)", key, n);
+                        eprintln!("{}", format_log_record(LogLevel::Info, &msg));
+                    }
                 }
             }
         }
-    }
 
-    Manifest {
-        version: MANIFEST_VERSION,
-        root: top_dir.to_string_lossy().to_string(),
-        split: spec,
-        size_mode: size_mode_str,
+        Manifest {
+            version: MANIFEST_VERSION,
+            root: top_dir.to_string_lossy().to_string(),
+            split: spec.clone(),
+            size_mode: size_label.clone(),
+        }
+        .save(outdir)
+        .with_context(|| format!("Failed to write manifest in {}", outdir.display()))?;
     }
-    .save(&outdir)
-    .with_context(|| format!("Failed to write manifest in {}", outdir.display()))?;
 
     let elapsed = start_time.elapsed();
-    let prune_info = if stats.pruned > 0 { format!(", pruned {} stale", stats.pruned) } else { String::new() };
+    let mut summary_info = if stats.pruned > 0 {
+        format!(", pruned {} stale", stats.pruned)
+    } else {
+        String::new()
+    };
+    if stats.vanished > 0 {
+        summary_info.push_str(&format!(", {} vanished", stats.vanished));
+    }
+    if stats.errors > 0 {
+        summary_info.push_str(&format!(", {} errors", stats.errors));
+    }
+    if stats.lossy_paths > 0 {
+        summary_info.push_str(&format!(", {} non-UTF-8", stats.lossy_paths));
+    }
 
     if is_tty {
-        eprintln!("{:>12} {} files ({}) in {:.2}s{}",
+        eprintln!(
+            "{:>12} {} files ({}) in {:.2}s{}",
             style("Completed").green().bold(),
             format_count(stats.files),
             format_bytes(stats.bytes),
             elapsed.as_secs_f64(),
-            prune_info
+            summary_info
         );
     } else {
-        eprintln!("Completed {} files ({}) in {:.2}s{}", format_count(stats.files), format_bytes(stats.bytes), elapsed.as_secs_f64(), prune_info);
+        let msg = format!(
+            "Completed {} files ({}) in {:.2}s{}",
+            format_count(stats.files),
+            format_bytes(stats.bytes),
+            elapsed.as_secs_f64(),
+            summary_info
+        );
+        eprintln!("{}", format_log_record(LogLevel::Info, &msg));
+    }
+
+    // Fail loud: an unreadable region was skipped, so the index is incomplete. The
+    // reachable files were still written and the offending paths already reported;
+    // --allow-errors opts into indexing what is reachable and exiting 0 instead.
+    if stats.errors > 0 && !args.allow_errors {
+        anyhow::bail!(
+            "encountered {} unreadable path(s); the index is incomplete — \
+             re-run with --allow-errors to index reachable files and exit 0",
+            stats.errors
+        );
+    }
+
+    // Attest to the run only now: every partition was walked and finalized, and any
+    // errors along the way were explicitly tolerated. Every failure path above returns
+    // before this point, leaving the index unmarked. The recorded counts keep an
+    // --allow-errors run honest about what it skipped.
+    //
+    // Known limitation: the marker describes the whole index but its counts come from this
+    // run alone. A partition-scoped run (--partition) still clears the marker and rewrites
+    // it from its own stats, so a later clean run over one partition records errors=0 and
+    // retires the warning while other partitions' skipped regions remain unindexed.
+    let completed_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let format = if is_nested(&keys) {
+        NESTED_INDEX_FORMAT_VERSION
+    } else {
+        INDEX_FORMAT_VERSION
+    };
+    sink.write_marker(&completion_marker_contents_for(
+        &stats,
+        completed_at,
+        format,
+    ))?;
+
+    // The run is attested; say so on the record. The `Completed` summary above already
+    // carried the counts, but only this line names the marker — without it a script
+    // cannot tell attestation apart from a run that printed a summary and then failed
+    // to write.
+    if !is_tty {
+        let msg = format!(
+            "Marker {} written ({} files, {}{})",
+            sink.marker_location(),
+            format_count(stats.files),
+            format_bytes(stats.bytes),
+            summary_info
+        );
+        eprintln!("{}", format_log_record(LogLevel::Info, &msg));
     }
 
     Ok(())

@@ -1,4 +1,4 @@
-name: CI
+name: Tests
 
 on:
   push:
@@ -6,42 +6,350 @@ on:
   pull_request:
     branches: [main]
 
+# Restrict the default GITHUB_TOKEN: nothing here needs more than repository read.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref (e.g. rapid pushes to a PR) to save CI minutes.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-
+  # Format + lint gates run once (host-independent): fmt is deterministic and clippy denies
+  # all warnings, so a single Linux runner is enough.
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          components: clippy
+          persist-credentials: false
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Resolve toolchain from rust-toolchain.toml
+        id: rust
+        run: |
+          echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # SHA-pinned action; toolchain version comes from rust-toolchain.toml (single source)
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          toolchain: ${{ steps.rust.outputs.channel }}
+          components: clippy, rustfmt
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Format check
+        run: cargo fmt --all -- --check
 
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Build
-        run: cargo build --verbose
+  # Build + test on every supported host (Linux + macOS); fail-fast off so one host's
+  # failure still reports the other. RUSTFLAGS -D warnings turns any build warning into an
+  # error here too (clippy's -D warnings does not cover a plain `cargo build`).
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
-      - name: Run tests
-        run: cargo test --verbose
+      - name: Resolve toolchain from rust-toolchain.toml
+        id: rust
+        run: |
+          echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # SHA-pinned action; toolchain version comes from rust-toolchain.toml (single source)
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+          components: clippy, rustfmt
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Build
+        run: cargo build --locked --all-features
+
+      - name: Test
+        run: cargo test --locked --all-features
+
+      # The S3 wire tests need the pinned httpfs, which nothing in the repository carries. Fetch
+      # it the way a release leg does, with the probe from this build naming engine and platform,
+      # into a directory the binaries never look in by default: a copy under
+      # target/lib/xdu/extensions would let a reader that wrongly loads httpfs for a local index
+      # pass every local test. The tests themselves touch nothing beyond loopback.
+      - name: Fetch the pinned httpfs for the S3 tests
+        run: |
+          set -eu
+          cargo build --locked --all-features --example extension-probe
+          sh packaging/extensions/fetch.sh target/debug/examples/extension-probe "$RUNNER_TEMP/xdu-ext"
+
+      # tests/s3-wire.sh runs tests/s3_tests.rs with --include-ignored and fails unless the passed
+      # count equals the listed count and reaches the minimum, so a wire test that vanished,
+      # skipped or was filtered away turns this step red. The minimum is the file's listed count;
+      # raise it in the commit that adds a test (AGENTS.md, Testing). The last line,
+      # `s3-wire: '' N of N passed`, is the record of what ran.
+      - name: S3 tests
+        env:
+          XDU_TEST_EXTENSION_DIR: ${{ runner.temp }}/xdu-ext
+        run: sh tests/s3-wire.sh "" 53
+
+      # A platform smoke check, not acceptance: the built tools find this runner's CA bundle and
+      # verify AWS's real certificate chain with it, in both TLS stacks, using AWS's documented
+      # example key pair (no account, no secret). Any HTTP answer passes; a certificate error or
+      # no answer fails. Each tool's answering line is printed. The loopback tls_ tests above
+      # are what show verification is on.
+      - name: AWS TLS probe
+        env:
+          HOME: ${{ runner.temp }}/aws-tls-probe-home
+        run: sh packaging/extensions/aws-tls-probe.sh target/debug "$RUNNER_TEMP/xdu-ext"
+
+  # Mirrors HyperShell's packaging-metadata job: regenerate the shipped artifacts and fail
+  # if any are missing. Because man pages come from doc/*.scd and completions come from
+  # src/cli.rs, this catches CLI <-> doc/scd drift at PR time (a new/renamed binary or a
+  # dropped man page shows up as a missing artifact).
+  packaging:
+    name: Packaging (man + completions generate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Resolve toolchain from rust-toolchain.toml
+        id: rust
+        run: |
+          echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # SHA-pinned action; toolchain version comes from rust-toolchain.toml (single source)
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+          components: clippy, rustfmt
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install scdoc + mandoc
+        # mandoc renders the generated .1 back to plain text so the assertion step below can read
+        # what the page PUBLISHES, not just that it compiled; bsdextrautils supplies `col`, which
+        # strips mandoc's backspace-overstrike bytes (not in the base image on ubuntu-24.04).
+        run: sudo apt-get update && sudo apt-get install -y scdoc mandoc bsdextrautils
+
+      - name: Render man pages (doc/*.scd -> share/man/man1/*.1)
+        run: |
+          mkdir -p share/man/man1
+          for scd in doc/*.scd; do
+            name=$(basename "$scd" .1.scd)
+            scdoc < "$scd" > "share/man/man1/${name}.1"
+          done
+
+      # scdoc exiting 0 is necessary but not sufficient — the same rule the build gate already
+      # states for code. scdoc markup fails two ways: a nesting error is loud, but a mis-escaped
+      # literal is SILENT. doc/xdu.1.scd once shipped `_OUTDIR_/*/*.parquet`, which renders at
+      # exit 0 and publishes `OUTDIR//.parquet` — a wrong glob handed to an operator, past a green
+      # gate. So assert the published TEXT of the artifact this job just produced. The escaping
+      # rules themselves are single-sourced in AGENTS.md "Commands"; they are not restated here.
+      #
+      # The verdict must depend on the page's CONTENT, never on its layout, so whitespace is
+      # stripped from both the published text and the literal before matching. Collapsing newlines
+      # to spaces is not enough: mandoc fills to whatever width it likes and may break a line
+      # INSIDE a token — a bare roff `-` is a legal break opportunity, so `OUTDIR/.xdu-complete`
+      # can publish as `OUTDIR/.xdu-` + newline + `complete` — and `col -b` indents continuation
+      # lines with a literal TAB, which squeezing spaces never touches.
+      #
+      # Stripping whitespace is lossy: it can fuse two adjacent tokens into a string that never
+      # appeared on the page (`e.g. partial` becomes `e.g.partial`, which contains `.partial`).
+      # For a presence check that can only cause a false green; for an exact-count check it causes
+      # a false red, so a counted needle must be specific enough that fusion cannot synthesize it
+      # — hence `.partial suffix` rather than `.partial`.
+      #
+      # Counts exist because a presence check on a literal that occurs twice fires only when EVERY
+      # occurrence is corrupted. `Nx:LITERAL` asserts exactly N, so corrupting either one is caught.
+      #
+      # Each page is rendered once and that render is judged before any literal is, so a page that
+      # failed to render or rendered to nothing is reported as such instead of as a pile of corrupt
+      # literals. mandoc exits 0 on an empty file and on a garbage file, so the length guard is not
+      # redundant with the exit status.
+      #
+      # `|| got=0` is load-bearing: grep exits 1 on zero matches, so under a shell with `pipefail`
+      # set -e would kill the step before the diagnostic is printed — in exactly the zero-count
+      # case the count was added to catch.
+      #
+      # This normalization is one rule in three places: here, the grep snippet in AGENTS.md's
+      # "Commands" section (what a maintainer runs locally), and .agents/factory/invariants.md §13.
+      # Changing it here means changing both of those in the same commit — otherwise the local check
+      # stops predicting CI's verdict, which is the defect this step was rewritten to fix.
+      - name: Assert critical literals survive into the published man-page text
+        run: |
+          set -eu
+          published() {
+            raw=$(mandoc -Tutf8 "$1") || return 1
+            printf '%s\n' "$raw" | col -b | tr -d '[:space:]'
+          }
+          fail=0
+          check() {
+            page="$1"; shift
+            if ! text=$(published "$page"); then
+              echo "RENDER FAILED: mandoc could not render $page" >&2
+              fail=1
+              return
+            fi
+            if [ "${#text}" -lt 200 ]; then
+              echo "RENDER EMPTY: $page produced only ${#text} characters — nothing to assert" >&2
+              fail=1
+              return
+            fi
+            for spec in "$@"; do
+              # `Nx:LITERAL` opts into a count; anything else is a presence check. The prefix is
+              # accepted whenever every character before `x:` is a digit, so N is not capped at
+              # one digit — a `10x:` that degraded to a presence check would assert a literal
+              # carrying its own prefix, which can never appear on the page. A literal whose own
+              # text starts with digits followed by `x:` would be read as a count, but that fails
+              # loud rather than silently, and no such literal exists here.
+              #
+              # ANY literal published more than once must be counted, not merely present: `grep`
+              # is satisfied by whichever copy survived, so corrupting one of two occurrences is
+              # invisible. That is a property of the page, not of the literal, so it has to be
+              # re-checked BY HAND whenever a page changes; nothing here re-derives it. The same
+              # applies to coverage: this list names four pages while the render step globs
+              # doc/*.scd, so a fifth page is unasserted. Both gaps are recorded in
+              # issues/manpage-gate-coverage-gaps.md.
+              want=""; lit="$spec"
+              case "$spec" in
+                [0-9]*x:*)
+                  n="${spec%%x:*}"
+                  case "$n" in
+                    *[!0-9]*) ;;
+                    *) want="$n"; lit="${spec#*x:}" ;;
+                  esac
+                  ;;
+              esac
+              needle=$(printf '%s' "$lit" | tr -d '[:space:]')
+              if [ -n "$want" ]; then
+                got=$(printf '%s' "$text" | grep -oF -- "$needle" | wc -l | tr -d ' ') || got=0
+                if [ "$got" -ne "$want" ]; then
+                  echo "CORRUPT RENDER: $page has $got occurrence(s) of the literal '$lit', expected $want" >&2
+                  fail=1
+                fi
+              elif ! printf '%s' "$text" | grep -qF -- "$needle"; then
+                echo "CORRUPT RENDER: $page is missing the literal: $lit" >&2
+                fail=1
+              fi
+            done
+          }
+          check share/man/man1/xdu.1 \
+            'OUTDIR/<partition>/<chunk>.parquet' \
+            'OUTDIR/**/*.parquet' \
+            'OUTDIR/.xdu-complete' \
+            '__root__' \
+            '2x:.partial suffix' \
+            'st_blocks * 512' \
+            '2x:s3://BUCKET/PREFIX' '1x:AWS_ACCESS_KEY_ID' '1x:AWS_SECRET_ACCESS_KEY' \
+            '1x:AWS_SESSION_TOKEN' '2x:AWS_PROFILE' '1x:AWS_SHARED_CREDENTIALS_FILE' \
+            '1x:AWS_CONFIG_FILE' '1x:AWS_REGION' '1x:AWS_DEFAULT_REGION' \
+            '1x:AWS_ENDPOINT_URL_S3' '2x:AWS_ENDPOINT_URL' '2x:AWS_CA_BUNDLE'
+          # Each of these names its variable twice per page — once as a cross-reference in the
+          # flag description, once as the ENVIRONMENT entry — so presence alone is satisfied by
+          # whichever copy survived, and corrupting the ENVIRONMENT entry publishes a variable
+          # name that does not exist. Counted for the same reason `.partial suffix` is.
+          # XDU_EXTENSION_DIR follows the same pattern on xdu-find.1 and xdu-view.1: a
+          # cross-reference in S3 INDICES, then its ENVIRONMENT entry. The AWS_* names are
+          # counted, on xdu.1 above as on both reader pages, so a later cross-reference forces a
+          # re-count; AWS_ENDPOINT_URL's count includes the AWS_ENDPOINT_URL_S3 entry, which
+          # contains it, and AWS_PROFILE's includes the example. On xdu.1, s3://BUCKET/PREFIX is
+          # counted twice: under -o and in S3 OUTPUT. AWS_CA_BUNDLE is named twice on each of the
+          # three pages: in the trust paragraph of the S3 section, then its ENVIRONMENT entry.
+          check share/man/man1/xdu-find.1 '2x:XDU_INDEX' '2x:XDU_EXTENSION_DIR' \
+            '2x:lib/xdu/extensions' '1x:cargo install' '1x:release tarball' \
+            '1x:s3://BUCKET/PREFIX' '1x:AWS_ACCESS_KEY_ID' '1x:AWS_SECRET_ACCESS_KEY' \
+            '1x:AWS_SESSION_TOKEN' '2x:AWS_PROFILE' '1x:AWS_SHARED_CREDENTIALS_FILE' \
+            '1x:AWS_CONFIG_FILE' '1x:AWS_REGION' '1x:AWS_DEFAULT_REGION' \
+            '1x:AWS_ENDPOINT_URL_S3' '2x:AWS_ENDPOINT_URL' '2x:AWS_CA_BUNDLE'
+          check share/man/man1/xdu-view.1 '2x:XDU_INDEX' '2x:XDU_EXTENSION_DIR' \
+            '2x:lib/xdu/extensions' '1x:cargo install' '1x:release tarball' \
+            '1x:s3://BUCKET/PREFIX' '1x:AWS_ACCESS_KEY_ID' '1x:AWS_SECRET_ACCESS_KEY' \
+            '1x:AWS_SESSION_TOKEN' '2x:AWS_PROFILE' '1x:AWS_SHARED_CREDENTIALS_FILE' \
+            '1x:AWS_CONFIG_FILE' '1x:AWS_REGION' '1x:AWS_DEFAULT_REGION' \
+            '1x:AWS_ENDPOINT_URL_S3' '2x:AWS_ENDPOINT_URL' '2x:AWS_CA_BUNDLE'
+          check share/man/man1/xdu-rm.1   '2x:XDU_INDEX' '2x:XDU_JOBS'
+          # A line starting with `.` or `'` is a roff control request: scdoc drops the period
+          # silently, and the intuitive `\.` escape destroys the rest of the line. Rewrap instead.
+          if grep -nE "^[[:space:]]*['.]" doc/*.scd; then
+            echo "ROFF CONTROL LINE: a doc/*.scd line begins with . or ' — rewrap it instead" >&2
+            fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: every asserted literal survived into the published man-page text"
+
+      - name: Generate shell completions
+        run: |
+          cargo build --release --locked --bin gen-completions
+          mkdir -p share/bash-completion/completions share/zsh/site-functions
+          ./target/release/gen-completions share/bash-completion/completions share/zsh/site-functions
+
+      # Container specs are generated-committed like the man pages: the recipe is
+      # the source, the specs are the artifact. Regenerate from scratch and fail
+      # on drift, so a recipe edit without its specs cannot land green. Pinned so
+      # the gate is deterministic; bump deliberately with a regen in the same
+      # commit. A step in the existing packaging job, not a new job, so the
+      # required-checks set is unchanged.
+      - name: Install hpccm
+        run: pipx install 'hpccm==26.5.0'
+
+      - name: Assert container specs match the HPCCM recipe
+        run: |
+          set -eu
+          cd hpccm
+          make -B xdu.def xdu.docker
+          git diff --exit-code -- xdu.def xdu.docker
+          echo "OK: container specs match the recipe"
+
+      - name: Assert all man pages + completions were produced
+        run: |
+          set -eu
+          missing=""
+          for f in \
+            share/man/man1/xdu.1 \
+            share/man/man1/xdu-find.1 \
+            share/man/man1/xdu-view.1 \
+            share/man/man1/xdu-rm.1 \
+            share/man/man1/xdu-du.1 \
+            share/man/man1/xdu-diff.1 \
+            share/bash-completion/completions/xdu.bash \
+            share/bash-completion/completions/xdu-find.bash \
+            share/bash-completion/completions/xdu-view.bash \
+            share/bash-completion/completions/xdu-rm.bash \
+            share/bash-completion/completions/xdu-du.bash \
+            share/bash-completion/completions/xdu-diff.bash \
+            share/zsh/site-functions/_xdu \
+            share/zsh/site-functions/_xdu-find \
+            share/zsh/site-functions/_xdu-view \
+            share/zsh/site-functions/_xdu-rm \
+            share/zsh/site-functions/_xdu-du \
+            share/zsh/site-functions/_xdu-diff; do
+            if [ ! -s "$f" ]; then
+              missing="${missing} ${f}"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "MISSING generated packaging artifacts:${missing}" >&2
+            exit 1
+          fi
+          echo "OK: all four man pages and all bash+zsh completions present"

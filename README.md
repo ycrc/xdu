@@ -5,12 +5,12 @@
 **High-performance file system indexer for large-scale storage administration**
 
 [![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/glentner/xdu)](https://github.com/glentner/xdu/releases)
-[![Tests](https://img.shields.io/github/actions/workflow/status/glentner/xdu/test.yaml?branch=main&label=tests)](https://github.com/glentner/xdu/actions/workflows/test.yaml)
+[![Release](https://img.shields.io/github/v/release/xdu-project/xdu)](https://github.com/xdu-project/xdu/releases)
+[![Tests](https://img.shields.io/github/actions/workflow/status/xdu-project/xdu/test.yaml?branch=main&label=tests)](https://github.com/xdu-project/xdu/actions/workflows/test.yaml)
 
 </div>
 
-Builds Hive-partitioned Parquet indexes for instant analytics on filesystems with hundreds of millions of files.
+Builds partitioned Parquet indexes for instant analytics on filesystems with hundreds of millions of files.
 
 ## Motivation
 
@@ -27,10 +27,10 @@ Traditional tools like `du` and `find` are designed for interactive, one-off que
 
 ## Design
 
-### Hive-Partitioned Output
+### Partitioned Output
 
-By default the index is partitioned by top-level subdirectory (large directories can be
-split further; see [Nested Partitions](#nested-partitions)). For a `/home` filesystem:
+By default the index is partitioned by top-level subdirectory (large directories can be split
+further; see [Nested Partitions](#nested-partitions)). For a `/home` filesystem:
 
 ```
 index/
@@ -48,14 +48,15 @@ This layout enables:
 - **Parallel writes**: Each partition is processed independently
 - **Incremental updates**: Re-index individual partitions without rebuilding everything
 
-Files directly in the top-level directory go to `index/__root__/`. The index also
-contains `_xdu.json`, which records the crawl root and the split settings.
+Files directly in the top-level directory go to `index/__root__/`. The index also contains
+`.xdu-complete`, the run's completion marker, and `_xdu.json`, which records the crawl root and the
+split settings.
 
 ### Nested Partitions
 
-When one top-level directory is much larger than the others, it can be split further.
-Each *split point* (a directory, relative to the crawled directory) gets its own
-partition at `index/<path>/`, and each file goes to the deepest split point containing it:
+When one top-level directory is much larger than the others, it can be split further. Each *split
+point* (a directory, relative to the crawled directory) gets its own partition at `index/<path>/`,
+and each file goes to the deepest split point containing it:
 
 ```bash
 xdu /data -o /index/data --split 'projects/big,projects/big/*'
@@ -72,31 +73,37 @@ index/
 └── projects/big/y/000000.parquet   all of projects/big/y
 ```
 
-- By default every top-level directory is a split point (`--split-depth 1`).
-  `--split-depth 2` splits every second-level directory too; `--split-depth 0` keeps
-  only the `--split` paths.
-- `--split` paths may use `*` and `?` within a component. `--split-file` reads them from
-  a file, one per line. Wildcards never cross a `/`, so `'a/*'` means the children of `a`.
-  For grandchildren too, write `'a/*,a/*/*'`. `**` is rejected. Quote patterns so the
-  shell doesn't expand them.
-- A split path must be a real directory. xdu never follows symlinks, so a path through a
-  symlink is rejected with an error naming the link. Nothing below a symlink is indexed anyway.
+- By default every top-level directory is a split point (`--split-depth 1`). `--split-depth 2`
+  splits every second-level directory too; `--split-depth 0` keeps only the `--split` paths.
+- `--split` paths may use `*` and `?` within a component. `--split-file` reads them from a file, one
+  per line. Wildcards never cross a `/`, so `'a/*'` means the children of `a`; for grandchildren
+  too, write `'a/*,a/*/*'`. `**` is rejected. Quote patterns so the shell doesn't expand them.
+- A split path must be a real directory. xdu never follows symlinks, so a path through a symlink is
+  rejected with an error naming the link.
 - The settings are saved in `_xdu.json`, so later runs (including `-p` re-indexes) reuse them.
   Changing them requires a full run, which removes partitions that are no longer split points.
-- Split finely enough to balance the work, but keep the partition count modest: thousands of
-  tiny Parquet files make queries slower.
-- `xdu-find`, `xdu-du` and `xdu-rm` accept nested paths for `-u` and include everything
+- Split finely enough to balance the work, but keep the partition count modest: thousands of tiny
+  Parquet files make queries slower.
+- `xdu-find`, `xdu-du`, `xdu-rm` and `xdu-view` accept nested paths for `-u` and include everything
   below them. `xdu-du` and `xdu-view` group nested partitions under their top-level directory.
-- `xdu-diff` compares partition by partition when both indices have the same split settings,
-  and whole top-level directories otherwise.
+- `xdu-diff` compares partition by partition when both indexes have the same split settings, and
+  whole top-level directories otherwise.
+- A nested index records index format version 3 in its completion marker, so an older xdu, whose
+  readers glob only one directory level, refuses it instead of missing the nested partitions. A flat
+  index stays at version 2. Split settings are supported only for a local output directory.
 
 ### Schema
 
-| Column | Type  | Description                    |
-|--------|-------|--------------------------------|
-| path   | UTF-8 | Absolute file path             |
-| size   | INT64 | File size in bytes             |
-| atime  | INT64 | Last access time (Unix epoch)  |
+| Column | Type  | Description                         |
+|--------|-------|-------------------------------------|
+| path   | UTF-8 | Absolute file path                  |
+| size   | INT64 | File size in bytes                  |
+| uid    | INT64 | Owning user id                      |
+| gid    | INT64 | Owning group id                     |
+| mode   | INT64 | Permission bits (st_mode & 07777)   |
+| atime  | INT64 | Last access time (Unix epoch)       |
+| mtime  | INT64 | Last modification time (Unix epoch) |
+| ctime  | INT64 | Last inode-change time (Unix epoch) |
 
 ### Performance
 
@@ -115,7 +122,7 @@ A typical 100M file filesystem might take 2-3 hours to `du`. With xdu, the index
 ### Quick Install (Recommended)
 
 ```bash
-curl -sSfL https://raw.githubusercontent.com/glentner/xdu/main/install.sh | sh
+curl -sSfL https://xdu-project.org/install.sh | sh
 ```
 
 This downloads the latest release binary for your platform and installs it to `~/.local/bin`.
@@ -124,20 +131,35 @@ This downloads the latest release binary for your platform and installs it to `~
 - `XDU_VERSION=v0.1.0` — Install a specific version
 - `XDU_INSTALL=/usr/local/bin` — Change install directory
 
+The DuckDB extensions a release ships go to `../lib/xdu/extensions/` relative to the install
+directory (`~/.local/lib/xdu/extensions` by default), where the tools look for them; nothing is
+downloaded at run time. To keep them somewhere else, set `XDU_EXTENSION_DIR` to that directory.
+
 ### From Source
 
 ```bash
-cargo install --git https://github.com/glentner/xdu.git
+cargo install --git https://github.com/xdu-project/xdu.git
 ```
 
-Requires [Rust](https://rustup.rs) nightly toolchain.
+Requires [Rust](https://rustup.rs) nightly toolchain. A `cargo install` build carries no DuckDB
+extensions, so a feature that needs one, such as querying an index in S3 (it needs `httpfs`), fails
+naming the path it looked in; copy the files from a release tarball's `lib/xdu/extensions/` there,
+or point `XDU_EXTENSION_DIR` at them.
+
+### Containers
+
+Container specs for Docker and Apptainer/Singularity live in [`hpccm/`](hpccm/), generated
+from a single [HPCCM](https://github.com/NVIDIA/hpc-container-maker) recipe. They install
+the published release binaries with no Rust toolchain, so they finish in seconds; see
+[`hpccm/README.md`](hpccm/README.md) for usage. They track release tags, not the working
+tree — for unreleased commits, build from source instead.
 
 ## Usage
 
 ### Building an Index
 
 ```bash
-xdu /home -o /var/lib/xdu/home -j 16 -b 100000
+xdu /home -o /var/lib/xdu/home -j 16 -B 100000
 ```
 
 | Option | Description | Default |
@@ -146,7 +168,7 @@ xdu /home -o /var/lib/xdu/home -j 16 -b 100000
 | `-j, --jobs` | Parallel threads (`XDU_JOBS` env) | 4 |
 | `-B, --buffsize` | Records per Parquet chunk | 100000 |
 | `-p, --partition` | Index only specific partitions (comma-separated, e.g. `alice,projects/big`) | All |
-| `-r, --recursive` | With `-p`, also index partitions nested below those given | |
+| `-r, --recursive` | With `-p`, also index the partitions nested below those given | |
 | `--split-depth` | Make every directory down to depth N a partition | 1, or the index's saved setting |
 | `--split` | Extra partition directories, relative to DIR (comma-separated, `*` and `?` allowed) | |
 | `--split-file` | Read `--split` paths from a file | |
@@ -159,7 +181,7 @@ The `xdu-find` command provides a convenient CLI for common queries:
 
 ```bash
 # Find all Python files
-xdu-find -i /var/lib/xdu/home -p '\.py$'
+xdu-find -i /var/lib/xdu/home -p '*.py'
 
 # Find large files (>1GB) not accessed in 90 days
 xdu-find -i /var/lib/xdu/home --min-size 1G --older-than 90
@@ -168,22 +190,35 @@ xdu-find -i /var/lib/xdu/home --min-size 1G --older-than 90
 xdu-find -i /var/lib/xdu/home -u alice --min-size 100M -f size
 
 # Count matching files
-xdu-find -i /var/lib/xdu/home -p '\.tmp$' --older-than 30 --count
+xdu-find -i /var/lib/xdu/home -p '*.tmp' --older-than 30 --count
+
+# Choose the fields to print; --csv for raw values with a header
+xdu-find -i /var/lib/xdu/home -u alice -f path,size,mtime,uid
+xdu-find -i /var/lib/xdu/home -f path,size,uid --csv
 
 # Pipe to xargs for bulk operations
-xdu-find -i /var/lib/xdu/home -p '\.tmp$' --older-than 30 | xargs rm
+xdu-find -i /var/lib/xdu/home -p '*.tmp' --older-than 30 | xargs rm
 ```
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `-i, --index` | Path to Parquet index directory | Required |
-| `-p, --pattern` | Regex pattern to match paths | |
+| `-p, --pattern` | Glob pattern to match paths (e.g., `*.py`) | |
+| `--regex` | Interpret `--pattern` as a regular expression | |
 | `-u, --partition` | Filter by partition (user directory, or a nested path like `projects/big`; includes everything below it) | |
 | `--min-size` | Minimum file size (e.g., 1K, 10M, 1G) | |
 | `--max-size` | Maximum file size | |
 | `--older-than` | Files not accessed in N days | |
 | `--newer-than` | Files accessed within N days | |
-| `-f, --format` | Output format: path, size, atime, csv, json | path |
+| `--owner` | Files owned by this user (name or uid) | |
+| `--group` | Files owned by this group (name or gid) | |
+| `--mode` | Permission filter: `644` exact, `/002` any-bit, `&4000` all-bit | |
+| `--mtime-older-than` | Files not modified in N days | |
+| `--mtime-newer-than` | Files modified within N days | |
+| `--ctime-older-than` | Files whose status (ctime) has not changed in N days | |
+| `--ctime-newer-than` | Files whose status (ctime) changed within N days | |
+| `-f, --format` | Output format: path, size, atime, csv, json, or a field list such as `path,size,mtime` (fields: path, size, uid, gid, mode, atime, mtime, ctime) | path |
+| `--csv` | With a field list: CSV with a header row and raw values | |
 | `-l, --limit` | Limit number of results | |
 | `-c, --count` | Count matching records | |
 
@@ -202,7 +237,7 @@ xdu-view -i /var/lib/xdu/home -u alice
 xdu-view -i /var/lib/xdu/home --older-than 30 -s size-desc
 
 # View large Python files (>1MB)
-xdu-view -i /var/lib/xdu/home -p '\.py$' --min-size 1M
+xdu-view -i /var/lib/xdu/home -p '*.py' --min-size 1M
 
 # See what changed since an earlier index, biggest growth first
 xdu-view -i /var/lib/xdu/home-wed --compare /var/lib/xdu/home-mon -s delta
@@ -214,15 +249,16 @@ xdu-view -i /var/lib/xdu/home-wed --compare /var/lib/xdu/home-mon -s delta
 |--------|-------------|---------|
 | `-i, --index` | Path to Parquet index directory | Required |
 | `-u, --partition` | Start in a specific partition (top-level directory, or a nested path) | |
-| `-p, --pattern` | Regex pattern to filter paths | |
+| `-p, --pattern` | Glob pattern to filter paths (e.g., `*.py`) | |
+| `--regex` | Interpret `--pattern` as a regular expression | |
 | `--min-size` | Minimum file size (e.g., 1K, 10M, 1G) | |
 | `--max-size` | Maximum file size | |
 | `--older-than` | Files not accessed in N days | |
 | `--newer-than` | Files accessed within N days | |
 | `-s, --sort` | Sort order (see below) | name |
-| `--compare` | Earlier index to compare against (see [Comparing Two Indices](#comparing-two-indices)) | |
+| `--compare` | Earlier local index to compare against (see [Comparing Two Indexes](#comparing-two-indexes)) | |
 
-**Sort modes:** `name` (default, directories first), `size-desc`, `size-asc`, `count-desc`, `count-asc`, `age-desc` (oldest first), `age-asc` (newest first), and with `--compare`: `delta-desc` (largest growth first), `delta-asc` (largest shrink first)
+**Sort modes:** `name` (default, directories first), `size-desc`, `size-asc`, `count-desc`, `count-asc`, `age-desc` (oldest first), `age-asc` (newest first), `mtime-desc`, `mtime-asc`, `ctime-desc`, `ctime-asc`, `uid-asc`, `gid-asc`, `mode-asc`, and with `--compare`: `delta-desc` (largest growth first), `delta-asc` (largest shrink first)
 
 #### Keybindings
 
@@ -231,9 +267,21 @@ xdu-view -i /var/lib/xdu/home-wed --compare /var/lib/xdu/home-mon -s delta
 |-----|--------|
 | `↑`/`k` | Move selection up |
 | `↓`/`j` | Move selection down |
-| `→`/`Enter`/`Space` | Enter directory |
+| `→`/`Enter` | Enter directory |
+| `Space` | Preview the selected file (list view); enter directory or focus the preview (tree view) |
 | `←`/`Backspace` | Go up / back |
+| `g`/`G` | Jump to first / last entry |
+| `t` | Toggle list ↔ tree view |
+| `?` | Show the key summary |
 | `q`/`Esc` | Quit |
+
+**Columns:**
+| Key | Action |
+|-----|--------|
+| `a` | Cycle the timestamp column: accessed / modified / changed (`o` and `n` filter on it) |
+| `u` | Toggle the user column |
+| `r` | Toggle the group column |
+| `x` | Toggle the permission column |
 
 **Sorting:**
 | Key | Action |
@@ -243,7 +291,7 @@ xdu-view -i /var/lib/xdu/home-wed --compare /var/lib/xdu/home-mon -s delta
 **Filtering (interactive):**
 | Key | Action |
 |-----|--------|
-| `/` | Set path pattern filter (regex) |
+| `/` | Set path pattern filter (glob) |
 | `o` | Set older-than filter (days) |
 | `n` | Set newer-than filter (days) |
 | `>` | Set minimum size filter |
@@ -257,7 +305,7 @@ When entering a filter value, type the value and press `Enter` to apply, or `Esc
 
 **Title bar** shows the current location and any active filters:
 ```
-┌─ alice/projects [older:30d] [min:1.00 MiB] [/\.py$/] ─────────────────────┐
+┌─ alice/projects [older:30d] [min:1.00 MiB] [/*.py] ─────────────────────┐
 ```
 
 **Status bar** shows entry count, current sort mode, and available keybindings:
@@ -272,11 +320,11 @@ When entering a filter value, type the value and press `Enter` to apply, or `Esc
   README.md                    4.50 KiB        1 file     today
 ```
 
-#### Comparing Two Indices
+#### Comparing Two Indexes
 
-With `--compare OLD`, `xdu-view` browses the `-i` index and shows how each entry changed
-since `OLD`, matching files by path relative to each index's crawl root (as `xdu-diff` does).
-Removed files and directories stay visible so shrinkage can be traced too.
+With `--compare OLD`, `xdu-view` browses the `-i` index and shows how each entry changed since
+`OLD`, matching files by path relative to each index's crawl root (as `xdu-diff` does). Removed
+files and directories stay visible so shrinkage can be traced too. Both indexes must be local.
 
 ```
   name                       size        Δsize        files  Δfiles   accessed
@@ -287,10 +335,12 @@ Removed files and directories stay visible so shrinkage can be traced too.
 ```
 
 - Markers: `+` new, `-` gone, `~` changed (added, removed, or modified files inside)
-- **Δsize** and **Δfiles** are green for growth and red for shrinkage; in tree view, Δsize replaces the file count
+- **Δsize** and **Δfiles** are green for growth and red for shrinkage; in tree view, Δsize replaces
+  the file count
 - `d` cycles which files are shown: all → changed → added → removed → modified
-- Sort with `s` → `delta-desc` / `delta-asc`, then drill into the top entry to find where growth happened
-- The tree view's file preview shows the file's previous size
+- Sort with `s` → `delta-desc` / `delta-asc`, then drill into the top entry to find where growth
+  happened
+- The file previews show the file's previous size
 
 #### Common Use Cases
 
@@ -316,7 +366,7 @@ xdu-view -i /var/lib/xdu/home --newer-than 7 -s count-desc
 **Find specific file types:**
 ```bash
 # Explore all Jupyter notebooks
-xdu-view -i /var/lib/xdu/home -p '\.ipynb$' -s size-desc
+xdu-view -i /var/lib/xdu/home -p '*.ipynb' -s size-desc
 ```
 
 ### Bulk Deletion with xdu-rm
@@ -334,7 +384,7 @@ xdu-rm -i /var/lib/xdu/home --older-than 60
 xdu-rm -i /var/lib/xdu/home --older-than 60 -j 16 --force
 
 # Delete only .tmp files older than 30 days in alice's partition
-xdu-rm -i /var/lib/xdu/home -u alice -p '\.tmp$' --older-than 30 --force
+xdu-rm -i /var/lib/xdu/home -u alice -p '*.tmp' --older-than 30 --force
 ```
 
 #### Command-Line Options
@@ -342,7 +392,8 @@ xdu-rm -i /var/lib/xdu/home -u alice -p '\.tmp$' --older-than 30 --force
 | Option | Description | Default |
 |--------|-------------|---------|
 | `-i, --index` | Path to Parquet index directory | Required |
-| `-p, --pattern` | Regex pattern to match paths | |
+| `-p, --pattern` | Glob pattern to match paths (e.g., `*.py`) | |
+| `--regex` | Interpret `--pattern` as a regular expression | |
 | `-u, --partition` | Filter by partition (user directory, or a nested path like `projects/big`; includes everything below it) | |
 | `--min-size` | Minimum file size (e.g., 1K, 10M, 1G) | |
 | `--max-size` | Maximum file size | |
@@ -405,10 +456,10 @@ xdu-rm -i /var/lib/xdu/scratch --older-than 7 -j 32 --force
 **Targeted cleanup by file type:**
 ```bash
 # Remove old Jupyter checkpoints
-xdu-rm -i /var/lib/xdu/home -p '/\.ipynb_checkpoints/' --older-than 30 --force
+xdu-rm -i /var/lib/xdu/home --regex -p '/\.ipynb_checkpoints/' --older-than 30 --force
 
 # Remove old core dumps
-xdu-rm -i /var/lib/xdu/home -p '/core\.\d+$' --older-than 7 --force
+xdu-rm -i /var/lib/xdu/home --regex -p '/core\.\d+$' --older-than 7 --force
 ```
 
 **Preview before production:**
@@ -421,11 +472,24 @@ xdu-rm -i /var/lib/xdu/home --older-than 60 --min-size 1G --dry-run | tail -1
 # 847,231 file(s) would be deleted.
 ```
 
-### Comparing Indices with xdu-diff
+### Disk Usage with xdu-du
 
-The `xdu-diff` command compares two indices of the same tree taken at different times—for
-example, indices of two filesystem snapshots. Files are matched by their path relative to
-each index's crawl root, so `/fs/.snapshots/@GMT-2026.10.14-…/home/alice/x` and
+`xdu-du` prints `du`-style totals from the index: one line per top-level directory (nested
+partitions folded in), or one per path given.
+
+```bash
+xdu-du -i /var/lib/xdu/home -h -c
+xdu-du -i /var/lib/xdu/home -h /home/alice /home/bob
+xdu-du -i /var/lib/xdu/home -s -h -u projects/big
+```
+
+`-h` is `--human-readable`, as in `du`; help is `--help`.
+
+### Comparing Indexes with xdu-diff
+
+The `xdu-diff` command compares two local indexes of the same tree taken at different times—for
+example, indexes of two filesystem snapshots. Files are matched by their path relative to each
+index's crawl root, so `/fs/.snapshots/@GMT-2026.10.14-…/home/alice/x` and
 `/fs/.snapshots/@GMT-2026.10.16-…/home/alice/x` are treated as the same file.
 
 ```bash
@@ -442,16 +506,17 @@ xdu-diff -h --files --sort delta -l 20 OLD NEW
 xdu-diff --files --status added --min-delta 1G -u alice --absolute OLD NEW
 ```
 
-Each file is classified as `added`, `removed`, `modified` (size or mtime changed), `meta`
-(only ctime/uid/gid/mode changed), `accessed` (only atime changed), or `unchanged`. In
-`--files` mode each line shows a marker (`+ - ~ m .`), the size delta, the current size, and the path.
+Each file is classified as `added`, `removed`, `modified` (size or mtime changed), `meta` (only
+ctime/uid/gid/mode changed), `accessed` (only atime changed), or `unchanged`. In `--files` mode each
+line shows a marker (`+ - ~ m .`), the size delta, the current size, and the path.
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `-f, --files` | List individual files instead of a per-partition summary | |
 | `--status` | Statuses to list with `--files` (comma-separated, or `all`) | `added,removed,modified,meta` |
 | `-u, --partition` | Restrict to a partition or subdirectory (e.g. `alice`, `projects/big`) | |
-| `-p, --pattern` | Regex matched against relative paths | |
+| `-p, --pattern` | Glob matched against relative paths | |
+| `--regex` | Interpret `--pattern` as a regular expression | |
 | `--min-delta` | With `--files`: minimum absolute size change (e.g., `10M`) | |
 | `-s, --sort` | `name`, `delta` (growth first), `shrink`, `abs` (largest change first) | `name` |
 | `-l, --limit` | Limit number of output rows | |
@@ -461,7 +526,73 @@ Each file is classified as `added`, `removed`, `modified` (size or mtime changed
 | `--csv` | CSV output with header (raw values) | |
 | `--old-root`, `--new-root` | Override the detected crawl root of each index | auto |
 
-The exit status follows `diff`: 0 if there are no differences (atime-only changes don't count), 1 if there are differences, 2 on error.
+The exit status follows `diff`: 0 if there are no differences (atime-only changes don't count), 1 if
+there are differences, 2 on error.
+
+### Indexes in S3
+
+`xdu` builds an index straight into an S3 bucket, on AWS or on an S3-compatible store: give `-o`
+an `s3://bucket/prefix` locator instead of a directory. Each chunk is uploaded to its final key as
+the crawl encodes it, and nothing of the index is staged on local disk. The completion marker
+works as it does locally: the run lists the prefix first, so an unreachable endpoint, refused
+credentials or a missing bucket fail it with any existing index untouched, then removes the marker,
+and writes it again only when every partition has finished. A re-run leaves no stale chunk behind.
+A top-level directory whose name would change on its way into a key or a glob (non-ASCII, or a
+character such as `~`, `%`, `#` or `*`) is refused before anything is written.
+
+```bash
+export AWS_PROFILE=research
+xdu /data/scratch -o s3://indexes/scratch -j 8
+```
+
+The index in the bucket is then queried in place: give
+`xdu-find` or `xdu-view` an `s3://bucket/prefix` locator wherever it takes an index directory,
+through `-i` or `XDU_INDEX`. Each query reads the Parquet footers and only the parts of each chunk it needs, with
+HTTP range requests, so a `--count` costs the footers, a small fraction of the index. Nothing is copied
+to local disk and nothing is downloaded at run time; the `httpfs` extension a release ships beside
+the binaries does the reading.
+
+```bash
+# Credentials, region and endpoint come from where the AWS tools look for them:
+# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN), or a profile in
+# ~/.aws/credentials and ~/.aws/config selected by AWS_PROFILE.
+export AWS_PROFILE=research
+
+# An S3-compatible store: name its endpoint (or set endpoint_url in the profile).
+export AWS_ENDPOINT_URL=https://store.example.org:9000
+
+xdu-find -i s3://indexes/scratch --count
+xdu-find -i s3://indexes/scratch -u alice --min-size 1G -f size
+xdu-view -i s3://indexes/scratch -u alice
+
+# Or once for the session
+export XDU_INDEX=s3://indexes/scratch
+xdu-find --top 10
+```
+
+The proxy variables (`HTTP_PROXY` and friends) are not used by `xdu` or the readers: requests go
+straight to the endpoint. Building needs no DuckDB extension; querying does. `xdu-rm` refuses an
+`s3://` index. Unreachable endpoints, refused credentials, a missing
+bucket or prefix, and an index without a readable completion marker each fail with the cause on
+stderr and print no rows. The bucket must have a name S3 allows (3 to 63 lowercase letters, digits,
+dots and hyphens, beginning and ending with a letter or digit); any other, and a locator carrying
+credentials, is refused before a request is sent, without the locator being repeated.
+
+Every `https` connection, the writer's and the readers', authenticates the server against one CA
+file: the one `AWS_CA_BUNDLE` names, else the platform's bundle (the first of
+`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`,
+`/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem` and `/etc/ssl/cert.pem` present).
+`SSL_CERT_FILE` and the macOS keychain are not read, nothing turns verification off, and a
+self-signed or unknown-CA endpoint is refused by all three tools; a store with a private CA needs
+`AWS_CA_BUNDLE` set to that CA's file. That file must include the root certificate the chain ends
+at (a file with no self-signed root, such as an intermediate CA alone, is refused before any
+request), and the endpoint's certificate must name its host in the subject alternative name (SAN).
+That root must be self-signed with SHA-256 or stronger, since a file whose only roots are
+SHA-1-signed is refused the same way, and an intermediate must ship with its own root: beside an
+unrelated root, `xdu` writes an index the readers refuse. Known limitation: `xdu-find` and `xdu-view` also accept a certificate whose subject common name
+(CN) names the host when its SAN does not, which `xdu` refuses; a follow-up
+([`issues/s3-reader-tls-hostname.md`](issues/s3-reader-tls-hostname.md)) will make the readers
+check the SAN alone.
 
 ### Querying with DuckDB
 
@@ -562,8 +693,8 @@ With nested partitions, name the partition by its path. Add `-r` to include the 
 xdu /data -o /index/data --partition projects/big -r
 ```
 
-A partial run reuses the split settings saved in the index. To change them, do a full run.
-A full run also removes partitions for directories that no longer exist.
+A partial run reuses the split settings saved in the index. To change them, do a full run. A full
+run also removes partitions for directories that no longer exist.
 
 ### Adaptive Parallelism
 
@@ -573,10 +704,10 @@ Unlike traditional one-thread-per-partition approaches, xdu uses jwalk's adaptiv
 - This eliminates the "long tail" problem where a few large partitions bottleneck the entire crawl
 - A filesystem with 1000 small partitions and 5 "whale" partitions (30M+ files each) now completes in 3-4 hours instead of 10+ hours
 
-Adaptive parallelism balances the *crawl*. A whale partition is still one Parquet unit, though,
-so drilling into it in `xdu-view`, diffing it, or re-indexing it with `-p` touches all of its files.
-Splitting it with `--split` (see [Nested Partitions](#nested-partitions)) breaks it into smaller
-units for those operations.
+Adaptive parallelism balances the *crawl*. A whale partition is still one Parquet unit, though, so
+drilling into it in `xdu-view`, diffing it, or re-indexing it with `-p` touches all of its files.
+Splitting it with `--split` (see [Nested Partitions](#nested-partitions)) breaks it into smaller units
+for those operations.
 
 ## License
 

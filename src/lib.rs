@@ -1,25 +1,470 @@
 //! Shared types and utilities for xdu tools.
 
+pub mod cli;
+pub mod crawl;
+pub mod diff;
+pub mod engine;
+pub mod layout;
+pub mod s3;
+pub mod view_query;
+
+pub use s3::{IndexLocator, S3Locator, S3Settings};
+
+use std::collections::HashMap;
+use std::ffi::CString;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::Path;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::{DataType, Field, Schema};
-use duckdb::Connection;
 
-/// A single file metadata record.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FileRecord {
-    pub path: String,
-    pub size: i64,
-    pub atime: i64,
-    pub mtime: i64,
-    pub ctime: i64,
-    pub uid: u32,
-    pub gid: u32,
-    pub mode: u32,
+/// Partition name reserved for files lying directly in the indexed root.
+///
+/// Part of the on-disk layout contract rather than of the crawl, so the writer and every
+/// reader name it from one place: two copies of this string could drift apart and quietly
+/// break the depth-1 partition.
+pub const ROOT_PARTITION: &str = "__root__";
+
+/// Run-level completion marker written at the index root when a crawl succeeds.
+///
+/// A dotfile, and not a `.parquet`, so the readers' glob never mistakes it for a chunk. The
+/// reverse direction — a partition directory landing *on* the marker path — is guarded by
+/// this name's membership in `RESERVED_INDEX_NAMES`.
+pub const COMPLETION_MARKER: &str = ".xdu-complete";
+
+/// On-disk index format version recorded in every completion marker.
+///
+/// 2 names the flat layout: eight-column `get_schema()` rows under
+/// `<partition>/NNNNNN.parquet` plus this marker. A future layout or schema change bumps
+/// this, and readers refuse what they do not understand instead of misreading it — the
+/// escape hatch the schema-stability invariant requires before any column is added.
+pub const INDEX_FORMAT_VERSION: u32 = 2;
+
+/// Index format version of a nested index: the same rows, with partition directories below
+/// the top level (`layout`). A reader that globs `*/*.parquet` would read such an index
+/// without error and silently miss every nested chunk, so the writer stamps this version
+/// only when a split point lies below the top level, and a flat index stays readable as 2.
+pub const NESTED_INDEX_FORMAT_VERSION: u32 = 3;
+
+/// Every index format version these readers understand.
+pub const SUPPORTED_INDEX_FORMATS: &[u32] = &[INDEX_FORMAT_VERSION, NESTED_INDEX_FORMAT_VERSION];
+
+/// Every name the index root already claims, paired with what claims it.
+///
+/// `<index>/` holds partition directories named after the source tree's top-level
+/// subdirectories, the reserved `COMPLETION_MARKER` dotfile and the `layout::MANIFEST_FILE`.
+/// A top-level source directory whose name is already claimed would be written *as* that
+/// entry — clobbering the synthetic loose-file partition's chunk ids, or occupying the
+/// marker path so the run cannot attest itself and no later run can clear it. So
+/// `crawl::build_work_queue` rejects one, naming what the collision is with.
+///
+/// The guard iterates this list rather than testing names one by one, so reserving a new
+/// name at the index root extends the rejection by construction: the collision class stays
+/// closed instead of depending on someone remembering the second half of it.
+pub const RESERVED_INDEX_NAMES: &[(&str, &str)] = &[
+    (
+        ROOT_PARTITION,
+        "the partition holding loose top-level files",
+    ),
+    (COMPLETION_MARKER, "the run-completion marker"),
+    (layout::MANIFEST_FILE, "the index manifest"),
+];
+
+/// Most a reader will ever read from a completion marker. The writer emits ~100 bytes; the
+/// cap exists so a reader cannot be made to pull an arbitrarily large file into memory by
+/// whatever left a file of that name in a group-writable index directory, or an object of
+/// that key in a bucket.
+pub const MARKER_READ_LIMIT: u64 = 64 * 1024;
+
+/// The tolerated-error count a completion marker records, if its body states one.
+///
+/// `None` for a missing or unparseable `errors=` key. An unrecognized marker body says
+/// nothing about errors, so a reader stays exactly as quiet as it was before the marker
+/// existed rather than inventing a warning out of a format it does not understand. The
+/// first key trimming to `errors` decides the answer.
+pub fn completion_marker_errors(body: &str) -> Option<u64> {
+    for line in body.lines() {
+        if let Some((key, value)) = line.split_once('=')
+            && key.trim() == "errors"
+        {
+            return value.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// What a guarded read of the completion marker found.
+///
+/// The marker lives in a directory operators share, so whatever sits at that path is
+/// untrusted: a FIFO or device node would block a reader that opened it blindly, and an
+/// enormous file would be pulled into memory. One `stat` decides all three cases before
+/// anything is opened. Over S3 the size comes from a `HEAD` instead, and an object over the
+/// cap is never fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkerRead {
+    /// No entry at the marker path: an interrupted run, or an index predating the marker.
+    Absent,
+    /// An entry that must not be read: not a regular file, over `MARKER_READ_LIMIT`, or
+    /// unreadable since the stat. Attests nothing, and is never opened.
+    Unreadable,
+    /// An S3 marker object of this many bytes, over `MARKER_READ_LIMIT`. Attests nothing,
+    /// and was never fetched.
+    Oversized(u64),
+    /// A regular file of sane size, read — possibly as empty when it vanished mid-read.
+    Body(String),
+}
+
+/// Read the completion marker without trusting what is at its path. Both the
+/// completeness warning and the version gate go through here, so the non-blocking and
+/// size-cap protections stay single-sourced.
+fn read_completion_marker(index: &Path) -> MarkerRead {
+    let marker = index.join(COMPLETION_MARKER);
+
+    // One `stat`, not two: `Path::exists()` *is* `metadata().is_ok()`, so an absent marker
+    // behaves exactly as it did before bodies were read at all.
+    let meta = match fs::metadata(&marker) {
+        Ok(meta) => meta,
+        Err(_) => return MarkerRead::Absent,
+    };
+
+    // Presence alone already attests that the run finished; the body only ever adds detail.
+    // So consulting it must never cost more than not consulting it: opening a FIFO, socket
+    // or device node of this name would block the reader forever, and an oversized file
+    // would be pulled into memory. Neither is worth a detail, so neither is opened.
+    if !meta.is_file() || meta.len() > MARKER_READ_LIMIT {
+        return MarkerRead::Unreadable;
+    }
+
+    // Anything unreadable here — a permission change, non-UTF-8 bytes, or the marker being
+    // deleted since the stat above — degrades to an empty body, which callers treat as
+    // unattested rather than as evidence of anything.
+    MarkerRead::Body(fs::read_to_string(&marker).unwrap_or_default())
+}
+
+/// The index format version a completion marker body states, if it states one.
+///
+/// Mirrors `completion_marker_errors`: the first key trimming to `format` decides, and
+/// anything absent or unparseable is `None` rather than a guess. The `xdu=` key beside
+/// it names the tool release that wrote the index, which outpaces format changes and so
+/// is never a compatibility answer.
+pub fn completion_marker_format(body: &str) -> Option<u32> {
+    for line in body.lines() {
+        if let Some((key, value)) = line.split_once('=')
+            && key.trim() == "format"
+        {
+            return value.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// The part of an index glob below the index root: `<partition>/**/*.parquet`, or
+/// `**/*.parquet` for every partition. Both transports share it, so the layout is written once.
+///
+/// `**` matches zero or more directories, so scoping to a partition includes the partitions
+/// nested below it, and a flat index reads exactly as `*/*.parquet` did.
+fn index_glob_tail(partition: Option<&str>) -> String {
+    match partition.map(|p| p.trim_matches('/')) {
+        Some(p) if !p.is_empty() => format!("{p}/**/*.parquet"),
+        _ => "**/*.parquet".to_string(),
+    }
+}
+
+/// The `read_parquet` glob for an index, optionally scoped to a single partition.
+///
+/// Every local reader goes through here, so the index layout (`<index>/<partition>/*.parquet`)
+/// is expressed once. It is also the single seam where local index paths and partition names
+/// reach SQL, which is where escaping belongs when it is added.
+pub fn index_glob(index: &Path, partition: Option<&str>) -> String {
+    format!("{}/{}", index.display(), index_glob_tail(partition))
+}
+
+/// The `read_parquet` glob for an index under an S3 prefix, optionally scoped to a single
+/// partition: `s3://<bucket>/<prefix>/<partition>/**/*.parquet`.
+///
+/// It reaches SQL only as a bound parameter (`parquet_source`), never as text.
+pub fn index_glob_s3(index: &S3Locator, partition: Option<&str>) -> String {
+    format!("{index}/{}", index_glob_tail(partition))
+}
+
+/// The `read_parquet(...)` call a reader puts in its `FROM` clause, and the values it binds.
+///
+/// For a local index the glob is written into the text as it always was, and nothing is
+/// bound. For an S3 index the text is `read_parquet(?)` and the glob, which carries the bucket,
+/// the prefix and any partition name, is the one bound value. `filename` adds the
+/// `filename=true` column a per-partition query groups by.
+pub fn parquet_source(
+    index: &IndexLocator,
+    partition: Option<&str>,
+    filename: bool,
+) -> (String, Vec<String>) {
+    let option = if filename { ", filename=true" } else { "" };
+    match index {
+        IndexLocator::Local(path) => (
+            format!("read_parquet('{}'{option})", index_glob(path, partition)),
+            Vec::new(),
+        ),
+        IndexLocator::S3(locator) => (
+            format!("read_parquet(?{option})"),
+            vec![index_glob_s3(locator, partition)],
+        ),
+    }
+}
+
+/// Open an index for reading: classify `raw`, open the connection, and pass both marker
+/// gates — the version refusal, then the completeness warning on stderr.
+///
+/// The same sequence `xdu-find` runs inline. An `s3://` locator opens its connection first,
+/// so a missing extension or credential is the first thing an operator hears about; a local
+/// path is canonicalized and loads no extension.
+pub fn open_index(raw: &Path) -> anyhow::Result<(IndexLocator, duckdb::Connection)> {
+    match IndexLocator::parse(raw.as_os_str())? {
+        IndexLocator::S3(locator) => {
+            let settings = S3Settings::resolve(&s3::ProcessEnv)?;
+            let conn = engine::open_s3_connection(&settings)?;
+            let marker = read_completion_marker_s3(&conn, &locator)?;
+            let shown = locator.to_string();
+            if let Some(error) = marker_version_error(&marker, &shown) {
+                anyhow::bail!(error);
+            }
+            if let Some(warning) = marker_completion_warning(&marker, &shown) {
+                eprintln!("{}", warning);
+            }
+            Ok((IndexLocator::S3(locator), conn))
+        }
+        IndexLocator::Local(_) => {
+            let index_path = raw.canonicalize().map_err(|e| {
+                anyhow::anyhow!("Index directory not found: {}: {e}", raw.display())
+            })?;
+            if let Some(error) = index_version_error(&index_path) {
+                anyhow::bail!(error);
+            }
+            if let Some(warning) = index_completion_warning(&index_path) {
+                eprintln!("{}", warning);
+            }
+            let conn = engine::open_connection()?;
+            Ok((IndexLocator::Local(index_path), conn))
+        }
+    }
+}
+
+/// Why an S3 request failed, as far as the reader can tell from DuckDB's error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum S3Cause {
+    /// The endpoint's TLS certificate does not chain to a CA in the trust source.
+    Untrusted,
+    /// No connection to the endpoint could be established.
+    Unreachable,
+    /// The endpoint refused the request's credentials or signature (HTTP 403).
+    Forbidden,
+    /// The endpoint answered 404: no such bucket for a listing, no such key for an object.
+    NotFound,
+    /// Anything else, carrying DuckDB's text unchanged.
+    Other(String),
+}
+
+/// Name the cause of a failed S3 request from DuckDB's error text.
+///
+/// `httpfs` reports causes only in prose, so this matches the texts it is known to produce: a
+/// refused certificate is httplib's `SSL server verification failed` (or curl's `SSL peer
+/// certificate`, should anything select curl); a dead endpoint is `Could not establish
+/// connection`; a rejected signature carries `HTTP 403`,
+/// or `403 (Forbidden)` in the form an object request takes; and a missing bucket or key
+/// carries `HTTP 404` or `404 (Not Found)` (a missing key's text says `Unable to connect`,
+/// though the endpoint answered). The fallback keeps DuckDB's text, which names the URL but
+/// never a credential.
+pub fn classify_s3_error(error: &duckdb::Error) -> S3Cause {
+    classify_s3_text(&error.to_string())
+}
+
+fn classify_s3_text(text: &str) -> S3Cause {
+    if text.contains("SSL server verification failed") || text.contains("SSL peer certificate") {
+        S3Cause::Untrusted
+    } else if text.contains("Could not establish connection") {
+        S3Cause::Unreachable
+    } else if text.contains("HTTP 403") || text.contains("403 (Forbidden)") {
+        S3Cause::Forbidden
+    } else if text.contains("HTTP 404") || text.contains("404 (Not Found)") {
+        S3Cause::NotFound
+    } else {
+        S3Cause::Other(text.to_string())
+    }
+}
+
+/// The error for a failed S3 request that is not a missing object, naming the cause.
+fn s3_request_error(index: &S3Locator, what: &str, error: &duckdb::Error) -> anyhow::Error {
+    match classify_s3_error(error) {
+        S3Cause::Untrusted => anyhow::anyhow!(
+            "the S3 endpoint's TLS certificate is not trusted while {what} for {index}; it must \
+             chain to a CA in the file AWS_CA_BUNDLE names, else the platform's CA bundle \
+             ({error})"
+        ),
+        S3Cause::Unreachable => anyhow::anyhow!(
+            "cannot reach the S3 endpoint while {what} for {index}: no connection could be \
+             established; check AWS_ENDPOINT_URL_S3, AWS_ENDPOINT_URL or the profile's \
+             endpoint, and the network"
+        ),
+        S3Cause::Forbidden => anyhow::anyhow!(
+            "the S3 endpoint refused the credentials while {what} for {index} (HTTP 403); \
+             check the access key, secret and region"
+        ),
+        S3Cause::NotFound => anyhow::anyhow!(
+            "bucket '{}' does not exist at the S3 endpoint (HTTP 404 while {what} for {index})",
+            index.bucket()
+        ),
+        S3Cause::Other(text) => {
+            anyhow::anyhow!("S3 request failed while {what} for {index}: {text}")
+        }
+    }
+}
+
+/// Read an S3 index's completion marker without fetching more than `MARKER_READ_LIMIT`.
+///
+/// Three statements, each a step that can fail on its own terms. A listing of everything under
+/// the prefix proves the endpoint is reachable with accepted credentials and that the bucket
+/// exists, and an empty one means no index is there at all; both are errors naming the cause.
+/// Then the marker's size, which costs a `HEAD` and no `GET`: a missing key is `Absent`, and a
+/// size over the cap is `Oversized` without the object being fetched. Only then the content,
+/// read whole in one ranged `GET`. Bytes that are not UTF-8 read as an empty body, as they do
+/// for a local marker.
+pub fn read_completion_marker_s3(
+    conn: &duckdb::Connection,
+    index: &S3Locator,
+) -> anyhow::Result<MarkerRead> {
+    let listed: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM (SELECT 1 FROM glob(?) LIMIT 1)",
+            [index.object_url("**")],
+            |row| row.get(0),
+        )
+        .map_err(|e| s3_request_error(index, "listing the index", &e))?;
+    if listed == 0 {
+        anyhow::bail!("no index at {index}: the prefix holds no objects");
+    }
+
+    let marker = index.object_url(COMPLETION_MARKER);
+    let size: i64 =
+        match conn.query_row("SELECT size FROM read_blob(?)", [&marker], |row| row.get(0)) {
+            Ok(size) => size,
+            Err(e) => {
+                return match classify_s3_error(&e) {
+                    S3Cause::NotFound => Ok(MarkerRead::Absent),
+                    _ => Err(s3_request_error(
+                        index,
+                        "reading the completion marker's size",
+                        &e,
+                    )),
+                };
+            }
+        };
+    let size = u64::try_from(size).unwrap_or(0);
+    if size > MARKER_READ_LIMIT {
+        return Ok(MarkerRead::Oversized(size));
+    }
+
+    let content: Vec<u8> = conn
+        .query_row("SELECT content FROM read_blob(?)", [&marker], |row| {
+            row.get(0)
+        })
+        .map_err(|e| s3_request_error(index, "reading the completion marker", &e))?;
+    Ok(MarkerRead::Body(
+        String::from_utf8(content).unwrap_or_default(),
+    ))
+}
+
+/// A warning to print when an index cannot be trusted to be complete, else `None`.
+///
+/// Two ways an index falls short. It may carry **no marker**: the crawler writes one only
+/// when a run finishes, so absence means a failed or interrupted run — or an index that
+/// predates the marker entirely. Or it may carry a marker that records **tolerated errors**:
+/// an `xdu --allow-errors` run finishes and is marked complete, yet knowingly skipped
+/// whatever it could not read. That second case matters most to `xdu-rm`, whose risk is
+/// precisely the files an index does not know about, and the operator running it weeks later
+/// never gave the consent the build-time `--allow-errors` expressed.
+///
+/// Readers warn and carry on rather than refusing: every index built before the marker
+/// existed is still perfectly queryable, and breaking those would be worse than the risk
+/// being flagged.
+pub fn index_completion_warning(index: &Path) -> Option<String> {
+    marker_completion_warning(&read_completion_marker(index), &index.display().to_string())
+}
+
+/// `index_completion_warning` over a marker already read, for the index named `index`.
+///
+/// The S3 readers read the marker once, since each read is a round trip, and pass the
+/// result to both gates.
+pub fn marker_completion_warning(marker: &MarkerRead, index: &str) -> Option<String> {
+    let body = match marker {
+        MarkerRead::Absent => {
+            return Some(format!(
+                "warning: {} has no completion marker ({}); it may be from an interrupted \
+                 run or predate the marker, so results may be incomplete",
+                index, COMPLETION_MARKER
+            ));
+        }
+        // An entry that cannot be read offers no detail, so there is nothing to add —
+        // which is the behavior a marker-present index had before bodies were read.
+        MarkerRead::Unreadable | MarkerRead::Oversized(_) => return None,
+        MarkerRead::Body(body) => body,
+    };
+
+    match completion_marker_errors(body) {
+        Some(errors) if errors > 0 => Some(format!(
+            "warning: {} was indexed with {} tolerated error(s) (xdu --allow-errors); the \
+             affected paths were skipped, so results may be incomplete",
+            index, errors
+        )),
+        _ => None,
+    }
+}
+
+/// A refusal to read an index whose format version is unknown or unsupported, else `None`.
+///
+/// Every index built before versioning carries no `format=` key, so absence of a version
+/// is not grandfathered: those rows predate the only check that could vouch for their
+/// layout, and reading them blind is the silent misread this exists to prevent. The
+/// remedy is always a re-crawl, which is why the diagnostic says so.
+pub fn index_version_error(index: &Path) -> Option<String> {
+    marker_version_error(&read_completion_marker(index), &index.display().to_string())
+}
+
+/// `index_version_error` over a marker already read, for the index named `index`.
+pub fn marker_version_error(marker: &MarkerRead, index: &str) -> Option<String> {
+    let found = match marker {
+        MarkerRead::Body(body) => completion_marker_format(body),
+        MarkerRead::Oversized(size) => {
+            return Some(format!(
+                "error: {} has a completion marker of {} bytes, over the {}-byte limit a \
+                 reader reads; it was not fetched, so the index format version is unknown",
+                index, size, MARKER_READ_LIMIT
+            ));
+        }
+        // Absent or unreadable attestation answers nothing about the layout.
+        MarkerRead::Absent | MarkerRead::Unreadable => None,
+    };
+
+    match found {
+        Some(version) if SUPPORTED_INDEX_FORMATS.contains(&version) => None,
+        Some(version) => Some(format!(
+            "error: {} has index format version {}, but this xdu supports versions {}; \
+             re-index with this xdu to query it",
+            index,
+            version,
+            SUPPORTED_INDEX_FORMATS
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(" and ")
+        )),
+        None => Some(format!(
+            "error: {} carries no index format version (it predates index versioning or \
+             comes from an interrupted run); re-index with this xdu to query it",
+            index,
+        )),
+    }
 }
 
 /// Round size up to the nearest block boundary.
@@ -80,7 +525,9 @@ pub fn parse_size(s: &str) -> Result<i64, String> {
         (s.as_str(), 1)
     };
 
-    let num: f64 = num.trim().parse()
+    let num: f64 = num
+        .trim()
+        .parse()
         .map_err(|_| format!("Invalid size: {}", s))?;
     Ok((num * mult as f64) as i64)
 }
@@ -103,23 +550,23 @@ pub enum SortMode {
     AgeDesc,
     /// By age (newest first - most recent access)
     AgeAsc,
-    /// By mtime (oldest first)
+    /// By modification time (oldest first)
     MtimeDesc,
-    /// By mtime (newest first)
+    /// By modification time (newest first)
     MtimeAsc,
-    /// By ctime (oldest first)
+    /// By status-change time (oldest first)
     CtimeDesc,
-    /// By ctime (newest first)
+    /// By status-change time (newest first)
     CtimeAsc,
-    /// By uid, ascending
+    /// By owner uid, ascending
     UidAsc,
-    /// By gid, ascending
+    /// By group gid, ascending
     GidAsc,
-    /// By mode, ascending
+    /// By permission bits, ascending
     ModeAsc,
-    /// By size change, largest growth first (compare mode only)
+    /// By size change, largest growth first (comparing two indexes only)
     DeltaDesc,
-    /// By size change, largest shrink first (compare mode only)
+    /// By size change, largest shrink first (comparing two indexes only)
     DeltaAsc,
 }
 
@@ -144,122 +591,84 @@ impl SortMode {
         SortMode::DeltaAsc,
     ];
 
-    /// Whether this sort mode only makes sense when comparing two indices.
+    /// True for the modes that sort by a change between two indexes, which a view of one
+    /// index has no column for.
     pub fn is_compare_only(self) -> bool {
         matches!(self, SortMode::DeltaDesc | SortMode::DeltaAsc)
     }
 
     /// Returns the next sort mode in the cycle.
     pub fn next(self) -> Self {
-        match self {
-            SortMode::Name => SortMode::SizeDesc,
-            SortMode::SizeDesc => SortMode::SizeAsc,
-            SortMode::SizeAsc => SortMode::CountDesc,
-            SortMode::CountDesc => SortMode::CountAsc,
-            SortMode::CountAsc => SortMode::AgeDesc,
-            SortMode::AgeDesc => SortMode::AgeAsc,
-            SortMode::AgeAsc => SortMode::MtimeDesc,
-            SortMode::MtimeDesc => SortMode::MtimeAsc,
-            SortMode::MtimeAsc => SortMode::CtimeDesc,
-            SortMode::CtimeDesc => SortMode::CtimeAsc,
-            SortMode::CtimeAsc => SortMode::UidAsc,
-            SortMode::UidAsc => SortMode::GidAsc,
-            SortMode::GidAsc => SortMode::ModeAsc,
-            SortMode::ModeAsc => SortMode::DeltaDesc,
-            SortMode::DeltaDesc => SortMode::DeltaAsc,
-            SortMode::DeltaAsc => SortMode::Name,
-        }
+        let i = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
     }
 
     /// Returns the previous sort mode in the cycle.
     pub fn prev(self) -> Self {
-        match self {
-            SortMode::Name => SortMode::DeltaAsc,
-            SortMode::SizeDesc => SortMode::Name,
-            SortMode::SizeAsc => SortMode::SizeDesc,
-            SortMode::CountDesc => SortMode::SizeAsc,
-            SortMode::CountAsc => SortMode::CountDesc,
-            SortMode::AgeDesc => SortMode::CountAsc,
-            SortMode::AgeAsc => SortMode::AgeDesc,
-            SortMode::MtimeDesc => SortMode::AgeAsc,
-            SortMode::MtimeAsc => SortMode::MtimeDesc,
-            SortMode::CtimeDesc => SortMode::MtimeAsc,
-            SortMode::CtimeAsc => SortMode::CtimeDesc,
-            SortMode::UidAsc => SortMode::CtimeAsc,
-            SortMode::GidAsc => SortMode::UidAsc,
-            SortMode::ModeAsc => SortMode::GidAsc,
-            SortMode::DeltaDesc => SortMode::ModeAsc,
-            SortMode::DeltaAsc => SortMode::DeltaDesc,
-        }
+        let i = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// The sort key column shared by the directory and partition orderings, or `None` for
+    /// name order, which the two spell differently.
+    fn order_column(&self) -> Option<&'static str> {
+        Some(match self {
+            SortMode::Name => return None,
+            SortMode::SizeDesc => "total_size DESC",
+            SortMode::SizeAsc => "total_size ASC",
+            SortMode::CountDesc => "file_count DESC",
+            SortMode::CountAsc => "file_count ASC",
+            SortMode::AgeDesc => "latest_atime ASC", // oldest first = smallest atime
+            SortMode::AgeAsc => "latest_atime DESC", // newest first = largest atime
+            SortMode::MtimeDesc => "latest_mtime ASC",
+            SortMode::MtimeAsc => "latest_mtime DESC",
+            SortMode::CtimeDesc => "latest_ctime ASC",
+            SortMode::CtimeAsc => "latest_ctime DESC",
+            SortMode::UidAsc => "min_uid ASC",
+            SortMode::GidAsc => "min_gid ASC",
+            SortMode::ModeAsc => "min_mode ASC",
+            SortMode::DeltaDesc => "size_delta DESC",
+            SortMode::DeltaAsc => "size_delta ASC",
+        })
     }
 
     /// Returns the SQL ORDER BY clause for this sort mode.
     /// When sorting by Name, directories are grouped first.
     pub fn to_order_by(&self, dirs_first: bool) -> &'static str {
-        match self {
-            SortMode::Name if dirs_first => "bool_or(is_dir) DESC, component",
-            SortMode::Name => "component",
-            SortMode::SizeDesc => "total_size DESC",
-            SortMode::SizeAsc => "total_size ASC",
-            SortMode::CountDesc => "file_count DESC",
-            SortMode::CountAsc => "file_count ASC",
-            SortMode::AgeDesc => "latest_atime ASC",   // oldest first = smallest atime
-            SortMode::AgeAsc => "latest_atime DESC",   // newest first = largest atime
-            SortMode::MtimeDesc => "latest_mtime ASC",
-            SortMode::MtimeAsc  => "latest_mtime DESC",
-            SortMode::CtimeDesc => "latest_ctime ASC",
-            SortMode::CtimeAsc  => "latest_ctime DESC",
-            SortMode::UidAsc    => "min_uid ASC",
-            SortMode::GidAsc    => "min_gid ASC",
-            SortMode::ModeAsc   => "min_mode ASC",
-            SortMode::DeltaDesc => "size_delta DESC",
-            SortMode::DeltaAsc  => "size_delta ASC",
+        match self.order_column() {
+            Some(column) => column,
+            None if dirs_first => "bool_or(is_dir) DESC, component",
+            None => "component",
         }
     }
 
     /// Returns the ORDER BY clause for partition listing.
     pub fn to_partition_order_by(&self) -> &'static str {
-        match self {
-            SortMode::Name => "partition",
-            SortMode::SizeDesc => "total_size DESC",
-            SortMode::SizeAsc => "total_size ASC",
-            SortMode::CountDesc => "file_count DESC",
-            SortMode::CountAsc => "file_count ASC",
-            SortMode::AgeDesc => "latest_atime ASC",
-            SortMode::AgeAsc => "latest_atime DESC",
-            SortMode::MtimeDesc => "latest_mtime ASC",
-            SortMode::MtimeAsc  => "latest_mtime DESC",
-            SortMode::CtimeDesc => "latest_ctime ASC",
-            SortMode::CtimeAsc  => "latest_ctime DESC",
-            SortMode::UidAsc    => "min_uid ASC",
-            SortMode::GidAsc    => "min_gid ASC",
-            SortMode::ModeAsc   => "min_mode ASC",
-            SortMode::DeltaDesc => "size_delta DESC",
-            SortMode::DeltaAsc  => "size_delta ASC",
-        }
+        self.order_column().unwrap_or("partition")
     }
 }
 
 impl fmt::Display for SortMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SortMode::Name => write!(f, "name"),
-            SortMode::SizeDesc => write!(f, "size-desc"),
-            SortMode::SizeAsc => write!(f, "size-asc"),
-            SortMode::CountDesc => write!(f, "count-desc"),
-            SortMode::CountAsc => write!(f, "count-asc"),
-            SortMode::AgeDesc => write!(f, "age-desc"),
-            SortMode::AgeAsc => write!(f, "age-asc"),
-            SortMode::MtimeDesc => write!(f, "mtime-desc"),
-            SortMode::MtimeAsc  => write!(f, "mtime-asc"),
-            SortMode::CtimeDesc => write!(f, "ctime-desc"),
-            SortMode::CtimeAsc  => write!(f, "ctime-asc"),
-            SortMode::UidAsc    => write!(f, "uid-asc"),
-            SortMode::GidAsc    => write!(f, "gid-asc"),
-            SortMode::ModeAsc   => write!(f, "mode-asc"),
-            SortMode::DeltaDesc => write!(f, "delta-desc"),
-            SortMode::DeltaAsc  => write!(f, "delta-asc"),
-        }
+        let name = match self {
+            SortMode::Name => "name",
+            SortMode::SizeDesc => "size-desc",
+            SortMode::SizeAsc => "size-asc",
+            SortMode::CountDesc => "count-desc",
+            SortMode::CountAsc => "count-asc",
+            SortMode::AgeDesc => "age-desc",
+            SortMode::AgeAsc => "age-asc",
+            SortMode::MtimeDesc => "mtime-desc",
+            SortMode::MtimeAsc => "mtime-asc",
+            SortMode::CtimeDesc => "ctime-desc",
+            SortMode::CtimeAsc => "ctime-asc",
+            SortMode::UidAsc => "uid-asc",
+            SortMode::GidAsc => "gid-asc",
+            SortMode::ModeAsc => "mode-asc",
+            SortMode::DeltaDesc => "delta-desc",
+            SortMode::DeltaAsc => "delta-asc",
+        };
+        f.write_str(name)
     }
 }
 
@@ -284,9 +693,159 @@ impl FromStr for SortMode {
             "mode-asc" | "mode" => Ok(SortMode::ModeAsc),
             "delta-desc" | "delta" | "growth" => Ok(SortMode::DeltaDesc),
             "delta-asc" | "shrink" => Ok(SortMode::DeltaAsc),
-            _ => Err(format!("Invalid sort mode: {}. Use: name, size-desc, size-asc, count-desc, count-asc, age-desc, age-asc, mtime-desc, mtime-asc, ctime-desc, ctime-asc, uid-asc, gid-asc, mode-asc, delta-desc, delta-asc", s)),
+            _ => Err(format!(
+                "Invalid sort mode: {}. Use: {}",
+                s,
+                SortMode::ALL
+                    .iter()
+                    .map(|m| m.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
         }
     }
+}
+
+/// Translate a glob pattern into an anchored regular expression for `regexp_matches`.
+///
+/// The query builder speaks one dialect — regex — so a glob is converted at ingestion and
+/// the database never learns a second one. `*` crosses `/`: a glob names the whole path,
+/// and `*.py` must match at any depth rather than only directly below the indexed root.
+/// `?` matches a single character, `[...]` is a character class (`[!...]` negates it,
+/// `[a-z]` is a range), and `\` quotes the next character literally. Every other regex
+/// metacharacter in a literal position is escaped, so the translation cannot smuggle in
+/// regex syntax the user did not write. A `-` first or last in a class is literal while a
+/// middle one opens a range — the regex grammar agrees on all three positions, so it
+/// publishes unescaped — and a descending range is rejected here, so every glob failure
+/// surfaces at ingestion rather than at the database. Output is wrapped `^(?:…)$` because
+/// `regexp_matches` is an unanchored substring search while a glob matches the entire path.
+pub fn glob_to_regex(glob: &str) -> Result<String, String> {
+    if glob.is_empty() {
+        return Err("Empty glob pattern matches no path".to_string());
+    }
+    let mut out = String::from("^(?:");
+    let mut chars = glob.char_indices().peekable();
+    while let Some((pos, c)) = chars.next() {
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            '\\' => match chars.next() {
+                Some((_, quoted)) => push_regex_literal(&mut out, quoted),
+                None => {
+                    return Err(format!(
+                        "Trailing backslash at byte {pos} in glob pattern: {glob}"
+                    ));
+                }
+            },
+            '[' => {
+                let mut class = String::new();
+                if matches!(chars.peek(), Some((_, '!'))) {
+                    chars.next();
+                    class.push('^');
+                }
+                // Last literal endpoint pushed, for range validation. None at class
+                // start — the `^` negation marks nothing — and after a range
+                // operator, whose endpoint cannot open another range.
+                let mut prev: Option<char> = None;
+                let mut closed = false;
+                while let Some((_, inner)) = chars.next() {
+                    match inner {
+                        // A `]` in first position is literal, so `[]]` is the class
+                        // holding `]`; a class with no closing bracket fails below.
+                        ']' if class_has_content(&class) => {
+                            closed = true;
+                            break;
+                        }
+                        // A middle `-` opens a range; first or last in the class
+                        // it is literal. The regex grammar reads each position
+                        // the same way, so all three publish unescaped.
+                        '-' if prev.is_some() => {
+                            match chars.peek() {
+                                Some((_, ']')) | None => {
+                                    class.push('-');
+                                    prev = Some('-');
+                                }
+                                // A quoted endpoint cannot be ordered against,
+                                // so this range escapes validation below.
+                                Some((_, '\\')) => {
+                                    class.push('-');
+                                    prev = None;
+                                }
+                                Some((_, end)) => {
+                                    let end = *end;
+                                    match prev {
+                                        Some(start) if start > end => {
+                                            return Err(format!(
+                                                "Descending range '{start}-{end}' at byte {pos} in glob pattern: {glob}"
+                                            ));
+                                        }
+                                        _ => {
+                                            class.push('-');
+                                            prev = None;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        '\\' => match chars.next() {
+                            Some((_, quoted)) => {
+                                push_class_literal(&mut class, quoted);
+                                prev = Some(quoted);
+                            }
+                            None => {
+                                return Err(format!(
+                                    "Trailing backslash in character class of glob pattern: {glob}"
+                                ));
+                            }
+                        },
+                        _ => {
+                            push_class_literal(&mut class, inner);
+                            prev = Some(inner);
+                        }
+                    }
+                }
+                if !closed {
+                    return Err(format!(
+                        "Unterminated character class at byte {pos} in glob pattern: {glob}"
+                    ));
+                }
+                out.push('[');
+                out.push_str(&class);
+                out.push(']');
+            }
+            _ => push_regex_literal(&mut out, c),
+        }
+    }
+    out.push_str(")$");
+    Ok(out)
+}
+
+/// Whether a partially built class body already holds content (`^` alone is negation).
+fn class_has_content(class: &str) -> bool {
+    !(class.is_empty() || class == "^")
+}
+
+/// Push a literal character into a regex, escaping every metacharacter.
+fn push_regex_literal(out: &mut String, c: char) {
+    if matches!(
+        c,
+        '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+    ) {
+        out.push('\\');
+    }
+    out.push(c);
+}
+
+/// Push a literal character into a regex character class, escaping what is special there.
+///
+/// `-` needs no escape: literal by position at the class edges, a range operator in the
+/// middle, and the regex grammar agrees on each. The class parser handles `-` positionally
+/// before this is ever reached with one.
+fn push_class_literal(class: &mut String, c: char) {
+    if matches!(c, ']' | '\\' | '^') {
+        class.push('\\');
+    }
+    class.push(c);
 }
 
 /// Query filters for file metadata searches.
@@ -294,6 +853,10 @@ impl FromStr for SortMode {
 pub struct QueryFilters {
     /// Regex pattern to match file paths.
     pub pattern: Option<String>,
+    /// Original user text of the pattern filter when given as a glob. The query always
+    /// runs on `pattern`; this exists so displays show what the user typed instead of the
+    /// translation. Unset when the pattern was given as a regex.
+    pub pattern_display: Option<String>,
     /// Minimum file size in bytes.
     pub min_size: Option<i64>,
     /// Maximum file size in bytes.
@@ -302,20 +865,20 @@ pub struct QueryFilters {
     pub older_than: Option<i64>,
     /// Files accessed since this epoch timestamp.
     pub newer_than: Option<i64>,
+    /// Files owned by this uid, resolved from `--owner` at filter-build time.
+    pub owner_uid: Option<u32>,
+    /// Files owned by this gid, resolved from `--group` at filter-build time.
+    pub group_gid: Option<u32>,
+    /// Permission-bits predicate, parsed from `--mode` before any query is built.
+    pub mode: Option<ModePredicate>,
     /// Files not modified since this epoch timestamp.
     pub mtime_older_than: Option<i64>,
     /// Files modified since this epoch timestamp.
     pub mtime_newer_than: Option<i64>,
-    /// Files whose ctime is before this epoch timestamp.
+    /// Files whose inode has not changed since this epoch timestamp.
     pub ctime_older_than: Option<i64>,
-    /// Files whose ctime is since this epoch timestamp.
+    /// Files whose inode changed since this epoch timestamp.
     pub ctime_newer_than: Option<i64>,
-    /// Filter by exact owner user ID.
-    pub uid: Option<u32>,
-    /// Filter by exact owner group ID.
-    pub gid: Option<u32>,
-    /// Filter by exact file mode bits.
-    pub mode: Option<u32>,
 }
 
 impl QueryFilters {
@@ -328,6 +891,31 @@ impl QueryFilters {
     pub fn with_pattern(mut self, pattern: Option<String>) -> Self {
         self.pattern = pattern;
         self
+    }
+
+    /// Set the path pattern filter, interpreting it as a glob unless `regex` holds.
+    ///
+    /// A glob is translated to an anchored regular expression before storage, so the
+    /// query builder never learns a second dialect. An invalid glob fails here — before
+    /// any query is built — rather than at the database.
+    pub fn with_path_pattern(
+        mut self,
+        pattern: Option<String>,
+        regex: bool,
+    ) -> Result<Self, String> {
+        match pattern {
+            None => Ok(self),
+            Some(raw) if regex => {
+                self.pattern = Some(raw);
+                Ok(self)
+            }
+            Some(glob) => {
+                let translated = glob_to_regex(&glob)?;
+                self.pattern = Some(translated);
+                self.pattern_display = Some(glob);
+                Ok(self)
+            }
+        }
     }
 
     /// Set minimum size filter from human-readable string (e.g., "1M").
@@ -345,11 +933,7 @@ impl QueryFilters {
     /// Set older-than filter from days.
     pub fn with_older_than(mut self, days: Option<u64>) -> Self {
         if let Some(d) = days {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            self.older_than = Some(now - (d as i64 * 86400));
+            self.older_than = Some(days_ago_epoch(d));
         }
         self
     }
@@ -357,78 +941,64 @@ impl QueryFilters {
     /// Set newer-than filter from days.
     pub fn with_newer_than(mut self, days: Option<u64>) -> Self {
         if let Some(d) = days {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            self.newer_than = Some(now - (d as i64 * 86400));
+            self.newer_than = Some(days_ago_epoch(d));
         }
         self
     }
 
-    /// Set mtime-older-than filter from days.
+    /// Set owner filter from an already-resolved uid.
+    pub fn with_owner_uid(mut self, uid: Option<u32>) -> Self {
+        self.owner_uid = uid;
+        self
+    }
+
+    /// Set group filter from an already-resolved gid.
+    pub fn with_group_gid(mut self, gid: Option<u32>) -> Self {
+        self.group_gid = gid;
+        self
+    }
+
+    /// Set permission filter from a `--mode` SPEC string (e.g., "644", "/002").
+    ///
+    /// Parsing fails here — before any query is built — rather than at the database.
+    pub fn with_mode(mut self, spec: Option<&str>) -> Result<Self, String> {
+        self.mode = spec.map(parse_mode_spec).transpose()?;
+        Ok(self)
+    }
+
+    /// Set mtime-older-than filter from days, the modification-time analogue of
+    /// `with_older_than`.
     pub fn with_mtime_older_than(mut self, days: Option<u64>) -> Self {
         if let Some(d) = days {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            self.mtime_older_than = Some(now - (d as i64 * 86400));
+            self.mtime_older_than = Some(days_ago_epoch(d));
         }
         self
     }
 
-    /// Set mtime-newer-than filter from days.
+    /// Set mtime-newer-than filter from days, the modification-time analogue of
+    /// `with_newer_than`.
     pub fn with_mtime_newer_than(mut self, days: Option<u64>) -> Self {
         if let Some(d) = days {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            self.mtime_newer_than = Some(now - (d as i64 * 86400));
+            self.mtime_newer_than = Some(days_ago_epoch(d));
         }
         self
     }
 
-    /// Set ctime-older-than filter from days.
+    /// Set ctime-older-than filter from days, the inode-change analogue of
+    /// `with_older_than`.
     pub fn with_ctime_older_than(mut self, days: Option<u64>) -> Self {
         if let Some(d) = days {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            self.ctime_older_than = Some(now - (d as i64 * 86400));
+            self.ctime_older_than = Some(days_ago_epoch(d));
         }
         self
     }
 
-    /// Set ctime-newer-than filter from days.
+    /// Set ctime-newer-than filter from days, the inode-change analogue of
+    /// `with_newer_than`.
     pub fn with_ctime_newer_than(mut self, days: Option<u64>) -> Self {
         if let Some(d) = days {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            self.ctime_newer_than = Some(now - (d as i64 * 86400));
+            self.ctime_newer_than = Some(days_ago_epoch(d));
         }
-        self
-    }
-
-    /// Set uid filter.
-    pub fn with_uid(mut self, uid: Option<u32>) -> Self {
-        self.uid = uid;
-        self
-    }
-
-    /// Set gid filter.
-    pub fn with_gid(mut self, gid: Option<u32>) -> Self {
-        self.gid = gid;
-        self
-    }
-
-    /// Set mode filter (exact match).
-    pub fn with_mode(mut self, mode: Option<u32>) -> Self {
-        self.mode = mode;
         self
     }
 
@@ -439,13 +1009,13 @@ impl QueryFilters {
             || self.max_size.is_some()
             || self.older_than.is_some()
             || self.newer_than.is_some()
+            || self.owner_uid.is_some()
+            || self.group_gid.is_some()
+            || self.mode.is_some()
             || self.mtime_older_than.is_some()
             || self.mtime_newer_than.is_some()
             || self.ctime_older_than.is_some()
             || self.ctime_newer_than.is_some()
-            || self.uid.is_some()
-            || self.gid.is_some()
-            || self.mode.is_some()
     }
 
     /// Returns individual WHERE clause conditions.
@@ -473,6 +1043,22 @@ impl QueryFilters {
             conditions.push(format!("atime >= {}", threshold));
         }
 
+        if let Some(uid) = self.owner_uid {
+            conditions.push(format!("uid = {}", uid));
+        }
+
+        if let Some(gid) = self.group_gid {
+            conditions.push(format!("gid = {}", gid));
+        }
+
+        if let Some(pred) = self.mode {
+            conditions.push(match pred {
+                ModePredicate::Exact(bits) => format!("mode = {}", bits),
+                ModePredicate::Any(bits) => format!("(mode & {}) != 0", bits),
+                ModePredicate::All(bits) => format!("(mode & {}) = {}", bits, bits),
+            });
+        }
+
         if let Some(threshold) = self.mtime_older_than {
             conditions.push(format!("mtime < {}", threshold));
         }
@@ -487,18 +1073,6 @@ impl QueryFilters {
 
         if let Some(threshold) = self.ctime_newer_than {
             conditions.push(format!("ctime >= {}", threshold));
-        }
-
-        if let Some(uid) = self.uid {
-            conditions.push(format!("uid = {}", uid));
-        }
-
-        if let Some(gid) = self.gid {
-            conditions.push(format!("gid = {}", gid));
-        }
-
-        if let Some(mode) = self.mode {
-            conditions.push(format!("mode = {}", mode));
         }
 
         conditions
@@ -529,25 +1103,26 @@ impl QueryFilters {
     /// Clear all filters.
     pub fn clear(&mut self) {
         self.pattern = None;
+        self.pattern_display = None;
         self.min_size = None;
         self.max_size = None;
         self.older_than = None;
         self.newer_than = None;
+        self.owner_uid = None;
+        self.group_gid = None;
+        self.mode = None;
         self.mtime_older_than = None;
         self.mtime_newer_than = None;
         self.ctime_older_than = None;
         self.ctime_newer_than = None;
-        self.uid = None;
-        self.gid = None;
-        self.mode = None;
     }
 
     /// Format active filters for display (e.g., "[older:30d] [min:1M]").
     pub fn format_display(&self) -> String {
         let mut parts = Vec::new();
 
-        if let Some(ref pattern) = self.pattern {
-            parts.push(format!("[/{}]", pattern));
+        if let Some(ref display) = self.pattern_display.as_ref().or(self.pattern.as_ref()) {
+            parts.push(format!("[/{}]", display));
         }
 
         if let Some(min_size) = self.min_size {
@@ -559,86 +1134,261 @@ impl QueryFilters {
         }
 
         if let Some(threshold) = self.older_than {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            let days = (now - threshold) / 86400;
-            parts.push(format!("[older:{}d]", days));
+            parts.push(format!("[older:{}d]", days_since_epoch(threshold)));
         }
 
         if let Some(threshold) = self.newer_than {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            let days = (now - threshold) / 86400;
-            parts.push(format!("[newer:{}d]", days));
+            parts.push(format!("[newer:{}d]", days_since_epoch(threshold)));
+        }
+
+        if let Some(uid) = self.owner_uid {
+            parts.push(format!("[owner:{}]", uid));
+        }
+
+        if let Some(gid) = self.group_gid {
+            parts.push(format!("[group:{}]", gid));
+        }
+
+        if let Some(pred) = self.mode {
+            parts.push(format!("[mode:{}]", pred));
         }
 
         if let Some(threshold) = self.mtime_older_than {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            let days = (now - threshold) / 86400;
-            parts.push(format!("[mtime-older:{}d]", days));
+            parts.push(format!("[mtime-older:{}d]", days_since_epoch(threshold)));
         }
 
         if let Some(threshold) = self.mtime_newer_than {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            let days = (now - threshold) / 86400;
-            parts.push(format!("[mtime-newer:{}d]", days));
+            parts.push(format!("[mtime-newer:{}d]", days_since_epoch(threshold)));
         }
 
         if let Some(threshold) = self.ctime_older_than {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            let days = (now - threshold) / 86400;
-            parts.push(format!("[ctime-older:{}d]", days));
+            parts.push(format!("[ctime-older:{}d]", days_since_epoch(threshold)));
         }
 
         if let Some(threshold) = self.ctime_newer_than {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            let days = (now - threshold) / 86400;
-            parts.push(format!("[ctime-newer:{}d]", days));
-        }
-
-        if let Some(uid) = self.uid {
-            parts.push(format!("[uid:{}]", uid));
-        }
-
-        if let Some(gid) = self.gid {
-            parts.push(format!("[gid:{}]", gid));
-        }
-
-        if let Some(mode) = self.mode {
-            parts.push(format!("[mode:{:o}]", mode));
+            parts.push(format!("[ctime-newer:{}d]", days_since_epoch(threshold)));
         }
 
         parts.join(" ")
     }
 }
 
+/// A parsed `--mode` permission filter: an operator plus permission bits.
+///
+/// Exact answers "the mode is this"; Any answers "any of these bits is set" (the
+/// exposure question — world-writable is Any(`0o002`)); All answers "every one of
+/// these bits is set" (setuid is All(`0o4000`)). Bits are the `0o7777` permission
+/// field, matching the stored `mode` column, so SQL compares them bare.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModePredicate {
+    Exact(u32),
+    Any(u32),
+    All(u32),
+}
+
+impl fmt::Display for ModePredicate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ModePredicate::Exact(bits) => write!(f, "{:o}", bits),
+            ModePredicate::Any(bits) => write!(f, "/{:o}", bits),
+            ModePredicate::All(bits) => write!(f, "&{:o}", bits),
+        }
+    }
+}
+
+/// Parse a `--mode` SPEC into an operator plus bits.
+///
+/// Grammar: bare octal (`644`, `0644`) is exact; a `/` prefix (`/002`) matches
+/// when any listed bit is set; an `&` prefix (`&4000`) matches when all listed
+/// bits are set. A leading `-` is not accepted — clap would eat it as a flag —
+/// and `&` is its spelling instead. An optional `0o` may follow the prefix.
+/// Anything else — empty input, a bare prefix, non-octal digits, more than
+/// `0o7777` — fails before any query is built.
+pub fn parse_mode_spec(spec: &str) -> Result<ModePredicate, String> {
+    let (op, digits) = match spec.strip_prefix('/') {
+        Some(rest) => ('/', rest),
+        None => match spec.strip_prefix('&') {
+            Some(rest) => ('&', rest),
+            None => ('=', spec),
+        },
+    };
+    let digits = digits.strip_prefix("0o").unwrap_or(digits);
+    if digits.is_empty() || !digits.bytes().all(|b| matches!(b, b'0'..=b'7')) {
+        return Err(format!(
+            "invalid mode SPEC: '{spec}' (want octal like 644, /002, or &4000)"
+        ));
+    }
+    let bits = u32::from_str_radix(digits, 8).map_err(|_| {
+        format!("invalid mode SPEC: '{spec}' (want octal like 644, /002, or &4000)")
+    })?;
+    if bits > 0o7777 {
+        return Err(format!(
+            "invalid mode SPEC: '{spec}' (permission bits stop at 07777)"
+        ));
+    }
+    Ok(match op {
+        '/' => ModePredicate::Any(bits),
+        '&' => ModePredicate::All(bits),
+        _ => ModePredicate::Exact(bits),
+    })
+}
+
+/// Resolve a user name to its uid, POSIX `find -user` style.
+///
+/// A name present in the user database wins — even a numeric one. Otherwise an
+/// all-digit string parses as a literal uid, so a host missing the passwd entry
+/// can still select by number. Anything else fails.
+///
+/// This calls the non-reentrant `getpwnam`, keeps no pointer past the call, and
+/// still must not run on a thread pool: the one call site resolves filters on
+/// the main thread before any query runs.
+pub fn resolve_user(name: &str) -> Result<u32, String> {
+    let cname = CString::new(name).map_err(|_| format!("unknown user: '{name}'"))?;
+    let uid = unsafe {
+        let entry = libc::getpwnam(cname.as_ptr());
+        if entry.is_null() {
+            None
+        } else {
+            Some((*entry).pw_uid)
+        }
+    };
+    if let Some(uid) = uid {
+        return Ok(uid);
+    }
+    decimal_id(name).ok_or_else(|| format!("unknown user: '{name}'"))
+}
+
+/// Resolve a group name to its gid: the group mirror of `resolve_user`, over
+/// `getgrnam`, with the same lookup-first-then-digits policy and the same
+/// single-threaded call-site constraint.
+pub fn resolve_group(name: &str) -> Result<u32, String> {
+    let cname = CString::new(name).map_err(|_| format!("unknown group: '{name}'"))?;
+    let gid = unsafe {
+        let entry = libc::getgrnam(cname.as_ptr());
+        if entry.is_null() {
+            None
+        } else {
+            Some((*entry).gr_gid)
+        }
+    };
+    if let Some(gid) = gid {
+        return Ok(gid);
+    }
+    decimal_id(name).ok_or_else(|| format!("unknown group: '{name}'"))
+}
+
+/// The user name of `uid`, or the number itself when the user database has no entry.
+///
+/// The reverse of `resolve_user`, for display. It uses the reentrant `getpwuid_r` and
+/// caches every answer for the life of the process: a view redraws its rows on every
+/// keystroke, and NSS behind LDAP answers in milliseconds, not nanoseconds.
+pub fn user_name(uid: i64) -> String {
+    static CACHE: OnceLock<Mutex<HashMap<i64, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(name) = cache.lock().unwrap().get(&uid) {
+        return name.clone();
+    }
+    let name = u32::try_from(uid)
+        .ok()
+        .and_then(|id| unsafe {
+            let mut buf = vec![0 as libc::c_char; 4096];
+            let mut pwd: libc::passwd = std::mem::zeroed();
+            let mut result: *mut libc::passwd = std::ptr::null_mut();
+            libc::getpwuid_r(id, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result);
+            (!result.is_null()).then(|| {
+                std::ffi::CStr::from_ptr((*result).pw_name)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        })
+        .unwrap_or_else(|| uid.to_string());
+    cache.lock().unwrap().insert(uid, name.clone());
+    name
+}
+
+/// The group name of `gid`: the group mirror of `user_name`, over `getgrgid_r`.
+pub fn group_name(gid: i64) -> String {
+    static CACHE: OnceLock<Mutex<HashMap<i64, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(name) = cache.lock().unwrap().get(&gid) {
+        return name.clone();
+    }
+    let name = u32::try_from(gid)
+        .ok()
+        .and_then(|id| unsafe {
+            let mut buf = vec![0 as libc::c_char; 4096];
+            let mut grp: libc::group = std::mem::zeroed();
+            let mut result: *mut libc::group = std::ptr::null_mut();
+            libc::getgrgid_r(id, &mut grp, buf.as_mut_ptr(), buf.len(), &mut result);
+            (!result.is_null()).then(|| {
+                std::ffi::CStr::from_ptr((*result).gr_name)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        })
+        .unwrap_or_else(|| gid.to_string());
+    cache.lock().unwrap().insert(gid, name.clone());
+    name
+}
+
+/// A digit string as a literal id. Empty strings, signs, and mixed tokens are
+/// not ids; a value past `u32` is not one either.
+fn decimal_id(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<u32>().ok()
+}
+
+/// Unix epoch seconds `days` whole days before now: the shared conversion behind
+/// every day-count CLI filter, atime and mtime alike.
+fn days_ago_epoch(days: u64) -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    now - (days as i64 * 86400)
+}
+
+/// Whole days between a stored epoch threshold and now, for filter displays.
+fn days_since_epoch(threshold: i64) -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    (now - threshold) / 86400
+}
+
+/// Build the deterministic `ORDER BY path LIMIT n` tail for a capped query.
+///
+/// A bare `LIMIT` returns an arbitrary, unstable subset, so ordering and limiting are
+/// inseparable: whenever a limit is present the query orders by `path` — the unique key of
+/// the index — so a `--dry-run` preview and the subsequent real deletion select identical
+/// rows. With no limit the tail is empty: every match is acted on regardless of order, and
+/// ordering the whole match set would be wasted work.
+pub fn deterministic_limit_clause(limit: Option<usize>) -> String {
+    match limit {
+        Some(n) => format!("ORDER BY path LIMIT {n}"),
+        None => String::new(),
+    }
+}
+
 /// Returns the Arrow schema for file metadata records.
+///
+/// Identity columns first (`path`, `size`, `uid`, `gid`, `mode`), then the three
+/// clocks (`atime`, `mtime`, `ctime`). Physical order binds no reader — every query
+/// projects by name, and the version gate refuses cross-version indexes — so the
+/// layout follows semantics rather than history.
 pub fn get_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("path",  DataType::Utf8,  false),
-        Field::new("size",  DataType::Int64, false),
+        Field::new("path", DataType::Utf8, false),
+        Field::new("size", DataType::Int64, false),
+        Field::new("uid", DataType::Int64, false),
+        Field::new("gid", DataType::Int64, false),
+        Field::new("mode", DataType::Int64, false),
         Field::new("atime", DataType::Int64, false),
         Field::new("mtime", DataType::Int64, false),
         Field::new("ctime", DataType::Int64, false),
-        Field::new("uid",   DataType::Int32, false),
-        Field::new("gid",   DataType::Int32, false),
-        Field::new("mode",  DataType::Int32, false),
     ]))
 }
 
@@ -686,7 +1436,7 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Format a signed byte delta with an explicit sign (e.g. "+1.50 MiB", "-12 B", "0 B").
+/// Format a signed byte delta with an explicit sign (`+1.50 MiB`, `-12 B`, `0 B`).
 pub fn format_bytes_signed(delta: i64) -> String {
     let magnitude = format_bytes(delta.unsigned_abs());
     match delta.signum() {
@@ -696,517 +1446,200 @@ pub fn format_bytes_signed(delta: i64) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Index comparison
-// ---------------------------------------------------------------------------
-
-/// Special partition name for files directly in the top-level directory.
-pub const ROOT_PARTITION: &str = "__root__";
-
-/// Per-file change classification produced by [`diff_partition_sql`], from most to
-/// least significant. A file is assigned the first status that applies.
-pub const DIFF_STATUSES: &[&str] = &[
-    "added",     // only in the new index
-    "removed",   // only in the old index
-    "modified",  // size or mtime changed
-    "meta",      // only ctime/uid/gid/mode changed
-    "accessed",  // only atime changed
-    "unchanged",
-];
-
-/// Quote a string as a SQL literal.
+/// Quote a string as a SQL literal, doubling any `'`.
+///
+/// For local index paths and crawl roots that a query must name as text, such as the
+/// several globs of an index comparison. An `s3://` glob is bound instead (`parquet_source`).
 pub fn sql_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-// ---------------------------------------------------------------------------
-// Index layout
-//
-// A partition is identified by its directory path relative to the crawl root
-// (`alice`, `projects/bigproj`), or `__root__` for files directly in the root.
-// Its chunks live in `<index>/<key>/NNNNNN.parquet`. A file belongs to the
-// deepest partition containing it, so partition directories can nest.
-// ---------------------------------------------------------------------------
+/// The columns an `xdu-find -f` field list may name, in schema order.
+pub const FIND_FIELDS: &[&str] = &[
+    "path", "size", "uid", "gid", "mode", "atime", "mtime", "ctime",
+];
 
-/// Name of the index manifest file, stored at the top of the index directory.
-pub const MANIFEST_FILE: &str = "_xdu.json";
+/// The fixed `xdu-find -f` formats. Each keeps the output it has always had, so a script
+/// written against one is not broken by field lists.
+pub const FIND_FORMATS: &[&str] = &["path", "size", "atime", "csv", "json"];
 
-/// Current manifest format version.
-pub const MANIFEST_VERSION: u64 = 1;
-
-/// Which directories become partitions (split points).
+/// What `xdu-find -f` asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SplitSpec {
-    /// Every directory at depth 1..=depth below the root is a split point.
-    pub depth: usize,
-    /// Additional split points, relative to the root. Components may use `*` and `?`.
-    pub patterns: Vec<String>,
+pub enum FindOutput {
+    /// One of `FIND_FORMATS`.
+    Format(String),
+    /// A comma-separated list of `FIND_FIELDS`, or one field that is not a format name.
+    Fields(Vec<String>),
 }
 
-impl Default for SplitSpec {
-    /// One partition per top-level directory (the original xdu layout).
-    fn default() -> Self {
-        Self { depth: 1, patterns: Vec::new() }
+/// Parse an `xdu-find -f` value. A format name wins over the field of the same name, so
+/// `-f size` stays the size-sorted listing it always was; `-f size,path` is a field list.
+pub fn parse_find_output(spec: &str) -> Result<FindOutput, String> {
+    let spec = spec.trim();
+    if FIND_FORMATS.contains(&spec) {
+        return Ok(FindOutput::Format(spec.to_string()));
     }
-}
-
-impl SplitSpec {
-    /// Canonical form (patterns trimmed, sorted, deduplicated) for comparison and storage.
-    pub fn normalized(&self) -> Self {
-        let mut patterns: Vec<String> = self.patterns.iter()
-            .map(|p| p.trim().trim_matches('/').to_string())
-            .filter(|p| !p.is_empty())
-            .collect();
-        patterns.sort();
-        patterns.dedup();
-        Self { depth: self.depth, patterns }
-    }
-
-    /// True if both specs assign every path to the same partition.
-    pub fn same_layout(&self, other: &SplitSpec) -> bool {
-        self.normalized() == other.normalized()
-    }
-}
-
-/// Index metadata written by `xdu` to `<index>/_xdu.json`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Manifest {
-    pub version: u64,
-    /// The crawl root (directory passed to `xdu`), without a trailing slash.
-    pub root: String,
-    pub split: SplitSpec,
-    /// Size calculation mode, for information (e.g. "disk-usage").
-    pub size_mode: String,
-}
-
-impl Manifest {
-    /// Read the manifest of an index, or None if it has none (indexes from older xdu versions).
-    pub fn load(index: &Path) -> anyhow::Result<Option<Manifest>> {
-        let path = index.join(MANIFEST_FILE);
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(anyhow::Error::new(e).context(format!("Reading {}", path.display()))),
-        };
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("Invalid manifest {}: {}", path.display(), e))?;
-        let version = v["version"].as_u64().unwrap_or(0);
-        if version > MANIFEST_VERSION {
-            anyhow::bail!("{} has version {}; this xdu supports up to {}", path.display(), version, MANIFEST_VERSION);
-        }
-        let root = v["root"].as_str()
-            .ok_or_else(|| anyhow::anyhow!("Manifest {} has no root", path.display()))?
-            .trim_end_matches('/')
-            .to_string();
-        let depth = v["split"]["depth"].as_u64().unwrap_or(1) as usize;
-        let patterns = v["split"]["patterns"].as_array()
-            .map(|a| a.iter().filter_map(|p| p.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-        Ok(Some(Manifest {
-            version,
-            root,
-            split: SplitSpec { depth, patterns },
-            size_mode: v["size_mode"].as_str().unwrap_or("").to_string(),
-        }))
-    }
-
-    /// Write the manifest atomically.
-    pub fn save(&self, index: &Path) -> anyhow::Result<()> {
-        let split = self.split.normalized();
-        let v = serde_json::json!({
-            "version": self.version,
-            "root": self.root,
-            "split": { "depth": split.depth, "patterns": split.patterns },
-            "size_mode": self.size_mode,
-        });
-        let path = index.join(MANIFEST_FILE);
-        let tmp = index.join(format!("{}.partial", MANIFEST_FILE));
-        std::fs::write(&tmp, format!("{}\n", serde_json::to_string_pretty(&v)?))?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    }
-}
-
-/// The split spec an index was built with (the default for indexes without a manifest).
-pub fn index_split_spec(index: &Path) -> anyhow::Result<SplitSpec> {
-    Ok(Manifest::load(index)?.map(|m| m.split).unwrap_or_default())
-}
-
-/// Match a single path component against a pattern with `*` and `?` wildcards.
-pub fn glob_match(pattern: &str, name: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let n: Vec<char> = name.chars().collect();
-    let (mut pi, mut ni) = (0, 0);
-    let mut star: Option<(usize, usize)> = None;
-    while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some((pi, ni));
-            pi += 1;
-        } else if let Some((sp, sn)) = star {
-            pi = sp + 1;
-            ni = sn + 1;
-            star = Some((sp, sn + 1));
-        } else {
-            return false;
+    let fields: Vec<String> = spec.split(',').map(|f| f.trim().to_string()).collect();
+    for f in &fields {
+        if !FIND_FIELDS.contains(&f.as_str()) {
+            return Err(format!(
+                "Unknown field '{}'. Formats: {}; fields for a comma-separated list: {}",
+                f,
+                FIND_FORMATS.join(", "),
+                FIND_FIELDS.join(", ")
+            ));
         }
     }
-    p[pi..].iter().all(|&c| c == '*')
+    Ok(FindOutput::Fields(fields))
 }
 
-/// Real (non-symlink) subdirectories of `dir`, by name. Unreadable directories yield nothing.
-fn subdirs(dir: &Path) -> Vec<String> {
-    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut names: Vec<String> = rd
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .collect();
-    names.sort();
-    names
-}
-
-/// Describe why `rel` is not a real directory under `root`, naming the first bad component.
-fn explain_missing_dir(root: &Path, rel: &str) -> String {
-    let mut path = root.to_path_buf();
-    for comp in rel.split('/') {
-        path.push(comp);
-        match std::fs::symlink_metadata(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return format!("{} does not exist", path.display());
-            }
-            Err(e) => return format!("cannot access {}: {}", path.display(), e),
-            Ok(m) if m.file_type().is_symlink() => {
-                let target = std::fs::read_link(&path).map(|t| t.display().to_string()).unwrap_or_default();
-                return format!(
-                    "{} is a symlink (to {}); symlinks are not followed, so nothing below it is indexed",
-                    path.display(), target
-                );
-            }
-            Ok(m) if !m.is_dir() => return format!("{} is not a directory", path.display()),
-            Ok(_) => {}
-        }
-    }
-    format!("{} is not a directory", path.display())
-}
-
-/// Resolve a split spec against the directory tree under `root`.
-///
-/// Returns the split points as sorted relative paths (the root itself is implied and not
-/// included), plus warnings for wildcard patterns that matched nothing. A literal path that
-/// is not a real directory (missing, a file, or a symlink) is an error.
-pub fn resolve_split_points(root: &Path, spec: &SplitSpec) -> anyhow::Result<(Vec<String>, Vec<String>)> {
-    let mut points = std::collections::BTreeSet::new();
-    let mut warnings = Vec::new();
-
-    // Depth-based split points: breadth-first to `spec.depth` levels.
-    let mut level: Vec<String> = vec![String::new()];
-    for _ in 0..spec.depth {
-        let mut next = Vec::new();
-        for rel in &level {
-            for name in subdirs(&root.join(rel)) {
-                let child = if rel.is_empty() { name } else { format!("{}/{}", rel, name) };
-                points.insert(child.clone());
-                next.push(child);
-            }
-        }
-        if next.is_empty() {
-            break;
-        }
-        level = next;
-    }
-
-    // Explicit split points, with wildcards expanded component by component.
-    for pattern in &spec.normalized().patterns {
-        let comps: Vec<&str> = pattern.split('/').collect();
-        if comps.iter().any(|c| c.is_empty() || *c == "." || *c == "..") {
-            anyhow::bail!("Invalid split path '{}': use a relative path without '.' or '..'", pattern);
-        }
-        if pattern.contains("**") {
-            anyhow::bail!(
-                "Invalid split path '{}': '**' is not supported, because wildcards match a single path \
-                 component. Use '*' for one level (e.g. 'a/*'), list deeper levels explicitly \
-                 (e.g. 'a/*,a/*/*'), or use --split-depth",
-                pattern
-            );
-        }
-        let mut matches: Vec<String> = vec![String::new()];
-        for comp in comps {
-            let mut next = Vec::new();
-            for rel in &matches {
-                let dir = root.join(rel);
-                let join = |name: &str| if rel.is_empty() { name.to_string() } else { format!("{}/{}", rel, name) };
-                if comp.contains(['*', '?']) {
-                    next.extend(subdirs(&dir).iter().filter(|n| glob_match(comp, n)).map(|n| join(n)));
-                } else if std::fs::symlink_metadata(dir.join(comp)).is_ok_and(|m| m.is_dir()) {
-                    next.push(join(comp));
-                }
-            }
-            matches = next;
-        }
-        if matches.is_empty() {
-            if pattern.contains(['*', '?']) {
-                warnings.push(format!("split path '{}' matched no directories", pattern));
-            } else {
-                anyhow::bail!("Split path '{}': {}", pattern, explain_missing_dir(root, pattern));
-            }
-        }
-        points.extend(matches);
-    }
-
-    if points.contains(ROOT_PARTITION) {
-        anyhow::bail!("A top-level directory named '{}' conflicts with the root partition", ROOT_PARTITION);
-    }
-    Ok((points.into_iter().collect(), warnings))
-}
-
-/// Index directory as a string, without a trailing slash, for building globs.
-pub fn index_str(index: &Path) -> String {
-    let s = index.to_string_lossy();
-    let t = s.trim_end_matches('/');
-    if t.is_empty() { "/".to_string() } else { t.to_string() }
-}
-
-/// Glob matching every chunk in an index, at any depth.
-pub fn all_parquet_glob(index: &Path) -> String {
-    format!("{}/**/*.parquet", index_str(index))
-}
-
-/// Glob matching the chunks of one partition (not including nested partitions).
-pub fn partition_glob(index: &Path, key: &str) -> String {
-    format!("{}/{}/*.parquet", index_str(index), key)
-}
-
-/// Glob matching the chunks of a partition and every partition nested below it.
-pub fn subtree_glob(index: &Path, key: &str) -> String {
-    format!("{}/{}/**/*.parquet", index_str(index), key)
-}
-
-/// Glob for querying an index: the subtree of `partition` if given, else everything.
-pub fn index_glob(index: &Path, partition: Option<&str>) -> String {
-    match partition.map(|p| p.trim_matches('/')) {
-        Some(p) if !p.is_empty() => subtree_glob(index, p),
-        _ => all_parquet_glob(index),
+/// An epoch timestamp as `YYYY-MM-DD HH:MM:SS` UTC, for human-readable field output. A
+/// pre-epoch time prints as its raw number rather than as a wrong date.
+pub fn format_epoch(epoch: i64) -> String {
+    match u64::try_from(epoch) {
+        Ok(secs) => format_log_timestamp(UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .trim_end_matches('Z')
+            .replacen('T', " ", 1),
+        Err(_) => epoch.to_string(),
     }
 }
 
-/// SQL expression giving the partition key of each row, for `read_parquet(..., filename=true)`
-/// over a glob rooted at `index`.
-pub fn partition_key_sql(index: &Path) -> String {
-    format!(
-        "regexp_extract(substr(filename, {}), '^(.*)/[^/]+\\.parquet$', 1)",
-        index_str(index).chars().count() + 2
-    )
-}
-
-/// SQL expression giving the top-level directory of each row's partition (see [`partition_key_sql`]).
-pub fn top_level_key_sql(index: &Path) -> String {
-    format!("split_part({}, '/', 1)", partition_key_sql(index))
-}
-
-/// First component of a partition key (`projects/bigproj` -> `projects`).
-pub fn top_level(key: &str) -> &str {
-    key.split('/').next().unwrap_or(key)
-}
-
-/// List partitions (directories containing at least one `.parquet` file, at any depth)
-/// as sorted keys relative to the index directory.
-pub fn list_partitions(index: &Path) -> anyhow::Result<Vec<String>> {
-    fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) -> anyhow::Result<()> {
-        let mut has_parquet = false;
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let ft = entry.file_type()?;
-            if ft.is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let child = if rel.is_empty() { name } else { format!("{}/{}", rel, name) };
-                walk(&entry.path(), &child, out)?;
-            } else if !rel.is_empty() && entry.path().extension().is_some_and(|ext| ext == "parquet") {
-                has_parquet = true;
-            }
-        }
-        if has_parquet {
-            out.push(rel.to_string());
-        }
-        Ok(())
+/// One integer field of a field list: raw for CSV; bytes, dates and octal modes otherwise.
+pub fn format_field_value(field: &str, value: i64, human: bool) -> String {
+    if !human {
+        return value.to_string();
     }
-    let mut partitions = Vec::new();
-    walk(index, "", &mut partitions)?;
-    partitions.sort();
-    Ok(partitions)
-}
-
-/// Distinct top-level directories of a set of partition keys, sorted.
-pub fn top_level_partitions(partitions: &[String]) -> Vec<String> {
-    let set: std::collections::BTreeSet<&str> = partitions.iter().map(|p| top_level(p)).collect();
-    set.into_iter().map(String::from).collect()
-}
-
-/// Discover the crawl root of an index (the directory that was passed to `xdu`),
-/// without a trailing slash.
-///
-/// Uses the manifest when present. Otherwise (indexes from older xdu versions), files in
-/// partition `p` live at `<root>/p/...` and files in `__root__` at `<root>/file`; the root
-/// is recovered from the longest common directory prefix of all paths, and if the index
-/// has a single top-level partition, that prefix is trimmed back to `<root>`.
-pub fn discover_index_root(conn: &Connection, index: &Path, partitions: &[String]) -> anyhow::Result<String> {
-    if let Some(m) = Manifest::load(index)? {
-        return Ok(m.root);
+    match field {
+        "size" => format_bytes(value.max(0) as u64),
+        "atime" | "mtime" | "ctime" => format_epoch(value),
+        "mode" => format!("{:o}", value),
+        _ => value.to_string(),
     }
-    let glob = all_parquet_glob(index);
-    let sql = format!("SELECT min(path), max(path) FROM read_parquet({})", sql_quote(&glob));
-    let (lo, hi): (Option<String>, Option<String>) =
-        conn.query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    let (lo, hi) = match (lo, hi) {
-        (Some(lo), Some(hi)) => (lo, hi),
-        _ => anyhow::bail!("Index is empty: {}", index.display()),
-    };
-
-    let common: String = lo.chars().zip(hi.chars())
-        .take_while(|(a, b)| a == b)
-        .map(|(a, _)| a)
-        .collect();
-    // Truncate to a whole directory, e.g. "/data/alice" + "/data/alfred" -> "/data"
-    let mut root = match common.rfind('/') {
-        Some(pos) => common[..pos].to_string(),
-        None => String::new(),
-    };
-
-    let tops = top_level_partitions(partitions);
-    let named: Vec<&String> = tops.iter().filter(|p| *p != ROOT_PARTITION).collect();
-    let has_root_files = tops.iter().any(|p| p == ROOT_PARTITION);
-    if named.len() == 1 && !has_root_files {
-        // Common prefix is somewhere inside the only partition: cut back to "<root>/<p>".
-        let marker = format!("/{}", named[0]);
-        let probe = format!("{}/", root);
-        if let Some(pos) = probe.rfind(&format!("{}/", marker)) {
-            root = probe[..pos].to_string();
-        }
-    }
-    Ok(root)
 }
 
-/// One side of a comparison: an index directory and its crawl root.
-#[derive(Clone, Debug)]
-pub struct DiffSide {
-    pub index: PathBuf,
-    pub root: String,
-}
-
-/// A unit of comparison: one partition, or a partition together with all nested ones.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DiffUnit {
-    /// Partition key (or top-level directory when `subtree` is set).
-    pub name: String,
-    /// Include partitions nested below `name`.
-    pub subtree: bool,
-    pub in_old: bool,
-    pub in_new: bool,
-}
-
-/// Units to compare two indexes by, given their partition keys.
-///
-/// When both indexes were built with the same split spec, every file belongs to the same
-/// partition in both, so partitions are compared one-to-one. Otherwise a file may sit in
-/// different partitions on each side, so whole top-level subtrees are compared instead.
-pub fn diff_units(old: &[String], new: &[String], same_layout: bool) -> Vec<DiffUnit> {
-    let (old_keys, new_keys, subtree) = if same_layout {
-        (old.to_vec(), new.to_vec(), false)
+/// Quote a CSV value when it holds a comma, quote or newline.
+pub fn csv_escape(s: &str) -> String {
+    if s.contains([',', '"', '\n']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
     } else {
-        (top_level_partitions(old), top_level_partitions(new), true)
-    };
-    let all: std::collections::BTreeSet<&String> = old_keys.iter().chain(new_keys.iter()).collect();
-    all.into_iter()
-        .map(|name| DiffUnit {
-            name: name.clone(),
-            // The root partition never has nested partitions.
-            subtree: subtree && name != ROOT_PARTITION,
-            in_old: old_keys.contains(name),
-            in_new: new_keys.contains(name),
-        })
-        .collect()
+        s.to_string()
+    }
 }
 
-impl DiffSide {
-    /// SQL relation for one unit of this side, keyed by path relative to the root.
-    /// Yields a typed empty relation when the unit is absent.
-    fn relation(&self, unit: &DiffUnit, present: bool) -> String {
-        if !present {
-            return "SELECT NULL::VARCHAR AS rel, NULL::BIGINT AS size, NULL::BIGINT AS atime, \
-                    NULL::BIGINT AS mtime, NULL::BIGINT AS ctime, NULL::INTEGER AS uid, \
-                    NULL::INTEGER AS gid, NULL::INTEGER AS mode WHERE false".to_string();
-        }
-        let glob = if unit.subtree {
-            subtree_glob(&self.index, &unit.name)
-        } else {
-            partition_glob(&self.index, &unit.name)
-        };
+/// Render one driver's per-partition progress line from its observed counters.
+///
+/// The line state derives from the counters, never from a thread claim: zero yielded entries
+/// means the driver holds the partition but the walk has produced nothing yet (`waiting`);
+/// entries without completed files mean metadata traversal with nothing countable
+/// (`scanning`, with directories visited and elapsed); completed files mean the lively shape.
+/// Elapsed arrives as whole seconds so the line stays stable between refresh ticks, and the
+/// speed fragment is the caller's verbatim (empty when the rolling window has no sample yet).
+pub fn format_partition_progress(
+    partition: &str,
+    files: u64,
+    bytes: u64,
+    dirs_visited: u64,
+    elapsed_secs: u64,
+    speed_fragment: &str,
+) -> String {
+    if files == 0 && dirs_visited == 0 {
+        format!("{}: waiting... {}s", partition, elapsed_secs)
+    } else if files == 0 {
         format!(
-            "SELECT substr(path, {start}) AS rel, size, atime, mtime, ctime, uid, gid, mode \
-             FROM read_parquet({glob})",
-            start = self.root.chars().count() + 2,
-            glob = sql_quote(&glob),
+            "{}: scanning {} dirs, {}s, no files yet",
+            partition,
+            format_count(dirs_visited),
+            elapsed_secs
+        )
+    } else {
+        format!(
+            "{}: {} files, {}{}",
+            partition,
+            format_count(files),
+            format_bytes(bytes),
+            speed_fragment
         )
     }
 }
 
-/// Build a query comparing one unit (see [`diff_units`]) between an old and new index.
+/// Severity of one stderr log record emitted by a non-TTY run.
 ///
-/// Files are matched on their path relative to each index's root, so indices taken
-/// from different snapshot mount points (e.g. `.snapshots/@GMT-...`) line up.
+/// The tag a script greps for. Three levels cover the crawl's vocabulary: routine progress,
+/// tolerated anomalies, and run-failing faults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    /// The tag text rendered into the record line.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LogLevel::Info => "INFO",
+            LogLevel::Warn => "WARN",
+            LogLevel::Error => "ERROR",
+        }
+    }
+}
+
+/// Render a `SystemTime` as a UTC `YYYY-MM-DDTHH:MM:SSZ` stamp.
 ///
-/// Output columns: `rel, status, size_old, size_new, delta, mtime_old, mtime_new`, plus
-/// `atime, mtime, ctime, uid, gid, mode` taken from the new index (or the old one for
-/// removed files). Sizes of the missing side are 0; `status` is one of [`DIFF_STATUSES`].
-pub fn diff_partition_sql(old: &DiffSide, new: &DiffSide, unit: &DiffUnit) -> String {
+/// Second precision is the cron-correlation granularity this log promises; ordering within
+/// a second is still line order. The conversion is `std` alone: `chrono` arrives only
+/// transitively through `arrow`, and one stamp line does not justify promoting it to a
+/// direct dependency. A pre-epoch time saturates at the epoch rather than failing the run.
+pub fn format_log_timestamp(now: SystemTime) -> String {
+    let secs = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86_400;
+    let time = secs % 86_400;
+    // Days since 1970-01-01 to civil date. The input cannot be negative (pre-epoch
+    // saturates above), so Euclidean division agrees with truncation throughout.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
     format!(
-        r#"
-        WITH a AS ({rel_a}), b AS ({rel_b})
-        SELECT
-            COALESCE(a.rel, b.rel) AS rel,
-            CASE
-                WHEN a.rel IS NULL THEN 'added'
-                WHEN b.rel IS NULL THEN 'removed'
-                WHEN a.size <> b.size OR a.mtime <> b.mtime THEN 'modified'
-                WHEN a.ctime <> b.ctime OR a.uid <> b.uid OR a.gid <> b.gid OR a.mode <> b.mode THEN 'meta'
-                WHEN a.atime <> b.atime THEN 'accessed'
-                ELSE 'unchanged'
-            END AS status,
-            COALESCE(a.size, 0) AS size_old,
-            COALESCE(b.size, 0) AS size_new,
-            COALESCE(b.size, 0) - COALESCE(a.size, 0) AS delta,
-            a.mtime AS mtime_old,
-            b.mtime AS mtime_new,
-            COALESCE(b.atime, a.atime) AS atime,
-            COALESCE(b.mtime, a.mtime) AS mtime,
-            COALESCE(b.ctime, a.ctime) AS ctime,
-            COALESCE(b.uid, a.uid) AS uid,
-            COALESCE(b.gid, a.gid) AS gid,
-            COALESCE(b.mode, a.mode) AS mode
-        FROM a FULL OUTER JOIN b ON a.rel = b.rel
-        "#,
-        rel_a = old.relation(unit, unit.in_old),
-        rel_b = new.relation(unit, unit.in_new),
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year,
+        m,
+        d,
+        time / 3_600,
+        (time % 3_600) / 60,
+        time % 60
     )
 }
 
-/// Like [`diff_partition_sql`], but shaped like an index so existing index queries can run
-/// on it: `path` is absolute under the new root (removed files included), `size` is the
-/// new size, and `size_old` and `status` are added.
-pub fn diff_as_index_sql(old: &DiffSide, new: &DiffSide, unit: &DiffUnit) -> String {
+/// Render one machine-readable stderr log record: `<timestamp> <LEVEL> <message>`.
+///
+/// The message tail is the caller's verbatim apart from line-break folding: a record is one
+/// line by construction, so embedded breaks (legal in Unix paths) become spaces rather than
+/// forging extra lines a script would misread as separate events.
+pub fn format_log_record(level: LogLevel, message: &str) -> String {
+    let single_line: Vec<&str> = message.split(['\r', '\n']).collect();
     format!(
-        "SELECT {root} || '/' || rel AS path, size_new AS size, size_old, \
-         atime, mtime, ctime, uid, gid, mode, status FROM ({diff})",
-        root = sql_quote(&new.root),
-        diff = diff_partition_sql(old, new, unit),
+        "{} {} {}",
+        format_log_timestamp(SystemTime::now()),
+        level.as_str(),
+        single_line.join(" ")
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::path::PathBuf;
 
     #[test]
     fn test_format_count_units() {
@@ -1277,30 +1710,155 @@ mod tests {
         assert_eq!(format_bytes(1024 * 1024 * 2 + 1024 * 512), "2.50 MiB");
     }
 
+    // format_partition_progress() tests
+    #[test]
+    fn test_partition_progress_waiting() {
+        // Zero yielded entries: the driver holds the partition but the walk has produced
+        // nothing, so the line waits rather than borrowing the active word.
+        assert_eq!(
+            format_partition_progress("alice", 0, 0, 0, 0, ""),
+            "alice: waiting... 0s"
+        );
+        assert_eq!(
+            format_partition_progress("alice", 0, 0, 0, 47, ""),
+            "alice: waiting... 47s"
+        );
+    }
+
+    #[test]
+    fn test_partition_progress_quiet_scanning() {
+        // Entries without completed files: metadata traversal with nothing countable yet.
+        assert_eq!(
+            format_partition_progress("alice", 0, 0, 3, 12, ""),
+            "alice: scanning 3 dirs, 12s, no files yet"
+        );
+        // Directory counts scale the way file counts do.
+        assert_eq!(
+            format_partition_progress("alice", 0, 0, 1500, 61, ""),
+            "alice: scanning 1.5K dirs, 61s, no files yet"
+        );
+    }
+
+    #[test]
+    fn test_partition_progress_lively() {
+        // Completed files: counts and bytes, with the caller's speed fragment verbatim.
+        assert_eq!(
+            format_partition_progress("alice", 2, 2048, 5, 3, ""),
+            "alice: 2 files, 2.00 KiB"
+        );
+        assert_eq!(
+            format_partition_progress(
+                "alice",
+                1500,
+                4096,
+                9,
+                3,
+                " | 1.5k files/s (peak: 2.0k files/s)"
+            ),
+            "alice: 1.5K files, 4.00 KiB | 1.5k files/s (peak: 2.0k files/s)"
+        );
+    }
+
+    #[test]
+    fn test_partition_progress_carries_no_thread_claim() {
+        // The regression this cycle exists for: no line state may name a driver or worker.
+        let states = [
+            format_partition_progress("alice", 0, 0, 0, 30, ""),
+            format_partition_progress("alice", 0, 0, 500, 30, ""),
+            format_partition_progress("alice", 10, 1024, 5, 30, ""),
+        ];
+        for msg in &states {
+            assert!(!msg.contains("[T"), "thread claim leaked: {msg}");
+        }
+    }
+
     #[test]
     fn test_format_bytes_gib() {
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GiB");
-        assert_eq!(format_bytes(1024 * 1024 * 1024 * 3 + 1024 * 1024 * 512), "3.50 GiB");
+        assert_eq!(
+            format_bytes(1024 * 1024 * 1024 * 3 + 1024 * 1024 * 512),
+            "3.50 GiB"
+        );
     }
 
     #[test]
     fn test_format_bytes_tib() {
         assert_eq!(format_bytes(1024_u64 * 1024 * 1024 * 1024), "1.00 TiB");
-        assert_eq!(format_bytes(1024_u64 * 1024 * 1024 * 1024 * 2 + 1024_u64 * 1024 * 1024 * 512), "2.50 TiB");
+        assert_eq!(
+            format_bytes(1024_u64 * 1024 * 1024 * 1024 * 2 + 1024_u64 * 1024 * 1024 * 512),
+            "2.50 TiB"
+        );
+    }
+
+    #[test]
+    fn test_log_level_tags() {
+        assert_eq!(LogLevel::Info.as_str(), "INFO");
+        assert_eq!(LogLevel::Warn.as_str(), "WARN");
+        assert_eq!(LogLevel::Error.as_str(), "ERROR");
+    }
+
+    #[test]
+    fn test_format_log_timestamp_epoch() {
+        assert_eq!(format_log_timestamp(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_format_log_timestamp_known_dates() {
+        let at =
+            |secs: u64| format_log_timestamp(UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        assert_eq!(at(946_684_799), "1999-12-31T23:59:59Z");
+        assert_eq!(at(951_868_799), "2000-02-29T23:59:59Z");
+        assert_eq!(at(1_709_210_096), "2024-02-29T12:34:56Z");
+        assert_eq!(at(1_789_009_201), "2026-09-10T03:00:01Z");
+    }
+
+    #[test]
+    fn test_format_log_record_shape() {
+        let record = format_log_record(LogLevel::Info, "Indexing /data");
+        assert!(
+            record.ends_with(" INFO Indexing /data"),
+            "tail stays verbatim: {record}"
+        );
+        let stamp = &record[..20];
+        assert_eq!(&stamp[4..5], "-");
+        assert_eq!(&stamp[7..8], "-");
+        assert_eq!(&stamp[10..11], "T");
+        assert_eq!(&stamp[13..14], ":");
+        assert_eq!(&stamp[16..17], ":");
+        assert_eq!(&stamp[19..20], "Z");
+        assert!(
+            !record.contains('\n') && !record.contains('\r'),
+            "one record is one line: {record:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_log_record_folds_embedded_breaks() {
+        let record = format_log_record(LogLevel::Error, "error: a\nb\rc: denied");
+        assert!(
+            record.ends_with(" ERROR error: a b c: denied"),
+            "breaks fold to spaces: {record:?}"
+        );
     }
 
     #[test]
     fn test_schema_fields() {
         let schema = get_schema();
-        assert_eq!(schema.fields().len(), 8);
-        assert_eq!(schema.field(0).name(), "path");
-        assert_eq!(schema.field(1).name(), "size");
-        assert_eq!(schema.field(2).name(), "atime");
-        assert_eq!(schema.field(3).name(), "mtime");
-        assert_eq!(schema.field(4).name(), "ctime");
-        assert_eq!(schema.field(5).name(), "uid");
-        assert_eq!(schema.field(6).name(), "gid");
-        assert_eq!(schema.field(7).name(), "mode");
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "path", "size", "uid", "gid", "mode", "atime", "mtime", "ctime"
+            ]
+        );
+        for field in schema.fields() {
+            if field.name() == "path" {
+                assert_eq!(field.data_type(), &DataType::Utf8);
+            } else {
+                assert_eq!(field.data_type(), &DataType::Int64);
+            }
+            assert!(!field.is_nullable());
+        }
     }
 
     // SizeMode::calculate() tests
@@ -1376,84 +1934,6 @@ mod tests {
         assert_eq!(round_to_block(mb + 1, mb), 2 * mb);
     }
 
-    // FileRecord tests
-    #[test]
-    fn test_file_record_creation() {
-        let record = FileRecord {
-            path: "/data/users/alice/file.txt".to_string(),
-            size: 1024,
-            atime: 1700000000,
-            mtime: 1699000000,
-            ctime: 1698000000,
-            uid: 1001,
-            gid: 1001,
-            mode: 0o100644,
-        };
-
-        assert_eq!(record.path, "/data/users/alice/file.txt");
-        assert_eq!(record.size, 1024);
-        assert_eq!(record.atime, 1700000000);
-        assert_eq!(record.mtime, 1699000000);
-        assert_eq!(record.ctime, 1698000000);
-        assert_eq!(record.uid, 1001);
-        assert_eq!(record.gid, 1001);
-        assert_eq!(record.mode, 0o100644);
-    }
-
-    #[test]
-    fn test_file_record_equality() {
-        let record1 = FileRecord {
-            path: "/data/file.txt".to_string(),
-            size: 100,
-            atime: 1000,
-            mtime: 900,
-            ctime: 800,
-            uid: 0,
-            gid: 0,
-            mode: 0o100644,
-        };
-        let record2 = FileRecord {
-            path: "/data/file.txt".to_string(),
-            size: 100,
-            atime: 1000,
-            mtime: 900,
-            ctime: 800,
-            uid: 0,
-            gid: 0,
-            mode: 0o100644,
-        };
-        let record3 = FileRecord {
-            path: "/data/other.txt".to_string(),
-            size: 100,
-            atime: 1000,
-            mtime: 900,
-            ctime: 800,
-            uid: 0,
-            gid: 0,
-            mode: 0o100644,
-        };
-
-        assert_eq!(record1, record2);
-        assert_ne!(record1, record3);
-    }
-
-    #[test]
-    fn test_file_record_clone() {
-        let record = FileRecord {
-            path: "/data/file.txt".to_string(),
-            size: 2048,
-            atime: 1600000000,
-            mtime: 1599000000,
-            ctime: 1598000000,
-            uid: 500,
-            gid: 500,
-            mode: 0o100755,
-        };
-        let cloned = record.clone();
-
-        assert_eq!(record, cloned);
-    }
-
     // parse_size() tests
     #[test]
     fn test_parse_size_bytes() {
@@ -1517,18 +1997,27 @@ mod tests {
         assert_eq!(SortMode::CountAsc.next(), SortMode::AgeDesc);
         assert_eq!(SortMode::AgeDesc.next(), SortMode::AgeAsc);
         assert_eq!(SortMode::AgeAsc.next(), SortMode::MtimeDesc);
-        assert_eq!(SortMode::MtimeDesc.next(), SortMode::MtimeAsc);
-        assert_eq!(SortMode::MtimeAsc.next(), SortMode::CtimeDesc);
-        assert_eq!(SortMode::CtimeDesc.next(), SortMode::CtimeAsc);
-        assert_eq!(SortMode::CtimeAsc.next(), SortMode::UidAsc);
-        assert_eq!(SortMode::UidAsc.next(), SortMode::GidAsc);
-        assert_eq!(SortMode::GidAsc.next(), SortMode::ModeAsc);
-        assert_eq!(SortMode::ModeAsc.next(), SortMode::DeltaDesc);
-        assert_eq!(SortMode::DeltaDesc.next(), SortMode::DeltaAsc);
         assert_eq!(SortMode::DeltaAsc.next(), SortMode::Name);
+        assert_eq!(SortMode::Name.prev(), SortMode::DeltaAsc);
         for mode in SortMode::ALL {
             assert_eq!(mode.next().prev(), mode);
+            assert_eq!(mode.to_string().parse::<SortMode>().unwrap(), mode);
         }
+    }
+
+    #[test]
+    fn test_sort_mode_compare_only_and_metadata_orders() {
+        assert!(SortMode::DeltaDesc.is_compare_only());
+        assert!(!SortMode::MtimeDesc.is_compare_only());
+        assert_eq!("delta".parse::<SortMode>().unwrap(), SortMode::DeltaDesc);
+        assert_eq!("shrink".parse::<SortMode>().unwrap(), SortMode::DeltaAsc);
+        assert_eq!(SortMode::MtimeDesc.to_order_by(true), "latest_mtime ASC");
+        assert_eq!(SortMode::UidAsc.to_partition_order_by(), "min_uid ASC");
+        assert_eq!(
+            SortMode::DeltaDesc.to_partition_order_by(),
+            "size_delta DESC"
+        );
+        assert_eq!(SortMode::Name.to_partition_order_by(), "partition");
     }
 
     #[test]
@@ -1537,7 +2026,10 @@ mod tests {
         assert_eq!("size-desc".parse::<SortMode>().unwrap(), SortMode::SizeDesc);
         assert_eq!("size".parse::<SortMode>().unwrap(), SortMode::SizeDesc);
         assert_eq!("size-asc".parse::<SortMode>().unwrap(), SortMode::SizeAsc);
-        assert_eq!("count-desc".parse::<SortMode>().unwrap(), SortMode::CountDesc);
+        assert_eq!(
+            "count-desc".parse::<SortMode>().unwrap(),
+            SortMode::CountDesc
+        );
         assert_eq!("count".parse::<SortMode>().unwrap(), SortMode::CountDesc);
         assert_eq!("count-asc".parse::<SortMode>().unwrap(), SortMode::CountAsc);
         assert_eq!("age-desc".parse::<SortMode>().unwrap(), SortMode::AgeDesc);
@@ -1545,11 +2037,6 @@ mod tests {
         assert_eq!("oldest".parse::<SortMode>().unwrap(), SortMode::AgeDesc);
         assert_eq!("age-asc".parse::<SortMode>().unwrap(), SortMode::AgeAsc);
         assert_eq!("newest".parse::<SortMode>().unwrap(), SortMode::AgeAsc);
-        assert_eq!("delta".parse::<SortMode>().unwrap(), SortMode::DeltaDesc);
-        assert_eq!("shrink".parse::<SortMode>().unwrap(), SortMode::DeltaAsc);
-        for mode in SortMode::ALL {
-            assert_eq!(mode.to_string().parse::<SortMode>().unwrap(), mode);
-        }
     }
 
     #[test]
@@ -1570,7 +2057,10 @@ mod tests {
 
     #[test]
     fn test_sort_mode_order_by() {
-        assert_eq!(SortMode::Name.to_order_by(true), "bool_or(is_dir) DESC, component");
+        assert_eq!(
+            SortMode::Name.to_order_by(true),
+            "bool_or(is_dir) DESC, component"
+        );
         assert_eq!(SortMode::Name.to_order_by(false), "component");
         assert_eq!(SortMode::SizeDesc.to_order_by(true), "total_size DESC");
         assert_eq!(SortMode::SizeAsc.to_order_by(false), "total_size ASC");
@@ -1596,10 +2086,94 @@ mod tests {
     }
 
     #[test]
+    fn test_glob_to_regex_star_crosses_directories() {
+        assert_eq!(glob_to_regex("*.py"), Ok("^(?:.*\\.py)$".to_string()));
+    }
+
+    #[test]
+    fn test_glob_to_regex_literals_are_escaped() {
+        assert_eq!(
+            glob_to_regex("data(2024).log"),
+            Ok("^(?:data\\(2024\\)\\.log)$".to_string())
+        );
+    }
+
+    #[test]
+    fn test_glob_to_regex_question_and_class() {
+        assert_eq!(
+            glob_to_regex("file?.[ch]"),
+            Ok("^(?:file.\\.[ch])$".to_string())
+        );
+        assert_eq!(glob_to_regex("[!a]*"), Ok("^(?:[^a].*)$".to_string()));
+    }
+
+    #[test]
+    fn test_glob_to_regex_backslash_quotes() {
+        assert_eq!(glob_to_regex("a\\*b"), Ok("^(?:a\\*b)$".to_string()));
+    }
+
+    #[test]
+    fn test_glob_to_regex_rejections() {
+        assert!(glob_to_regex("").is_err());
+        assert!(glob_to_regex("[abc").is_err());
+        assert!(glob_to_regex("[]").is_err());
+        assert!(glob_to_regex("abc\\").is_err());
+        assert!(glob_to_regex("a[b\\").is_err());
+    }
+
+    #[test]
+    fn test_glob_to_regex_class_ranges() {
+        assert_eq!(
+            glob_to_regex("*.[a-z]og"),
+            Ok("^(?:.*\\.[a-z]og)$".to_string())
+        );
+        assert_eq!(glob_to_regex("[a-m]*"), Ok("^(?:[a-m].*)$".to_string()));
+        assert_eq!(glob_to_regex("[!0-9]*"), Ok("^(?:[^0-9].*)$".to_string()));
+    }
+
+    #[test]
+    fn test_glob_to_regex_dash_literal_at_class_edges() {
+        assert_eq!(glob_to_regex("[-a]"), Ok("^(?:[-a])$".to_string()));
+        assert_eq!(glob_to_regex("[a-]"), Ok("^(?:[a-])$".to_string()));
+        assert_eq!(glob_to_regex("[!-a]"), Ok("^(?:[^-a])$".to_string()));
+    }
+
+    #[test]
+    fn test_glob_to_regex_descending_range_rejected() {
+        let err = glob_to_regex("*.[z-a]").unwrap_err();
+        assert!(err.contains("Descending range"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_with_path_pattern_glob_and_regex() {
+        let globbed = QueryFilters::new()
+            .with_path_pattern(Some("*.py".to_string()), false)
+            .unwrap();
+        assert_eq!(globbed.pattern, Some("^(?:.*\\.py)$".to_string()));
+        assert_eq!(globbed.pattern_display, Some("*.py".to_string()));
+        assert!(globbed.to_where_clause().contains("regexp_matches"));
+        assert!(globbed.format_display().contains("[/*.py]"));
+
+        let raw = QueryFilters::new()
+            .with_path_pattern(Some("\\.py$".to_string()), true)
+            .unwrap();
+        assert_eq!(raw.pattern, Some("\\.py$".to_string()));
+        assert_eq!(raw.pattern_display, None);
+
+        assert!(
+            QueryFilters::new()
+                .with_path_pattern(Some("[abc".to_string()), false)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_query_filters_size() {
         let filters = QueryFilters::new()
-            .with_min_size(Some("1M")).unwrap()
-            .with_max_size(Some("1G")).unwrap();
+            .with_min_size(Some("1M"))
+            .unwrap()
+            .with_max_size(Some("1G"))
+            .unwrap();
         assert!(filters.is_active());
         let clause = filters.to_where_clause();
         assert!(clause.contains("size >= 1048576"));
@@ -1610,7 +2184,8 @@ mod tests {
     fn test_query_filters_combined() {
         let filters = QueryFilters::new()
             .with_pattern(Some("test".to_string()))
-            .with_min_size(Some("1K")).unwrap();
+            .with_min_size(Some("1K"))
+            .unwrap();
         let clause = filters.to_where_clause();
         assert!(clause.contains("AND"));
         assert!(clause.contains("regexp_matches"));
@@ -1621,7 +2196,8 @@ mod tests {
     fn test_query_filters_clear() {
         let mut filters = QueryFilters::new()
             .with_pattern(Some("test".to_string()))
-            .with_min_size(Some("1K")).unwrap();
+            .with_min_size(Some("1K"))
+            .unwrap();
         assert!(filters.is_active());
         filters.clear();
         assert!(!filters.is_active());
@@ -1629,9 +2205,494 @@ mod tests {
 
     #[test]
     fn test_query_filters_full_where_clause() {
-        let filters = QueryFilters::new()
-            .with_min_size(Some("1M")).unwrap();
+        let filters = QueryFilters::new().with_min_size(Some("1M")).unwrap();
         let clause = filters.to_full_where_clause();
         assert!(clause.starts_with("WHERE "));
+    }
+
+    #[test]
+    fn test_query_filters_owner_group_fragments() {
+        let filters = QueryFilters::new()
+            .with_owner_uid(Some(1000))
+            .with_group_gid(Some(100));
+        assert!(filters.is_active());
+        let clause = filters.to_where_clause();
+        assert!(clause.contains("uid = 1000"));
+        assert!(clause.contains("gid = 100"));
+        assert!(clause.contains("AND"));
+    }
+
+    #[test]
+    fn test_query_filters_mode_fragments() {
+        let exact = QueryFilters::new().with_mode(Some("644")).unwrap();
+        assert!(exact.to_where_clause().contains("mode = 420"));
+
+        let any = QueryFilters::new().with_mode(Some("/002")).unwrap();
+        assert!(any.to_where_clause().contains("(mode & 2) != 0"));
+
+        let all = QueryFilters::new().with_mode(Some("&4000")).unwrap();
+        assert!(all.to_where_clause().contains("(mode & 2048) = 2048"));
+
+        assert!(QueryFilters::new().with_mode(Some("888")).is_err());
+        assert!(QueryFilters::new().with_mode(Some("-002")).is_err());
+    }
+
+    #[test]
+    fn test_parse_mode_spec_matrix() {
+        assert_eq!(parse_mode_spec("644"), Ok(ModePredicate::Exact(0o644)));
+        assert_eq!(parse_mode_spec("0644"), Ok(ModePredicate::Exact(0o644)));
+        assert_eq!(parse_mode_spec("0o755"), Ok(ModePredicate::Exact(0o755)));
+        assert_eq!(parse_mode_spec("/002"), Ok(ModePredicate::Any(0o002)));
+        assert_eq!(parse_mode_spec("&4000"), Ok(ModePredicate::All(0o4000)));
+        assert_eq!(parse_mode_spec("0"), Ok(ModePredicate::Exact(0)));
+        assert_eq!(parse_mode_spec("7777"), Ok(ModePredicate::Exact(0o7777)));
+
+        for bad in [
+            "", "/", "&", "8", "888", "10000", "-002", "u=rwx", "64 4", "0x10",
+        ] {
+            assert!(parse_mode_spec(bad).is_err(), "SPEC '{bad}' must fail");
+        }
+    }
+
+    #[test]
+    fn test_query_filters_mtime_fragments() {
+        let filters = QueryFilters::new()
+            .with_mtime_older_than(Some(30))
+            .with_mtime_newer_than(Some(7));
+        assert!(filters.is_active());
+        let clause = filters.to_where_clause();
+        assert!(clause.contains("mtime < "));
+        assert!(clause.contains("mtime >= "));
+        assert!(clause.contains("AND"));
+
+        let idle = QueryFilters::new()
+            .with_mtime_older_than(None)
+            .with_mtime_newer_than(None);
+        assert!(!idle.is_active());
+    }
+
+    #[test]
+    fn test_query_filters_new_fields_clear_and_display() {
+        let mut filters = QueryFilters::new()
+            .with_owner_uid(Some(1000))
+            .with_group_gid(Some(100))
+            .with_mode(Some("/002"))
+            .unwrap()
+            .with_mtime_older_than(Some(30));
+        let display = filters.format_display();
+        assert!(display.contains("[owner:1000]"));
+        assert!(display.contains("[group:100]"));
+        assert!(display.contains("[mode:/2]"));
+        assert!(display.contains("[mtime-older:30d]"));
+        filters.clear();
+        assert!(!filters.is_active());
+        assert_eq!(filters.to_where_clause(), "");
+    }
+
+    #[test]
+    fn test_resolve_user_lookup_first_then_digits() {
+        let euid = unsafe { libc::geteuid() };
+        let name = unsafe {
+            let entry = libc::getpwuid(euid);
+            assert!(!entry.is_null());
+            std::ffi::CStr::from_ptr((*entry).pw_name)
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(resolve_user(&name), Ok(euid));
+
+        assert!(resolve_user("xdu-no-such-user").is_err());
+        assert!(resolve_user("").is_err());
+        assert!(resolve_user("-1").is_err());
+        assert!(resolve_user("1000x").is_err());
+        assert!(resolve_user("99999999999").is_err());
+        // A pure digit string with no such name is the uid itself.
+        assert_eq!(resolve_user("4294967294"), Ok(4294967294));
+    }
+
+    #[test]
+    fn test_resolve_group_lookup_first_then_digits() {
+        let egid = unsafe { libc::getegid() };
+        let name = unsafe {
+            let entry = libc::getgrgid(egid);
+            assert!(!entry.is_null());
+            std::ffi::CStr::from_ptr((*entry).gr_name)
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(resolve_group(&name), Ok(egid));
+
+        assert!(resolve_group("xdu-no-such-group").is_err());
+        assert!(resolve_group("").is_err());
+        assert!(resolve_group("100x").is_err());
+        assert_eq!(resolve_group("4294967294"), Ok(4294967294));
+    }
+
+    // deterministic_limit_clause() tests
+    #[test]
+    fn test_deterministic_limit_clause_none() {
+        assert_eq!(deterministic_limit_clause(None), "");
+    }
+
+    #[test]
+    fn test_deterministic_limit_clause_some() {
+        assert_eq!(deterministic_limit_clause(Some(1)), "ORDER BY path LIMIT 1");
+        assert_eq!(deterministic_limit_clause(Some(5)), "ORDER BY path LIMIT 5");
+    }
+
+    // index layout: the glob every reader shares
+
+    #[test]
+    fn test_index_glob_all_partitions() {
+        assert_eq!(
+            index_glob(Path::new("/index/scratch"), None),
+            "/index/scratch/**/*.parquet"
+        );
+    }
+
+    #[test]
+    fn test_index_glob_single_partition() {
+        assert_eq!(
+            index_glob(Path::new("/index/scratch"), Some("alice")),
+            "/index/scratch/alice/**/*.parquet"
+        );
+        // The reserved loose-file partition is addressed like any other.
+        assert_eq!(
+            index_glob(Path::new("/index/scratch"), Some(ROOT_PARTITION)),
+            "/index/scratch/__root__/**/*.parquet"
+        );
+    }
+
+    #[test]
+    fn test_index_completion_warning() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let index = dir.path();
+
+        // No marker: a reader should say so, naming the index and the marker.
+        let warning = index_completion_warning(index).expect("markerless index must warn");
+        assert!(warning.contains(&index.display().to_string()));
+        assert!(warning.contains(COMPLETION_MARKER));
+
+        // Marker present: silence.
+        std::fs::write(index.join(COMPLETION_MARKER), "xdu=test\n").unwrap();
+        assert_eq!(index_completion_warning(index), None);
+
+        // A marker recording tolerated errors is present but still not trustworthy: warn, and
+        // do it without the substring the markerless case owns so the two stay distinguishable.
+        std::fs::write(index.join(COMPLETION_MARKER), "xdu=test\nerrors=2\n").unwrap();
+        let warning = index_completion_warning(index).expect("a tolerated-error index must warn");
+        assert!(warning.contains(&index.display().to_string()));
+        assert!(warning.contains("2 tolerated error(s)"));
+        assert!(warning.contains("--allow-errors"));
+        assert!(
+            !warning.contains("completion marker"),
+            "must stay distinguishable from the markerless warning: {warning}"
+        );
+
+        // A clean run records zero, which is nothing to report.
+        std::fs::write(index.join(COMPLETION_MARKER), "xdu=test\nerrors=0\n").unwrap();
+        assert_eq!(index_completion_warning(index), None);
+
+        // Something of that name that is not a file still attests presence, and offers no
+        // body worth reading.
+        std::fs::remove_file(index.join(COMPLETION_MARKER)).unwrap();
+        std::fs::create_dir(index.join(COMPLETION_MARKER)).unwrap();
+        assert_eq!(index_completion_warning(index), None);
+    }
+
+    #[test]
+    fn test_completion_marker_errors_reads_the_writers_body() {
+        // Writer and reader pinned by one test: if `completion_marker_contents` ever renames
+        // or reformats the key, this fails loudly instead of the readers going quietly silent.
+        let body = crawl::completion_marker_contents(
+            &crawl::CrawlStats {
+                errors: 3,
+                ..Default::default()
+            },
+            1_700_000_000,
+        );
+        // The writer stamps the format the gate checks: pin both ends together so a
+        // renamed key fails here instead of refusing every index at query time.
+        assert_eq!(completion_marker_errors(&body), Some(3));
+        assert_eq!(completion_marker_format(&body), Some(INDEX_FORMAT_VERSION));
+        assert_eq!(
+            completion_marker_errors(&crawl::completion_marker_contents(
+                &crawl::CrawlStats::default(),
+                1_700_000_000
+            )),
+            Some(0)
+        );
+
+        // Nothing to say: no key, no body, or a format this version does not understand.
+        assert_eq!(completion_marker_errors(""), None);
+        assert_eq!(completion_marker_errors("xdu=0.4.1\nfiles=10\n"), None);
+        assert_eq!(completion_marker_errors("errors=garbage\n"), None);
+        assert_eq!(completion_marker_errors("errors=-1\n"), None);
+        assert_eq!(completion_marker_errors("errors=\n"), None);
+        assert_eq!(completion_marker_errors("no separator here\n"), None);
+
+        // Stray whitespace, a missing trailing newline, and CRLF all still parse.
+        assert_eq!(completion_marker_errors("errors=4"), Some(4));
+        assert_eq!(completion_marker_errors("errors= 5 \n"), Some(5));
+        assert_eq!(completion_marker_errors("files=1\r\nerrors=6\r\n"), Some(6));
+
+        // The first key trimming to `errors` decides the answer.
+        assert_eq!(completion_marker_errors("errors=1\nerrors=9\n"), Some(1));
+    }
+
+    #[test]
+    fn test_completion_marker_format_parses_the_writers_key() {
+        // The tool release beside it is not a format: a crate version must never read as
+        // compatibility, or every upgrade would refuse every readable index.
+        assert_eq!(completion_marker_format("xdu=7\n"), None);
+        assert_eq!(completion_marker_format(""), None);
+        assert_eq!(completion_marker_format("xdu=0.4.1\nfiles=10\n"), None);
+        assert_eq!(completion_marker_format("format=garbage\n"), None);
+        assert_eq!(completion_marker_format("format=-1\n"), None);
+        assert_eq!(completion_marker_format("format=\n"), None);
+        assert_eq!(completion_marker_format("format=1.5\n"), None);
+        assert_eq!(completion_marker_format("no separator here\n"), None);
+
+        // Stray whitespace, a missing trailing newline, and CRLF all still parse.
+        assert_eq!(completion_marker_format("format=1"), Some(1));
+        assert_eq!(completion_marker_format("format= 2 \n"), Some(2));
+        assert_eq!(completion_marker_format("files=1\r\nformat=3\r\n"), Some(3));
+
+        // The first key trimming to `format` decides the answer.
+        assert_eq!(completion_marker_format("format=4\nformat=9\n"), Some(4));
+    }
+
+    #[test]
+    fn test_index_version_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let index = dir.path();
+
+        // No marker answers nothing about the layout: refuse, directing a re-index.
+        let error = index_version_error(index).expect("markerless index must refuse");
+        assert!(error.contains("no index format version"));
+        assert!(error.contains("re-index"));
+
+        // A pre-versioning marker is versionless, however clean its run was: same refusal.
+        std::fs::write(index.join(COMPLETION_MARKER), "xdu=test\nerrors=0\n").unwrap();
+        let error = index_version_error(index).expect("versionless index must refuse");
+        assert!(error.contains("no index format version"));
+        assert!(error.contains("re-index"));
+
+        // Garbage where the version belongs is not a version.
+        std::fs::write(index.join(COMPLETION_MARKER), "xdu=test\nformat=new\n").unwrap();
+        assert!(index_version_error(index).is_some());
+
+        // A version this build does not understand names both sides of the mismatch.
+        std::fs::write(index.join(COMPLETION_MARKER), "xdu=test\nformat=999\n").unwrap();
+        let error = index_version_error(index).expect("future version must refuse");
+        assert!(error.contains("999"));
+        assert!(error.contains(&INDEX_FORMAT_VERSION.to_string()));
+        assert!(error.contains("re-index"));
+
+        // What the writer emits is accepted, tolerated errors and all — the version gate
+        // passes and the completeness warning stays that function's own job.
+        let body = crawl::completion_marker_contents(
+            &crawl::CrawlStats {
+                errors: 2,
+                ..Default::default()
+            },
+            1_700_000_000,
+        );
+        std::fs::write(index.join(COMPLETION_MARKER), &body).unwrap();
+        assert_eq!(index_version_error(index), None);
+
+        // Something of that name that is not a file cannot vouch for the layout either.
+        std::fs::remove_file(index.join(COMPLETION_MARKER)).unwrap();
+        std::fs::create_dir(index.join(COMPLETION_MARKER)).unwrap();
+        assert!(index_version_error(index).is_some());
+    }
+
+    #[test]
+    fn test_index_completion_warning_does_not_block_on_a_fifo_marker() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join(COMPLETION_MARKER);
+
+        // Opening a FIFO read-only blocks until a writer appears, so reading the body without
+        // first checking the file type would hang every reader forever. An index directory on
+        // shared scratch is routinely group-writable, so this is reachable, not theoretical.
+        let c_path = std::ffi::CString::new(marker.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+
+        let index = dir.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(index_completion_warning(&index));
+        });
+
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(result) => assert_eq!(
+                result, None,
+                "a FIFO marker attests presence and yields no body"
+            ),
+            Err(_) => panic!(
+                "index_completion_warning blocked on a FIFO marker — the file-type guard is gone"
+            ),
+        }
+    }
+
+    fn s3_locator(raw: &str) -> S3Locator {
+        S3Locator::parse(std::ffi::OsStr::new(raw)).unwrap()
+    }
+
+    #[test]
+    fn test_index_glob_s3_shares_the_layout() {
+        let index = s3_locator("s3://bucket/some/prefix/");
+        assert_eq!(
+            index_glob_s3(&index, None),
+            "s3://bucket/some/prefix/**/*.parquet"
+        );
+        assert_eq!(
+            index_glob_s3(&index, Some(ROOT_PARTITION)),
+            "s3://bucket/some/prefix/__root__/**/*.parquet"
+        );
+        // A bucket-root index has no empty segment before the partition.
+        assert_eq!(
+            index_glob_s3(&s3_locator("s3://bucket"), Some("alice")),
+            "s3://bucket/alice/**/*.parquet"
+        );
+    }
+
+    #[test]
+    fn test_parquet_source_keeps_local_sql_byte_for_byte() {
+        // A local glob is text, scoped partitions included nested ones below them.
+        let local = IndexLocator::Local(PathBuf::from("/index/scratch"));
+        assert_eq!(
+            parquet_source(&local, None, false),
+            (
+                "read_parquet('/index/scratch/**/*.parquet')".to_string(),
+                vec![]
+            )
+        );
+        assert_eq!(
+            parquet_source(&local, Some("alice"), true),
+            (
+                "read_parquet('/index/scratch/alice/**/*.parquet', filename=true)".to_string(),
+                vec![]
+            )
+        );
+    }
+
+    #[test]
+    fn test_parquet_source_binds_the_s3_glob() {
+        // A quote in the prefix or the partition would end a literal; bound, it never reaches
+        // the text.
+        let index = IndexLocator::S3(s3_locator("s3://bucket/it's"));
+        assert_eq!(
+            parquet_source(&index, None, false),
+            (
+                "read_parquet(?)".to_string(),
+                vec!["s3://bucket/it's/**/*.parquet".to_string()]
+            )
+        );
+        let (sql, params) = parquet_source(&index, Some("o'brien"), true);
+        assert_eq!(sql, "read_parquet(?, filename=true)");
+        assert_eq!(
+            params,
+            vec!["s3://bucket/it's/o'brien/**/*.parquet".to_string()]
+        );
+        assert!(!sql.contains('\''));
+    }
+
+    #[test]
+    fn test_classify_s3_text_names_each_measured_cause() {
+        assert_eq!(
+            classify_s3_text(
+                "IO Error: SSL server verification failed error for HTTP GET to \
+                 '/b/?encoding-type=url&list-type=2&prefix=p%2F'"
+            ),
+            S3Cause::Untrusted
+        );
+        assert_eq!(
+            classify_s3_text(
+                "IO Error: Could not establish connection error for HTTP GET to '/b/?list-type=2'"
+            ),
+            S3Cause::Unreachable
+        );
+        assert_eq!(
+            classify_s3_text(
+                "HTTP Error: HTTP GET error reading 's3://b/p/b/?list-type=2' in region \
+                 'us-east-1' (HTTP 403 Forbidden)"
+            ),
+            S3Cause::Forbidden
+        );
+        assert_eq!(
+            classify_s3_text(
+                "HTTP Error: HTTP GET error on 'http://h/b/p/.xdu-complete' (HTTP 403)"
+            ),
+            S3Cause::Forbidden
+        );
+        assert_eq!(
+            classify_s3_text(
+                "HTTP Error: HTTP GET error reading 's3://b/p/b/?list-type=2' in region \
+                 'us-east-1' (HTTP 404 Not Found)"
+            ),
+            S3Cause::NotFound
+        );
+        assert_eq!(
+            classify_s3_text(
+                "HTTP Error: Unable to connect to URL \"http://h/b/p/.xdu-complete\": 404 (Not \
+                 Found)."
+            ),
+            S3Cause::NotFound
+        );
+        let other = "HTTP Error: HTTP GET error on 'http://h/b/k' (HTTP 500)";
+        assert_eq!(classify_s3_text(other), S3Cause::Other(other.to_string()));
+    }
+
+    #[test]
+    fn test_marker_gates_refuse_an_oversized_s3_marker_naming_the_cap() {
+        let marker = MarkerRead::Oversized(MARKER_READ_LIMIT + 1);
+        let error = marker_version_error(&marker, "s3://bucket/idx").unwrap();
+        assert!(error.contains("s3://bucket/idx"), "{error}");
+        assert!(error.contains(&MARKER_READ_LIMIT.to_string()), "{error}");
+        assert!(
+            error.contains(&(MARKER_READ_LIMIT + 1).to_string()),
+            "{error}"
+        );
+        // An unread marker adds no detail to warn about, as locally.
+        assert_eq!(marker_completion_warning(&marker, "s3://bucket/idx"), None);
+    }
+
+    #[test]
+    fn test_marker_gates_read_a_body_as_the_local_gates_do() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let index = dir.path();
+        let body = "xdu=0\nerrors=2\nformat=2\n";
+        std::fs::write(index.join(COMPLETION_MARKER), body).unwrap();
+        let shown = index.display().to_string();
+        let read = MarkerRead::Body(body.to_string());
+        assert_eq!(
+            marker_version_error(&read, &shown),
+            index_version_error(index)
+        );
+        assert_eq!(
+            marker_completion_warning(&read, &shown),
+            index_completion_warning(index)
+        );
+        assert!(marker_completion_warning(&read, &shown).is_some());
+        assert_eq!(marker_version_error(&read, &shown), None);
+    }
+
+    #[test]
+    fn test_index_completion_warning_ignores_an_oversized_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let index = dir.path();
+
+        // This body does record errors, but a reader must not pull 64 KiB+ into memory to
+        // find that out — the size guard wins over the key.
+        let mut body = String::from("errors=7\n");
+        body.push_str(&"x".repeat(MARKER_READ_LIMIT as usize + 1));
+        std::fs::write(index.join(COMPLETION_MARKER), &body).unwrap();
+
+        assert_eq!(index_completion_warning(index), None);
     }
 }

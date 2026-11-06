@@ -1,11 +1,12 @@
 [package]
 name = "xdu"
-version = "0.4.1"
+version = "0.5.2"
 edition = "2024"
 license = "MIT"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
 rayon = "1.10"
 parquet = { version = "56", features = ["arrow"] }
 arrow = { version = "56", features = ["chrono-tz"] }
@@ -13,17 +14,43 @@ jwalk = "0.8"
 anyhow = "1"
 indicatif = "0.17"
 console = "0.15"
-duckdb = { version = "1", features = ["bundled"] }
-chrono = "0.4"
+# `bundled` compiles DuckDB but does not link the Parquet reader; `parquet` does. Without it
+# the readers autoinstall a 12 MB extension on first use and cannot query an air-gapped host.
+duckdb = { version = "1", features = ["bundled", "parquet"] }
 infer = "0.19"
-ratatui = "0.29"
-crossterm = "0.28"
+# Runtime NSS (getpwnam/getgrnam) for --owner/--group resolution; also a dev-dep below.
 libc = "0.2"
+ratatui = "0.29"
+# The index manifest (`layout::Manifest`); already in the tree through object_store.
 serde_json = "1"
+crossterm = "0.28"
+# The writer's S3 client for `xdu -o s3://`: PUT, LIST and DELETE, which DuckDB cannot issue.
+# ring is the only crypto provider; OpenSSL, native-tls and aws-lc stay out of the runtime tree,
+# because the release legs' dynamic-library allow-list and glibc floor have proven ring alone.
+object_store = { version = "0.14.2", default-features = false, features = ["aws-base", "reqwest", "ring"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+futures = "0.3"
+bytes = "1"
 
 [dev-dependencies]
 tempfile = "3"
 libc = "0.2"
+# The loopback S3 endpoint the wire tests run in-process: SigV4-checking, file-backed, so no
+# container, cloud account or network beyond 127.0.0.1. Pinned exactly; a 0.x API can churn.
+s3s = "=0.17.0"
+s3s-fs = "=0.17.0"
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+# The s3s `S3` trait is an async-trait; the test endpoint wraps s3s-fs to list keys the way S3
+# encodes them.
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "time"] }
+# The TLS front the certificate tests put before the loopback endpoint: certificates made per
+# run, so no private key is committed and none expires in the tree. ring only, as the runtime
+# tree is: rcgen's defaults are ring, and tokio-rustls' defaults would bring aws-lc.
+rcgen = "=0.14.10"
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring"] }
 
 [[bin]]
 name = "xdu"
@@ -48,6 +75,15 @@ path = "src/bin/xdu-du.rs"
 [[bin]]
 name = "xdu-diff"
 path = "src/bin/xdu-diff.rs"
+
+[[bin]]
+name = "gen-completions"
+path = "src/bin/gen-completions.rs"
+
+# Examples are built but not tested by default; this one's unit tests run with `cargo test`.
+[[example]]
+name = "extension-probe"
+test = true
 
 [profile.release]
 lto = true

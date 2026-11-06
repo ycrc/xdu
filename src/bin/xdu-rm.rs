@@ -1,79 +1,18 @@
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use duckdb::Connection;
 use rayon::prelude::*;
 
-use xdu::{index_glob, parse_size, sql_quote, QueryFilters};
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "xdu-rm",
-    about = "Delete files matching index query criteria",
-    after_help = "Examples:
-  xdu-rm -i /index/scratch -u alice --older-than 180 -n
-  xdu-rm -i /index/scratch -p '\\.tmp$' --force
-  xdu-rm -i /index/scratch --min-size 1G --safe"
-)]
-struct Args {
-    /// Path to the Parquet index directory
-    #[arg(short, long, value_name = "DIR", env = "XDU_INDEX")]
-    index: PathBuf,
-
-    /// Regular expression pattern to match paths
-    #[arg(short, long, value_name = "REGEX")]
-    pattern: Option<String>,
-
-    /// Filter by partition (e.g. a user directory, or a nested path like projects/big); includes nested partitions
-    #[arg(short = 'u', long, value_name = "NAME")]
-    partition: Option<String>,
-
-    /// Minimum file size (e.g., 1K, 10M, 1G)
-    #[arg(long, value_name = "SIZE")]
-    min_size: Option<String>,
-
-    /// Maximum file size (e.g., 1K, 10M, 1G)
-    #[arg(long, value_name = "SIZE")]
-    max_size: Option<String>,
-
-    /// Files not accessed in N days
-    #[arg(long, value_name = "DAYS")]
-    older_than: Option<u64>,
-
-    /// Files accessed within N days
-    #[arg(long, value_name = "DAYS")]
-    newer_than: Option<u64>,
-
-    /// Limit number of files to delete
-    #[arg(short, long)]
-    limit: Option<usize>,
-
-    /// Show what would be deleted without deleting
-    #[arg(short = 'n', long)]
-    dry_run: bool,
-
-    /// Verify file metadata before deletion (re-stat to check atime/size)
-    #[arg(long)]
-    safe: bool,
-
-    /// Skip confirmation prompt
-    #[arg(short, long)]
-    force: bool,
-
-    /// Show detailed output for each file
-    #[arg(short, long)]
-    verbose: bool,
-
-    /// Number of parallel threads for deletion
-    #[arg(short, long, default_value = "4", env = "XDU_JOBS")]
-    jobs: usize,
-}
+use xdu::cli::XduRmArgs;
+use xdu::{
+    QueryFilters, deterministic_limit_clause, index_completion_warning, index_glob,
+    index_version_error, parse_size,
+};
 
 /// File info from the index query
 #[allow(dead_code)]
@@ -84,7 +23,14 @@ struct FileInfo {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = XduRmArgs::parse();
+
+    // Deletion through an S3 index is not built. Refuse before the pool, the index, the
+    // extension directory or any query, so nothing about the refusal depends on them.
+    if xdu::s3::is_s3_locator(args.index.as_os_str()) {
+        eprintln!("xdu-rm: S3 indices are not yet supported by xdu-rm");
+        std::process::exit(1);
+    }
 
     // Configure thread pool
     rayon::ThreadPoolBuilder::new()
@@ -93,18 +39,35 @@ fn main() -> Result<()> {
         .ok(); // Ignore error if pool already initialized
 
     // Resolve index path
-    let index_path = args.index.canonicalize()
+    let index_path = args
+        .index
+        .canonicalize()
         .with_context(|| format!("Index directory not found: {}", args.index.display()))?;
 
-    // Build the glob pattern for Parquet files
-    let glob_pattern = sql_quote(&index_glob(&index_path, args.partition.as_deref()));
+    // Refuse an index whose format version is unknown or unsupported before any
+    // selection: no deletion set may come from an unknown layout.
+    if let Some(error) = index_version_error(&index_path) {
+        return Err(anyhow::anyhow!(error));
+    }
+
+    // An index that never finished, or that finished under --allow-errors, is missing rows —
+    // which for a deletion tool means files it will not consider. Worth saying out loud
+    // before anything is unlinked, the more so because whoever tolerated those errors at
+    // build time is rarely whoever is running this now.
+    if let Some(warning) = index_completion_warning(&index_path) {
+        eprintln!("{}", warning);
+    }
+
+    let glob_pattern = index_glob(&index_path, args.partition.as_deref());
 
     // Connect to DuckDB (in-memory)
-    let conn = Connection::open_in_memory()?;
+    let conn = xdu::engine::open_connection()?;
 
-    // Build filters using shared QueryFilters
+    // Build filters using shared QueryFilters. A glob is translated here; an invalid
+    // one fails before any deletion set is selected rather than at the database.
     let filters = QueryFilters::new()
-        .with_pattern(args.pattern.clone())
+        .with_path_pattern(args.pattern.clone(), args.regex)
+        .map_err(|e| anyhow::anyhow!(e))?
         .with_older_than(args.older_than)
         .with_newer_than(args.newer_than)
         .with_min_size(args.min_size.as_deref())
@@ -114,15 +77,14 @@ fn main() -> Result<()> {
 
     let where_clause = filters.to_full_where_clause();
 
-    let limit_clause = if let Some(n) = args.limit {
-        format!("LIMIT {}", n)
-    } else {
-        String::new()
-    };
+    // A LIMIT without a deterministic ORDER BY returns an arbitrary subset, so --dry-run and
+    // the real run could delete different files. Pair the limit with `ORDER BY path` (the
+    // unique key) so the preview and the real deletion always select identical rows.
+    let limit_clause = deterministic_limit_clause(args.limit);
 
     // Query for matching files
     let sql = format!(
-        "SELECT path, size, atime FROM read_parquet({}) {} {}",
+        "SELECT path, size, atime FROM read_parquet('{}') {} {}",
         glob_pattern, where_clause, limit_clause
     );
 
@@ -174,7 +136,9 @@ fn main() -> Result<()> {
         .as_secs() as i64;
 
     let atime_threshold = args.older_than.map(|days| now - (days as i64 * 86400));
-    let max_size_bytes = args.max_size.as_deref()
+    let max_size_bytes = args
+        .max_size
+        .as_deref()
         .map(parse_size)
         .transpose()
         .map_err(|e| anyhow::anyhow!(e))?;

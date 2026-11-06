@@ -1,0 +1,285 @@
+//! Shared helpers for the real-binary integration tests.
+//!
+//! These drive the actual `xdu` / `xdu-find` binaries (`std::process::Command`) against
+//! throwaway `tempfile` indexes — never a real filesystem — and assert concrete
+//! post-conditions (row counts, files present-or-absent), not merely exit 0.
+//!
+//! `dead_code` is allowed because each test file uses only a subset of these helpers,
+//! and every `tests/*.rs` file compiles the module into its own separate crate.
+#![allow(dead_code)]
+
+pub mod s3;
+
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Path to a binary built for *this* test invocation.
+///
+/// `CARGO_BIN_EXE_<name>` is set by Cargo to the binary compiled for the current test
+/// profile, so the tests never accidentally exercise a stale `target/release` artifact
+/// left over from an earlier build.
+pub fn binary_path(name: &str) -> PathBuf {
+    match name {
+        "xdu" => env!("CARGO_BIN_EXE_xdu").into(),
+        "xdu-find" => env!("CARGO_BIN_EXE_xdu-find").into(),
+        "xdu-rm" => env!("CARGO_BIN_EXE_xdu-rm").into(),
+        "xdu-view" => env!("CARGO_BIN_EXE_xdu-view").into(),
+        "xdu-du" => env!("CARGO_BIN_EXE_xdu-du").into(),
+        "xdu-diff" => env!("CARGO_BIN_EXE_xdu-diff").into(),
+        other => panic!("unknown test binary: {other}"),
+    }
+}
+
+/// Create a test file of a specific byte size, making parent dirs as needed.
+pub fn create_test_file(path: &Path, size: usize) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = File::create(path)?;
+    file.write_all(&vec![b'x'; size])?;
+    Ok(())
+}
+
+/// Set the access time of a file to a specific number of days ago.
+///
+/// Lives here rather than in a single test file: an integration fixture kept private to
+/// one `tests/*.rs` is how that file ends up re-declaring helpers this module already
+/// provides, which is exactly how a defective local `binary_path` survived here.
+pub fn set_atime_days_ago(path: &Path, days: u64) -> std::io::Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let old_time = now - (days * 86400);
+
+    // Get current mtime to preserve it
+    let metadata = fs::metadata(path)?;
+    let mtime = metadata
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Use libc to set atime while preserving mtime
+    let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    let times = [
+        libc::timespec {
+            tv_sec: old_time as i64,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: mtime as i64,
+            tv_nsec: 0,
+        },
+    ];
+    unsafe {
+        if libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Set the modification time of a file to a specific number of days ago.
+///
+/// The mtime mirror of `set_atime_days_ago`: the atime is preserved while the
+/// mtime moves, so `--mtime-older-than` fixtures do not disturb the atime ones.
+pub fn set_mtime_days_ago(path: &Path, days: u64) -> std::io::Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let old_time = now - (days * 86400);
+
+    // Get current atime to preserve it
+    let metadata = fs::metadata(path)?;
+    let atime = metadata
+        .accessed()?
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Use libc to set mtime while preserving atime
+    let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    let times = [
+        libc::timespec {
+            tv_sec: atime as i64,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: old_time as i64,
+            tv_nsec: 0,
+        },
+    ];
+    unsafe {
+        if libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Run `xdu` with arbitrary args; returns (stdout, stderr, success).
+pub fn run_xdu(args: &[&str]) -> (String, String, bool) {
+    let output = Command::new(binary_path("xdu"))
+        .args(args)
+        .output()
+        .expect("failed to spawn xdu");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
+}
+
+/// Build an index over `source` into `index`, asserting success.
+///
+/// Uses `--apparent-size` so sizes are exact and filesystem-independent.
+pub fn build_index(source: &Path, index: &Path) {
+    let (_out, err, ok) = run_xdu(&[
+        "--apparent-size",
+        "-o",
+        index.to_str().unwrap(),
+        source.to_str().unwrap(),
+    ]);
+    assert!(ok, "xdu build failed: {err}");
+}
+
+/// Run `xdu-find` with arbitrary args; returns (stdout, stderr, success).
+pub fn run_find(args: &[&str]) -> (String, String, bool) {
+    let output = Command::new(binary_path("xdu-find"))
+        .args(args)
+        .output()
+        .expect("failed to spawn xdu-find");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
+}
+
+/// Run `xdu-rm` with arbitrary args; returns (stdout, stderr, success).
+pub fn run_rm(args: &[&str]) -> (String, String, bool) {
+    let output = Command::new(binary_path("xdu-rm"))
+        .args(args)
+        .output()
+        .expect("failed to spawn xdu-rm");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
+}
+
+/// Run `xdu-view` with arbitrary args; returns (stdout, stderr, success).
+///
+/// Only the pre-terminal paths are drivable without a TTY: a refusal exits before the
+/// terminal is touched, while an accepted index proceeds into TUI setup and fails
+/// without one.
+pub fn run_view(args: &[&str]) -> (String, String, bool) {
+    let output = Command::new(binary_path("xdu-view"))
+        .args(args)
+        .output()
+        .expect("failed to spawn xdu-view");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
+}
+
+/// Run a project binary with `HOME` redirected; returns (stdout, stderr, success).
+///
+/// `HOME` is the lever for DuckDB's extension cache (`$HOME/.duckdb/extensions`), so
+/// pointing it at an empty directory makes a runtime extension download observable.
+pub fn run_binary_with_home(name: &str, home: &Path, args: &[&str]) -> (String, String, bool) {
+    let output = Command::new(binary_path(name))
+        .args(args)
+        .env("HOME", home)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {name}: {e}"));
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
+}
+
+/// Every regular file beneath `dir`, recursively, sorted.
+///
+/// Returns the paths rather than a count so an assertion can report *what* was written,
+/// not merely that something was.
+pub fn list_files_recursive(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return found;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(list_files_recursive(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Query the index row count, optionally scoped by extra `xdu-find` args.
+pub fn find_count(index: &Path, extra: &[&str]) -> i64 {
+    let mut args: Vec<&str> = vec!["-i", index.to_str().unwrap(), "--count"];
+    args.extend_from_slice(extra);
+    let (out, err, ok) = run_find(&args);
+    assert!(ok, "xdu-find --count failed: {err}");
+    out.trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("non-integer count output: {out:?}"))
+}
+
+/// Sorted list of indexed paths (via `xdu-find -f path`).
+pub fn find_paths(index: &Path) -> Vec<String> {
+    let (out, err, ok) = run_find(&["-i", index.to_str().unwrap(), "-f", "path"]);
+    assert!(ok, "xdu-find -f path failed: {err}");
+    let mut lines: Vec<String> = out.lines().map(|l| l.to_string()).collect();
+    lines.sort();
+    lines
+}
+
+/// Count leftover `*.partial` files anywhere under the index directory.
+pub fn count_partials(index: &Path) -> usize {
+    let mut count = 0;
+    let entries = match fs::read_dir(index) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    for part in entries.filter_map(|e| e.ok()) {
+        let p = part.path();
+        if p.is_dir()
+            && let Ok(chunks) = fs::read_dir(&p)
+        {
+            for chunk in chunks.filter_map(|e| e.ok()) {
+                if chunk.file_name().to_string_lossy().ends_with(".partial") {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Count finalized `*.parquet` chunk files inside one partition dir of the index.
+pub fn count_chunks(index: &Path, partition: &str) -> usize {
+    let part_dir = index.join(partition);
+    let entries = match fs::read_dir(&part_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".parquet"))
+        .count()
+}

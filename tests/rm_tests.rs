@@ -2,104 +2,19 @@
 //!
 //! These tests create temporary directory structures, build indexes using xdu,
 //! and verify that xdu-rm correctly deletes files based on query criteria.
+//!
+//! Binary resolution and every fixture come from `tests/common`, so each case drives the
+//! artifact Cargo built for the profile under test rather than whatever happens to be
+//! sitting in `target/release`.
 
-use std::fs::{self, File};
+mod common;
+
+use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
 
-/// Get the path to a built binary.
-fn binary_path(name: &str) -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("target");
-    // Try release first, then debug
-    let release_path = path.join("release").join(name);
-    if release_path.exists() {
-        return release_path;
-    }
-    path.join("debug").join(name)
-}
-
-/// Create a test file with specific content size.
-fn create_test_file(path: &Path, size: usize) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = File::create(path)?;
-    file.write_all(&vec![b'x'; size])?;
-    Ok(())
-}
-
-/// Set the access time of a file to a specific number of days ago.
-fn set_atime_days_ago(path: &Path, days: u64) -> std::io::Result<()> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let old_time = now - (days * 86400);
-
-    // Get current mtime to preserve it
-    let metadata = fs::metadata(path)?;
-    let mtime = metadata
-        .modified()?
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    // Use libc to set atime while preserving mtime
-    let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    let times = [
-        libc::timespec {
-            tv_sec: old_time as i64,
-            tv_nsec: 0,
-        },
-        libc::timespec {
-            tv_sec: mtime as i64,
-            tv_nsec: 0,
-        },
-    ];
-    unsafe {
-        if libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-/// Build an index using xdu.
-/// Uses --apparent-size for consistent test results (disk usage varies by filesystem).
-fn build_index(source: &Path, index: &Path) -> std::io::Result<()> {
-    let output = Command::new(binary_path("xdu"))
-        .arg("--apparent-size")
-        .arg("-o")
-        .arg(index)
-        .arg(source)
-        .output()?;
-
-    if !output.status.success() {
-        eprintln!("xdu stderr: {}", String::from_utf8_lossy(&output.stderr));
-        return Err(std::io::Error::other(
-            format!("xdu failed: {}", String::from_utf8_lossy(&output.stderr)),
-        ));
-    }
-    Ok(())
-}
-
-/// Run xdu-rm and return (stdout, stderr, success).
-fn run_xdu_rm(args: &[&str]) -> std::io::Result<(String, String, bool)> {
-    let output = Command::new(binary_path("xdu-rm"))
-        .args(args)
-        .output()?;
-
-    Ok((
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-        output.status.success(),
-    ))
-}
+use common::{build_index, create_test_file, run_rm, set_atime_days_ago};
 
 // =============================================================================
 // Test: Basic dry-run shows files without deleting
@@ -117,13 +32,10 @@ fn test_dry_run_lists_files_without_deleting() {
     create_test_file(&source.join("user1/file2.txt"), 200).unwrap();
 
     // Build index
-    build_index(&source, &index).unwrap();
+    build_index(&source, &index);
 
     // Run dry-run
-    let (stdout, _stderr, success) = run_xdu_rm(&[
-        "-i", index.to_str().unwrap(),
-        "--dry-run",
-    ]).unwrap();
+    let (stdout, _stderr, success) = run_rm(&["-i", index.to_str().unwrap(), "--dry-run"]);
 
     assert!(success);
     assert!(stdout.contains("file1.txt"));
@@ -150,16 +62,13 @@ fn test_force_delete_removes_files() {
     create_test_file(&source.join("user1/delete_me.txt"), 100).unwrap();
 
     // Build index
-    build_index(&source, &index).unwrap();
+    build_index(&source, &index);
 
     // Verify file exists before deletion
     assert!(source.join("user1/delete_me.txt").exists());
 
     // Run with --force to skip confirmation
-    let (stdout, _stderr, success) = run_xdu_rm(&[
-        "-i", index.to_str().unwrap(),
-        "--force",
-    ]).unwrap();
+    let (stdout, _stderr, success) = run_rm(&["-i", index.to_str().unwrap(), "--force"]);
 
     assert!(success);
     assert!(stdout.contains("Deleted: 1"));
@@ -185,14 +94,16 @@ fn test_pattern_filter_deletes_matching_files() {
     create_test_file(&source.join("user1/also_delete.log"), 100).unwrap();
 
     // Build index
-    build_index(&source, &index).unwrap();
+    build_index(&source, &index);
 
     // Delete only .log files
-    let (stdout, _stderr, success) = run_xdu_rm(&[
-        "-i", index.to_str().unwrap(),
-        "--pattern", "\\.log$",
+    let (stdout, _stderr, success) = run_rm(&[
+        "-i",
+        index.to_str().unwrap(),
+        "--pattern",
+        "*.log",
         "--force",
-    ]).unwrap();
+    ]);
 
     assert!(success);
     assert!(stdout.contains("Deleted: 2"));
@@ -201,6 +112,69 @@ fn test_pattern_filter_deletes_matching_files() {
     assert!(source.join("user1/keep.txt").exists());
     assert!(!source.join("user1/delete.log").exists());
     assert!(!source.join("user1/also_delete.log").exists());
+}
+
+// =============================================================================
+// Test: --regex restores regular-expression matching
+// =============================================================================
+
+#[test]
+fn test_regex_flag_restores_regex_matching() {
+    let temp_dir = TempDir::new().unwrap();
+    let source = temp_dir.path().join("source");
+    let index = temp_dir.path().join("index");
+
+    // Same mixed fixture as the glob pattern test above.
+    fs::create_dir_all(source.join("user1")).unwrap();
+    create_test_file(&source.join("user1/keep.txt"), 100).unwrap();
+    create_test_file(&source.join("user1/delete.log"), 100).unwrap();
+    create_test_file(&source.join("user1/also_delete.log"), 100).unwrap();
+
+    // Build index
+    build_index(&source, &index);
+
+    // The old regex spelling keeps working behind the opt-in switch.
+    let (stdout, _stderr, success) = run_rm(&[
+        "-i",
+        index.to_str().unwrap(),
+        "--pattern",
+        "\\.log$",
+        "--regex",
+        "--force",
+    ]);
+
+    assert!(success);
+    assert!(stdout.contains("Deleted: 2"));
+
+    // Verify correct files remain
+    assert!(source.join("user1/keep.txt").exists());
+    assert!(!source.join("user1/delete.log").exists());
+    assert!(!source.join("user1/also_delete.log").exists());
+}
+
+// =============================================================================
+// Test: An invalid glob deletes nothing
+// =============================================================================
+
+#[test]
+fn test_invalid_glob_deletes_nothing() {
+    let temp_dir = TempDir::new().unwrap();
+    let source = temp_dir.path().join("source");
+    let index = temp_dir.path().join("index");
+
+    fs::create_dir_all(source.join("user1")).unwrap();
+    create_test_file(&source.join("user1/keep.log"), 100).unwrap();
+
+    // Build index
+    build_index(&source, &index);
+
+    // Rejection happens before any deletion set is selected, so --force is safe here.
+    let (_stdout, stderr, success) =
+        run_rm(&["-i", index.to_str().unwrap(), "--pattern", "[", "--force"]);
+
+    assert!(!success);
+    assert!(stderr.contains("Unterminated character class"));
+    assert!(source.join("user1/keep.log").exists());
 }
 
 // =============================================================================
@@ -219,14 +193,11 @@ fn test_min_size_filter() {
     create_test_file(&source.join("user1/large.txt"), 10000).unwrap();
 
     // Build index
-    build_index(&source, &index).unwrap();
+    build_index(&source, &index);
 
     // Delete only files >= 1K
-    let (stdout, _stderr, success) = run_xdu_rm(&[
-        "-i", index.to_str().unwrap(),
-        "--min-size", "1K",
-        "--force",
-    ]).unwrap();
+    let (stdout, _stderr, success) =
+        run_rm(&["-i", index.to_str().unwrap(), "--min-size", "1K", "--force"]);
 
     assert!(success);
     assert!(stdout.contains("Deleted: 1"));
@@ -248,14 +219,11 @@ fn test_max_size_filter() {
     create_test_file(&source.join("user1/large.txt"), 10000).unwrap();
 
     // Build index
-    build_index(&source, &index).unwrap();
+    build_index(&source, &index);
 
     // Delete only files <= 1K
-    let (stdout, _stderr, success) = run_xdu_rm(&[
-        "-i", index.to_str().unwrap(),
-        "--max-size", "1K",
-        "--force",
-    ]).unwrap();
+    let (stdout, _stderr, success) =
+        run_rm(&["-i", index.to_str().unwrap(), "--max-size", "1K", "--force"]);
 
     assert!(success);
     assert!(stdout.contains("Deleted: 1"));
@@ -285,14 +253,16 @@ fn test_older_than_filter() {
     // recent.txt keeps current atime
 
     // Build index
-    build_index(&source, &index).unwrap();
+    build_index(&source, &index);
 
     // Delete only files older than 30 days
-    let (stdout, _stderr, success) = run_xdu_rm(&[
-        "-i", index.to_str().unwrap(),
-        "--older-than", "30",
+    let (stdout, _stderr, success) = run_rm(&[
+        "-i",
+        index.to_str().unwrap(),
+        "--older-than",
+        "30",
         "--force",
-    ]).unwrap();
+    ]);
 
     assert!(success);
     assert!(stdout.contains("Deleted: 1"));
@@ -319,14 +289,16 @@ fn test_partition_filter() {
     create_test_file(&source.join("bob/file.txt"), 100).unwrap();
 
     // Build index
-    build_index(&source, &index).unwrap();
+    build_index(&source, &index);
 
     // Delete only alice's files
-    let (stdout, _stderr, success) = run_xdu_rm(&[
-        "-i", index.to_str().unwrap(),
-        "--partition", "alice",
+    let (stdout, _stderr, success) = run_rm(&[
+        "-i",
+        index.to_str().unwrap(),
+        "--partition",
+        "alice",
         "--force",
-    ]).unwrap();
+    ]);
 
     assert!(success);
     assert!(stdout.contains("Deleted: 1"));
@@ -353,14 +325,11 @@ fn test_limit_option() {
     create_test_file(&source.join("user1/file3.txt"), 100).unwrap();
 
     // Build index
-    build_index(&source, &index).unwrap();
+    build_index(&source, &index);
 
     // Delete only 1 file
-    let (stdout, _stderr, success) = run_xdu_rm(&[
-        "-i", index.to_str().unwrap(),
-        "--limit", "1",
-        "--force",
-    ]).unwrap();
+    let (stdout, _stderr, success) =
+        run_rm(&["-i", index.to_str().unwrap(), "--limit", "1", "--force"]);
 
     assert!(success);
     assert!(stdout.contains("Deleted: 1"));
@@ -371,6 +340,50 @@ fn test_limit_option() {
         .filter_map(|e| e.ok())
         .collect();
     assert_eq!(remaining.len(), 2);
+}
+
+// =============================================================================
+// Test: --limit selects a deterministic, stable set (dry-run == real run)
+// =============================================================================
+
+#[test]
+fn test_limit_deterministic_selection() {
+    let temp_dir = TempDir::new().unwrap();
+    let source = temp_dir.path().join("source");
+    let index = temp_dir.path().join("index");
+
+    // Five files with an unambiguous lexicographic order.
+    fs::create_dir_all(source.join("user1")).unwrap();
+    for name in ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"] {
+        create_test_file(&source.join("user1").join(name), 100).unwrap();
+    }
+
+    build_index(&source, &index);
+
+    // Two dry-runs with --limit 3 must produce byte-identical output (R1).
+    let (out1, _e1, ok1) = run_rm(&["-i", index.to_str().unwrap(), "--limit", "3", "--dry-run"]);
+    let (out2, _e2, ok2) = run_rm(&["-i", index.to_str().unwrap(), "--limit", "3", "--dry-run"]);
+    assert!(ok1 && ok2);
+    assert_eq!(out1, out2, "two --dry-run --limit runs diverged");
+
+    // The three lexicographically-smallest paths are selected (R3).
+    assert!(out1.contains("a.txt"));
+    assert!(out1.contains("b.txt"));
+    assert!(out1.contains("c.txt"));
+    assert!(!out1.contains("d.txt"));
+    assert!(!out1.contains("e.txt"));
+    assert!(out1.contains("3 file(s) would be deleted"));
+
+    // The real run deletes exactly what the dry-run previewed (R2).
+    let (out3, _e3, ok3) = run_rm(&["-i", index.to_str().unwrap(), "--limit", "3", "--force"]);
+    assert!(ok3);
+    assert!(out3.contains("Deleted: 3"));
+
+    assert!(!source.join("user1/a.txt").exists());
+    assert!(!source.join("user1/b.txt").exists());
+    assert!(!source.join("user1/c.txt").exists());
+    assert!(source.join("user1/d.txt").exists());
+    assert!(source.join("user1/e.txt").exists());
 }
 
 // =============================================================================
@@ -391,7 +404,7 @@ fn test_safe_mode_protects_recently_accessed_files() {
     set_atime_days_ago(&source.join("user1/important.txt"), 90).unwrap();
 
     // Build the index (captures the old atime)
-    build_index(&source, &index).unwrap();
+    build_index(&source, &index);
 
     // Now simulate the user accessing the file AFTER the index was built
     // This updates the atime to now
@@ -400,13 +413,15 @@ fn test_safe_mode_protects_recently_accessed_files() {
     // Attempt to delete with --safe mode
     // Without --safe, the file would be deleted because the INDEX shows it as old
     // With --safe, the file should be PROTECTED because its CURRENT atime is recent
-    let (stdout, _stderr, success) = run_xdu_rm(&[
-        "-i", index.to_str().unwrap(),
-        "--older-than", "30",
+    let (stdout, _stderr, success) = run_rm(&[
+        "-i",
+        index.to_str().unwrap(),
+        "--older-than",
+        "30",
         "--safe",
         "--force",
         "--verbose",
-    ]).unwrap();
+    ]);
 
     assert!(success);
 
@@ -434,7 +449,7 @@ fn test_safe_mode_protects_files_that_grew() {
     create_test_file(&source.join("user1/growing.txt"), 100).unwrap();
 
     // Build the index (captures the small size)
-    build_index(&source, &index).unwrap();
+    build_index(&source, &index);
 
     // Now the file grows (user added data)
     {
@@ -448,13 +463,15 @@ fn test_safe_mode_protects_files_that_grew() {
     // Attempt to delete files <= 1K with --safe mode
     // Without --safe, it would try to delete (index shows 100 bytes)
     // With --safe, it should skip because current size is > 1K
-    let (stdout, _stderr, success) = run_xdu_rm(&[
-        "-i", index.to_str().unwrap(),
-        "--max-size", "1K",
+    let (stdout, _stderr, success) = run_rm(&[
+        "-i",
+        index.to_str().unwrap(),
+        "--max-size",
+        "1K",
         "--safe",
         "--force",
         "--verbose",
-    ]).unwrap();
+    ]);
 
     assert!(success);
 
@@ -483,17 +500,14 @@ fn test_handles_missing_files_gracefully() {
     create_test_file(&source.join("user1/will_be_gone.txt"), 100).unwrap();
 
     // Build index
-    build_index(&source, &index).unwrap();
+    build_index(&source, &index);
 
     // Delete one file manually (simulating external deletion)
     fs::remove_file(source.join("user1/will_be_gone.txt")).unwrap();
 
     // Run xdu-rm
-    let (stdout, _stderr, success) = run_xdu_rm(&[
-        "-i", index.to_str().unwrap(),
-        "--force",
-        "--verbose",
-    ]).unwrap();
+    let (stdout, _stderr, success) =
+        run_rm(&["-i", index.to_str().unwrap(), "--force", "--verbose"]);
 
     assert!(success);
     assert!(stdout.contains("Missing: 1"));
@@ -516,14 +530,11 @@ fn test_verbose_output() {
     create_test_file(&source.join("user1/file2.txt"), 100).unwrap();
 
     // Build index
-    build_index(&source, &index).unwrap();
+    build_index(&source, &index);
 
     // Run with verbose
-    let (stdout, _stderr, success) = run_xdu_rm(&[
-        "-i", index.to_str().unwrap(),
-        "--force",
-        "--verbose",
-    ]).unwrap();
+    let (stdout, _stderr, success) =
+        run_rm(&["-i", index.to_str().unwrap(), "--force", "--verbose"]);
 
     assert!(success);
     assert!(stdout.contains("DELETE:"));
@@ -546,14 +557,16 @@ fn test_no_matching_files() {
     create_test_file(&source.join("user1/file.txt"), 100).unwrap();
 
     // Build index
-    build_index(&source, &index).unwrap();
+    build_index(&source, &index);
 
     // Search for non-existent pattern
-    let (stdout, _stderr, success) = run_xdu_rm(&[
-        "-i", index.to_str().unwrap(),
-        "--pattern", "\\.nonexistent$",
+    let (stdout, _stderr, success) = run_rm(&[
+        "-i",
+        index.to_str().unwrap(),
+        "--pattern",
+        "*.nonexistent",
         "--force",
-    ]).unwrap();
+    ]);
 
     assert!(success);
     assert!(stdout.contains("No matching files found"));
@@ -588,16 +601,20 @@ fn test_combined_filters() {
     set_atime_days_ago(&source.join("user1/old_small.log"), 90).unwrap();
 
     // Build index
-    build_index(&source, &index).unwrap();
+    build_index(&source, &index);
 
     // Delete only files that are: .log AND older than 30 days AND >= 1K
-    let (stdout, _stderr, success) = run_xdu_rm(&[
-        "-i", index.to_str().unwrap(),
-        "--pattern", "\\.log$",
-        "--older-than", "30",
-        "--min-size", "1K",
+    let (stdout, _stderr, success) = run_rm(&[
+        "-i",
+        index.to_str().unwrap(),
+        "--pattern",
+        "*.log",
+        "--older-than",
+        "30",
+        "--min-size",
+        "1K",
         "--force",
-    ]).unwrap();
+    ]);
 
     assert!(success);
     assert!(stdout.contains("Deleted: 1"));
@@ -624,17 +641,51 @@ fn test_safe_mode_without_relevant_filter_still_deletes() {
     create_test_file(&source.join("user1/file.txt"), 100).unwrap();
 
     // Build index
-    build_index(&source, &index).unwrap();
+    build_index(&source, &index);
 
     // Run with --safe but no --older-than or --max-size
     // Safe mode has nothing to check, so deletion proceeds
-    let (stdout, _stderr, success) = run_xdu_rm(&[
-        "-i", index.to_str().unwrap(),
-        "--safe",
-        "--force",
-    ]).unwrap();
+    let (stdout, _stderr, success) = run_rm(&["-i", index.to_str().unwrap(), "--safe", "--force"]);
 
     assert!(success);
     assert!(stdout.contains("Deleted: 1"));
     assert!(!source.join("user1/file.txt").exists());
+}
+
+// =============================================================================
+// Test: An S3 index locator is refused before anything else runs
+// =============================================================================
+
+/// `xdu-rm` refuses an `s3://` locator from `-i` or `XDU_INDEX` with one line and exit 1. A
+/// garbage `httpfs` stands in `XDU_EXTENSION_DIR`, so an extension load would have printed its
+/// own failure; an index lookup or a query would have printed theirs, and a selection would
+/// have printed to stdout. The one refusal line, and nothing else, is the proof none ran.
+#[test]
+fn test_s3_locator_is_refused_before_anything_runs() {
+    let extensions = TempDir::new().unwrap();
+    fs::write(
+        extensions.path().join("httpfs.duckdb_extension"),
+        b"not a DuckDB extension",
+    )
+    .unwrap();
+    let hermetic = common::s3::Hermetic::new();
+    for via_env in [false, true] {
+        let mut cmd = hermetic.command("xdu-rm");
+        cmd.env("XDU_EXTENSION_DIR", extensions.path())
+            .args(["--force", "-j", "2"]);
+        if via_env {
+            cmd.env("XDU_INDEX", "s3://bucket/idx");
+        } else {
+            cmd.args(["-i", "s3://bucket/idx"]);
+        }
+        let output = cmd.output().expect("spawn xdu-rm");
+        assert_eq!(output.status.code(), Some(1), "via_env={via_env}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "xdu-rm: S3 indices are not yet supported by xdu-rm\n",
+            "via_env={via_env}"
+        );
+        assert!(output.stdout.is_empty(), "via_env={via_env}");
+    }
+    hermetic.assert_left_empty();
 }
