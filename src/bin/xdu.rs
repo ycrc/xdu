@@ -13,7 +13,7 @@ use arrow::datatypes::Schema;
 use clap::Parser;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use jwalk::{Parallelism, WalkDir};
+use jwalk::{Parallelism, WalkDirGeneric};
 use rayon::ThreadPoolBuilder;
 
 use xdu::cli::XduArgs;
@@ -38,7 +38,9 @@ use xdu::{
 /// Concurrency contract (must be preserved):
 /// - A single shared rayon thread pool (N threads) backs *all* jwalk walkers, so
 ///   work-stealing balances directory reads across active partitions and one huge
-///   partition can't starve the rest.
+///   partition can't starve the rest. Files are stat'd on that pool too, inside the
+///   walker's `process_read_dir`, so a single huge partition still spreads its metadata
+///   reads across all N threads.
 /// - C driver threads (`std::thread`s, joined by `thread::scope`) each pull partitions
 ///   from the `Mutex<VecDeque>` work queue and consume their walker serially.
 /// - `thread::scope` propagates the first driver `Err` (or panic under unwind) as the
@@ -252,29 +254,42 @@ fn crawl(
                             // and by no other.
                             let skip = Arc::clone(&split_skip);
                             let base_depth = item.depth;
-                            let walker = WalkDir::new(&item.path)
-                                .parallelism(Parallelism::RayonExistingPool {
-                                    pool: pool.clone(),
-                                    busy_timeout: None,
-                                })
-                                .max_depth(item.max_depth.unwrap_or(usize::MAX))
-                                .skip_hidden(false)
-                                .follow_links(false)
-                                .process_read_dir(move |depth, dir, _, children| {
-                                    // `depth` is None for the walk root's own entry, which is
-                                    // always kept.
-                                    let Some(depth) = depth else { return };
-                                    if !skip.checks_children_at(base_depth + depth) {
-                                        return;
-                                    }
-                                    children.retain(|child| match child {
-                                        Ok(e) => {
-                                            !(e.file_type.is_dir()
-                                                && skip.skips(&dir.join(&e.file_name)))
+                            // Each entry carries its lstat result from the pool thread
+                            // that read its directory. Done in the driver loop instead,
+                            // one partition's stats ran on one thread: a 192M-file GPFS
+                            // partition crawled at ~2,200 files/s while the readers
+                            // queued >100 GB of entries ahead of it.
+                            let walker =
+                                WalkDirGeneric::<((), Option<fs::Metadata>)>::new(&item.path)
+                                    .parallelism(Parallelism::RayonExistingPool {
+                                        pool: pool.clone(),
+                                        busy_timeout: None,
+                                    })
+                                    .max_depth(item.max_depth.unwrap_or(usize::MAX))
+                                    .skip_hidden(false)
+                                    .follow_links(false)
+                                    .process_read_dir(move |depth, dir, _, children| {
+                                        // A failed stat leaves `None`; the driver repeats it to
+                                        // classify and report the error.
+                                        for child in children.iter_mut().flatten() {
+                                            if child.file_type.is_file() {
+                                                child.client_state = child.metadata().ok();
+                                            }
                                         }
-                                        Err(_) => true,
+                                        // `depth` is None for the walk root's own entry, which is
+                                        // always kept.
+                                        let Some(depth) = depth else { return };
+                                        if !skip.checks_children_at(base_depth + depth) {
+                                            return;
+                                        }
+                                        children.retain(|child| match child {
+                                            Ok(e) => {
+                                                !(e.file_type.is_dir()
+                                                    && skip.skips(&dir.join(&e.file_name)))
+                                            }
+                                            Err(_) => true,
+                                        });
                                     });
-                                });
 
                             let mut buffer = PartitionBuffer::new(
                                 item.partition.clone(),
@@ -303,7 +318,7 @@ fn crawl(
                             let mut part_lossy: u64 = 0;
 
                             for entry in walker {
-                                let entry = match entry {
+                                let mut entry = match entry {
                                     Ok(e) => e,
                                     // A jwalk error stands in for a whole unreadable subtree: a
                                     // failed directory read yields one Err in place of all its
@@ -370,7 +385,11 @@ fn crawl(
                                     // between the directory read and this stat. For a regular
                                     // file lstat and stat agree, so sizes and atimes are
                                     // unchanged.
-                                    let metadata = match entry.metadata() {
+                                    let stat = match entry.client_state.take() {
+                                        Some(m) => Ok(m),
+                                        None => entry.metadata(),
+                                    };
+                                    let metadata = match stat {
                                         Ok(m) => m,
                                         // The file raced away (ENOENT) or became unreadable
                                         // between the walk and this stat: benign vs. hard.

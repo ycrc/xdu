@@ -448,9 +448,12 @@ pinned `httpfs`, with the glob a bound parameter (`lib::parquet_source`); `xdu-r
 - **Concurrency (indexer):** a **single** rayon pool (`Parallelism::RayonExistingPool`) backs **all**
   jwalk walkers; up to `--jobs` driver `std::thread`s pull partitions from a `Mutex<VecDeque>` work
   queue; rayon work-stealing balances directory reads across all active walkers so one huge partition
-  can't starve the rest. `std::thread::scope` joins the drivers; the first `Err`/panic fails the run.
-  Thread budget: N pool + C drivers + 1 main, plus, for an `s3://` output, the 2 worker threads of
-  `S3Sink`'s private tokio runtime, which driver threads `block_on` and rayon workers never touch.
+  can't starve the rest. Files are lstat'd on the pool too, in the walker's `process_read_dir`, and
+  the result rides in the entry's `client_state`; a stat in the driver loop would serialize a single
+  partition's metadata reads onto one thread. `std::thread::scope` joins the drivers; the first
+  `Err`/panic fails the run. Thread budget: N pool + C drivers + 1 main, plus, for an `s3://`
+  output, the 2 worker threads of `S3Sink`'s private tokio runtime, which driver threads `block_on`
+  and rayon workers never touch.
 - **Atomic writes:** every write goes through `crawl::IndexSink`. Locally (`LocalSink`) each chunk
   is written to `NNNNNN.parquet.partial`, then `fs::rename`d to `.parquet` in `finalize()` (atomic
   within a dir on POSIX); stale higher-numbered chunks from a prior larger run are pruned up to the

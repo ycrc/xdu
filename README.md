@@ -110,7 +110,7 @@ index/
 **Why xdu is faster than `du` for this use-case:**
 
 1. **Adaptive parallel traversal**: Using jwalk, threads dynamically balance work at every directory level—no partition gets bottlenecked to a single thread
-2. **Parallel metadata**: File stat() calls happen in parallel within the thread pool, critical for high-latency network filesystems
+2. **Parallel metadata**: File stat() calls run on the shared thread pool alongside the directory reads, so even a single huge partition is stat'd in parallel—critical for high-latency network filesystems
 3. **Columnar storage**: Parquet compresses paths efficiently (often 10:1) and enables predicate pushdown
 4. **Buffered writes**: Records accumulate in memory before flushing, minimizing I/O syscalls
 5. **One traversal, many queries**: Build the index once, query it thousands of times instantly
@@ -701,10 +701,13 @@ run also removes partitions for directories that no longer exist.
 Unlike traditional one-thread-per-partition approaches, xdu uses jwalk's adaptive parallelism. Work is dynamically distributed at every directory level:
 
 - When a thread enters a directory with many subdirectories, those subdirectories are redistributed across idle threads
+- File stat() calls run in the same pool tasks as the directory reads, so a whale partition's metadata lookups are spread across all `-j` threads too
 - This eliminates the "long tail" problem where a few large partitions bottleneck the entire crawl
 - A filesystem with 1000 small partitions and 5 "whale" partitions (30M+ files each) now completes in 3-4 hours instead of 10+ hours
 
-Adaptive parallelism balances the *crawl*. A whale partition is still one Parquet unit, though, so
+Adaptive parallelism balances the *crawl*. Each partition still has one driver thread that builds
+its rows and writes its Parquet chunks; that is far cheaper than a network-filesystem stat, but it
+is the remaining serial step in a whale partition. A whale partition is also one Parquet unit, so
 drilling into it in `xdu-view`, diffing it, or re-indexing it with `-p` touches all of its files.
 Splitting it with `--split` (see [Nested Partitions](#nested-partitions)) breaks it into smaller units
 for those operations.

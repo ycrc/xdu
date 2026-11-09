@@ -442,3 +442,51 @@ fn test_view_queries_fold_nested_partitions_and_compare() {
     assert_eq!(names, vec!["added.txt"]);
     assert_eq!(entries[0].change_marker(), '+');
 }
+
+/// Each row carries the metadata of its own file. Stats run on the walker's pool threads
+/// and travel with the directory entry, so a mix-up would store one file's sizes and times
+/// under another's path; distinct mtimes and sizes catch that.
+#[test]
+fn test_metadata_matches_files() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let tree = make_tree();
+    for (i, rel) in FILES.iter().enumerate() {
+        let file = fs::File::options()
+            .write(true)
+            .open(tree.path().join(rel))
+            .unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000 + i as u64))
+            .unwrap();
+    }
+    let index = TempDir::new().unwrap();
+    xdu_ok(
+        tree.path(),
+        index.path(),
+        &["--apparent-size", "--split-depth", "2"],
+    );
+
+    let conn = xdu::engine::open_connection().unwrap();
+    let sql = format!(
+        "SELECT path, size, uid, mode, mtime FROM read_parquet({})",
+        sql_quote(&index_glob(index.path(), None)),
+    );
+    let mut stmt = conn.prepare(&sql).unwrap();
+    let rows: Vec<(String, i64, i64, i64, i64)> = stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(rows.len(), FILES.len());
+    for (path, size, uid, mode, mtime) in rows {
+        let m = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(size, m.len() as i64, "{path}");
+        assert_eq!(uid, i64::from(m.uid()), "{path}");
+        assert_eq!(mode, i64::from(m.mode() & 0o7777), "{path}");
+        assert_eq!(mtime, m.mtime(), "{path}");
+    }
+}
