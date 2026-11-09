@@ -30,6 +30,11 @@ pub const MANIFEST_FILE: &str = "_xdu.json";
 /// The newest manifest layout this xdu reads and the one it writes.
 pub const MANIFEST_VERSION: u64 = 1;
 
+/// The name of GPFS's snapshot directory. Each `@GMT-…` entry below it is a read-only copy
+/// of the tree it sits in, so walking it indexes the same files again under other paths;
+/// `xdu` skips directories of this name unless `--include-snapshots` is given.
+pub const SNAPSHOT_DIR: &str = ".snapshots";
+
 /// Which directories become partitions (split points).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SplitSpec {
@@ -87,6 +92,9 @@ pub struct Manifest {
     /// The size mode's label (`disk-usage`, `apparent-size`, `block-rounded(N)`), recorded so
     /// a `--partition` run that mixes modes can say so.
     pub size_mode: String,
+    /// Whether `.snapshots` directories were walked. `None` for a manifest written before
+    /// the setting existed; that xdu walked them, but whether the tree had any is unknown.
+    pub include_snapshots: Option<bool>,
 }
 
 impl Manifest {
@@ -131,18 +139,22 @@ impl Manifest {
             root,
             split: SplitSpec { depth, patterns },
             size_mode: v["size_mode"].as_str().unwrap_or("").to_string(),
+            include_snapshots: v["include_snapshots"].as_bool(),
         }))
     }
 
     /// Write the manifest through a `.partial` and a rename, so a reader never sees half of it.
     pub fn save(&self, index: &Path) -> Result<()> {
         let split = self.split.normalized();
-        let v = serde_json::json!({
+        let mut v = serde_json::json!({
             "version": self.version,
             "root": self.root,
             "split": { "depth": split.depth, "patterns": split.patterns },
             "size_mode": self.size_mode,
         });
+        if let Some(include) = self.include_snapshots {
+            v["include_snapshots"] = serde_json::Value::Bool(include);
+        }
         let path = index.join(MANIFEST_FILE);
         let tmp = index.join(format!("{}.partial", MANIFEST_FILE));
         std::fs::write(&tmp, format!("{}\n", serde_json::to_string_pretty(&v)?))
@@ -198,13 +210,15 @@ pub struct SplitPoint {
 
 /// Real (non-symlink) subdirectories of `dir` as (lossy name, real name), sorted. An
 /// unreadable directory has none: the crawl reports it as an error when it gets there.
-fn subdirs(dir: &Path) -> Vec<(String, OsString)> {
+/// `.snapshots` is left out unless `include_snapshots`, since the walk will not enter it.
+fn subdirs(dir: &Path, include_snapshots: bool) -> Vec<(String, OsString)> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut names: Vec<(String, OsString)> = rd
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| include_snapshots || e.file_name() != SNAPSHOT_DIR)
         .map(|e| (e.file_name().to_string_lossy().to_string(), e.file_name()))
         .collect();
     names.sort();
@@ -246,9 +260,14 @@ fn explain_missing_dir(root: &Path, rel: &str) -> String {
 /// an error rather than a warning: a typo would otherwise leave a whole subtree in its
 /// parent's partition without a word. Two directories whose names collapse onto one lossy key
 /// are an error too, since both would write the same partition.
+///
+/// Without `include_snapshots`, no split point lies in a `.snapshots` directory: depth and
+/// wildcards pass over it, and a literal path through it is an error, because the walk skips
+/// it and the partition would come out empty.
 pub fn resolve_split_points(
     root: &Path,
     spec: &SplitSpec,
+    include_snapshots: bool,
 ) -> Result<(Vec<SplitPoint>, Vec<String>)> {
     let mut points: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut warnings = Vec::new();
@@ -285,7 +304,7 @@ pub fn resolve_split_points(
     for _ in 0..spec.depth {
         let mut next = Vec::new();
         for parent in &level {
-            for (name, real) in subdirs(&parent.path) {
+            for (name, real) in subdirs(&parent.path, include_snapshots) {
                 let point = child(parent, &name, &real);
                 insert(&mut points, point.clone())?;
                 next.push(point);
@@ -316,13 +335,21 @@ pub fn resolve_split_points(
                 pattern
             );
         }
+        if !include_snapshots && comps.contains(&SNAPSHOT_DIR) {
+            anyhow::bail!(
+                "Split path '{}' is inside a {} directory, which is skipped; pass \
+                 --include-snapshots to index snapshots",
+                pattern,
+                SNAPSHOT_DIR
+            );
+        }
         let mut matches: Vec<SplitPoint> = vec![top.clone()];
         for comp in comps {
             let mut next = Vec::new();
             for parent in &matches {
                 if comp.contains(['*', '?']) {
                     next.extend(
-                        subdirs(&parent.path)
+                        subdirs(&parent.path, include_snapshots)
                             .iter()
                             .filter(|(name, _)| component_glob_match(comp, name))
                             .map(|(name, real)| child(parent, name, real)),
@@ -514,7 +541,8 @@ mod tests {
     #[test]
     fn test_resolve_split_points_depth_and_patterns() {
         let tmp = tree();
-        let (points, warnings) = resolve_split_points(tmp.path(), &SplitSpec::default()).unwrap();
+        let (points, warnings) =
+            resolve_split_points(tmp.path(), &SplitSpec::default(), false).unwrap();
         assert_eq!(split_keys(&points), vec!["alice", "projects"]);
         assert_eq!(points[1].path, tmp.path().join("projects"));
         assert!(warnings.is_empty());
@@ -528,7 +556,7 @@ mod tests {
                 "nope*".into(),
             ],
         };
-        let (points, warnings) = resolve_split_points(tmp.path(), &spec).unwrap();
+        let (points, warnings) = resolve_split_points(tmp.path(), &spec, false).unwrap();
         let points = split_keys(&points);
         assert_eq!(
             points,
@@ -549,9 +577,50 @@ mod tests {
                 depth: 0,
                 patterns: vec![],
             },
+            false,
         )
         .unwrap();
         assert!(points.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_split_points_skips_snapshots() {
+        let tmp = TempDir::new().unwrap();
+        for d in [
+            ".snapshots/@GMT-1/alice",
+            "alice/.snapshots/@GMT-1",
+            "alice/sub",
+        ] {
+            fs::create_dir_all(tmp.path().join(d)).unwrap();
+        }
+        let spec = SplitSpec {
+            depth: 2,
+            patterns: vec!["*/*".into()],
+        };
+        let (points, _) = resolve_split_points(tmp.path(), &spec, false).unwrap();
+        assert_eq!(split_keys(&points), vec!["alice", "alice/sub"]);
+
+        let (points, _) = resolve_split_points(tmp.path(), &spec, true).unwrap();
+        assert_eq!(
+            split_keys(&points),
+            vec![
+                ".snapshots",
+                ".snapshots/@GMT-1",
+                "alice",
+                "alice/.snapshots",
+                "alice/sub"
+            ]
+        );
+
+        let literal = SplitSpec {
+            depth: 1,
+            patterns: vec!["alice/.snapshots".into()],
+        };
+        let msg = resolve_split_points(tmp.path(), &literal, false)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("--include-snapshots"), "{msg}");
+        assert!(resolve_split_points(tmp.path(), &literal, true).is_ok());
     }
 
     #[test]
@@ -567,7 +636,7 @@ mod tests {
                 depth: 1,
                 patterns: vec![pattern.into()],
             };
-            let err = resolve_split_points(tmp.path(), &spec)
+            let err = resolve_split_points(tmp.path(), &spec, false)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(needle), "{pattern}: {err}");
@@ -582,7 +651,7 @@ mod tests {
             depth: 0,
             patterns: vec!["link".into()],
         };
-        let err = resolve_split_points(tmp.path(), &spec)
+        let err = resolve_split_points(tmp.path(), &spec, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("is a symlink"), "{err}");
@@ -601,10 +670,12 @@ mod tests {
                 patterns: vec!["b".into(), "a".into()],
             },
             size_mode: "disk-usage".into(),
+            include_snapshots: Some(true),
         };
         m.save(tmp.path()).unwrap();
         let back = Manifest::load(tmp.path()).unwrap().unwrap();
         assert_eq!(back.root, "/data");
+        assert_eq!(back.include_snapshots, Some(true));
         assert_eq!(back.split.patterns, vec!["a", "b"]);
         assert_eq!(back.split.depth, 2);
         assert!(!tmp.path().join("_xdu.json.partial").exists());

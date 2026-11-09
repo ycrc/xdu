@@ -23,7 +23,7 @@ use xdu::crawl::{
     lossy_path, remove_stale_partition,
 };
 use xdu::layout::{
-    MANIFEST_VERSION, Manifest, SplitPoint, SplitSpec, is_nested, list_partitions,
+    MANIFEST_VERSION, Manifest, SNAPSHOT_DIR, SplitPoint, SplitSpec, is_nested, list_partitions,
     normalize_partition_arg, resolve_split_points, split_keys,
 };
 use xdu::s3::{IndexLocator, ProcessEnv, S3Settings, S3Sink};
@@ -80,6 +80,7 @@ fn crawl(
     partition_filter: Option<&HashSet<String>>,
     recursive: bool,
     allow_errors: bool,
+    include_snapshots: bool,
     is_tty: bool,
 ) -> Result<CrawlStats> {
     // Build shared rayon thread pool for jwalk walkers
@@ -100,6 +101,9 @@ fn crawl(
         let entry = entry?;
         let path = entry.path();
         let ft = entry.file_type()?;
+        if ft.is_dir() && !include_snapshots && entry.file_name() == SNAPSHOT_DIR {
+            continue;
+        }
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         entries.push(TopEntry {
             path,
@@ -150,6 +154,9 @@ fn crawl(
         let mut opts = format!("jobs={jobs}, size={}", size_mode_label(size_mode));
         if allow_errors {
             opts.push_str(", allow-errors");
+        }
+        if include_snapshots {
+            opts.push_str(", include-snapshots");
         }
         let msg = format!("Indexing {}{} ({opts})", top_dir.display(), filter_desc);
         eprintln!("{}", format_log_record(LogLevel::Info, &msg));
@@ -279,6 +286,14 @@ fn crawl(
                                         // `depth` is None for the walk root's own entry, which is
                                         // always kept.
                                         let Some(depth) = depth else { return };
+                                        // Below the root only: a walk root named .snapshots
+                                        // was asked for by name.
+                                        if !include_snapshots {
+                                            children.retain(|child| {
+                                                !matches!(child, Ok(e) if e.file_type.is_dir()
+                                                    && e.file_name == SNAPSHOT_DIR)
+                                            });
+                                        }
                                         if !skip.checks_children_at(base_depth + depth) {
                                             return;
                                         }
@@ -749,6 +764,21 @@ fn run(is_tty: bool) -> Result<()> {
             args.outdir.display()
         );
     }
+    // Snapshots decide which directories are partitions and which files a partition holds,
+    // so a partial run under the other setting would leave the index mixing the two. An index
+    // from before the setting was recorded is not checked.
+    if let Some(ref m) = existing
+        && args.partition.is_some()
+        && let Some(indexed) = m.include_snapshots
+        && indexed != args.include_snapshots
+    {
+        anyhow::bail!(
+            "The existing index in {} was built {} --include-snapshots; repeat that setting, \
+             or run without --partition to rebuild the whole index",
+            args.outdir.display(),
+            if indexed { "with" } else { "without" }
+        );
+    }
     let size_label = size_mode_label(size_mode);
     if let Some(ref m) = existing
         && args.partition.is_some()
@@ -766,7 +796,7 @@ fn run(is_tty: bool) -> Result<()> {
         }
     }
 
-    let (split_points, warnings) = resolve_split_points(&top_dir, &spec)?;
+    let (split_points, warnings) = resolve_split_points(&top_dir, &spec, args.include_snapshots)?;
     for w in &warnings {
         let msg = format!("warning: {w}");
         if is_tty {
@@ -787,6 +817,14 @@ fn run(is_tty: bool) -> Result<()> {
         for name in pf {
             if name == ROOT_PARTITION || keys.contains(name) {
                 continue;
+            }
+            if !args.include_snapshots && name.split('/').any(|c| c == SNAPSHOT_DIR) {
+                anyhow::bail!(
+                    "Partition '{}' is inside a {} directory, which is skipped; pass \
+                     --include-snapshots to index snapshots",
+                    name,
+                    SNAPSHOT_DIR
+                );
             }
             if top_dir.join(name).is_dir() {
                 anyhow::bail!(
@@ -816,6 +854,7 @@ fn run(is_tty: bool) -> Result<()> {
         partition_filter.as_ref(),
         args.recursive,
         args.allow_errors,
+        args.include_snapshots,
         is_tty,
     )?;
 
@@ -851,6 +890,7 @@ fn run(is_tty: bool) -> Result<()> {
             root: top_dir.to_string_lossy().to_string(),
             split: spec.clone(),
             size_mode: size_label.clone(),
+            include_snapshots: Some(args.include_snapshots),
         }
         .save(outdir)
         .with_context(|| format!("Failed to write manifest in {}", outdir.display()))?;

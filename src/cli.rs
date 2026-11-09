@@ -86,6 +86,12 @@ pub struct XduArgs {
     /// every reachable file and exits 0. Vanished-file races are always tolerated.
     #[arg(long)]
     pub allow_errors: bool,
+
+    /// Also index directories named .snapshots (GPFS snapshots). By default they are
+    /// skipped: each snapshot is a copy of the tree around it, so indexing it counts the
+    /// same files again. A --partition run must use the index's existing setting.
+    #[arg(long)]
+    pub include_snapshots: bool,
 }
 
 /// Arguments for `xdu-find` — the index query tool.

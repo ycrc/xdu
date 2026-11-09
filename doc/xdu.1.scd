@@ -6,7 +6,7 @@ xdu - build a distributed file metadata index in Parquet format
 
 # SYNOPSIS
 
-*xdu* _DIR_ *-o* _OUTDIR_ \[*-j* _N_] \[*-B* _N_] \[*--apparent-size*] \[*-k* _SIZE_] \[*-p* _NAMES_ \[*-r*]] \[*--split-depth* _N_] \[*--split* _PATHS_] \[*--split-file* _FILE_] \[*--allow-errors*]
+*xdu* _DIR_ *-o* _OUTDIR_ \[*-j* _N_] \[*-B* _N_] \[*--apparent-size*] \[*-k* _SIZE_] \[*-p* _NAMES_ \[*-r*]] \[*--split-depth* _N_] \[*--split* _PATHS_] \[*--split-file* _FILE_] \[*--allow-errors*] \[*--include-snapshots*]
 
 # DESCRIPTION
 
@@ -75,6 +75,13 @@ _DIR_
 	Continue past unreadable files or directories (permission or I/O
 	errors) instead of failing the run. See _EXIT STATUS_.
 
+*--include-snapshots*
+	Also index directories named .snapshots, where GPFS keeps its snapshots.
+	By default they are skipped wherever they occur: each snapshot is a
+	read-only copy of the tree around it, so indexing it counts the same
+	files again under other paths. A *-p* run must use the setting the index
+	was built with; changing it takes a full run.
+
 *-h*, *--help*
 	Print help information.
 
@@ -98,10 +105,10 @@ a real directory: *xdu* never follows symlinks, and a path through one is
 rejected with an error naming the link. Quote patterns so the shell does not
 expand them.
 
-The crawl root, split settings and size mode are saved in _OUTDIR_/\_xdu.json,
-and later runs reuse them, *-p* runs included. Changing the settings takes a
-full run, which removes the partitions that are no longer split points. Split
-paths are supported only for a local _OUTDIR_.
+The crawl root, split settings, size mode and snapshot setting are saved in
+_OUTDIR_/\_xdu.json. Later runs reuse the split settings, *-p* runs included.
+Changing them takes a full run, which removes the partitions that are no longer
+split points. Split paths are supported only for a local _OUTDIR_.
 
 A nested index records index format version 3 in its completion marker, so a
 reader that globs only one directory level refuses it instead of missing the

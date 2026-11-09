@@ -174,6 +174,12 @@ xdu /home -o /var/lib/xdu/home -j 16 -B 100000
 | `--split-file` | Read `--split` paths from a file | |
 | `--apparent-size` | Report file length instead of disk usage (st_blocks) | |
 | `-k, --block-size` | Round sizes up to block size (e.g., `128K`). Implies `--apparent-size` | |
+| `--include-snapshots` | Also index `.snapshots` directories (GPFS snapshots) | Skipped |
+
+Directories named `.snapshots` are skipped wherever they occur: each GPFS snapshot is a copy of
+the tree around it, so indexing it counts the same files again. A crawl root inside a snapshot
+(e.g. `/fs/.snapshots/@GMT-…/home`) is still indexed. A `-p` run must use the setting the index
+was built with.
 
 ### Querying with xdu-find
 

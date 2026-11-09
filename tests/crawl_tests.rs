@@ -1130,3 +1130,105 @@ fn test_failing_run_logs_error_record_without_marker() {
         "a failed run must not be marked complete"
     );
 }
+
+// =============================================================================
+// .snapshots: skipped by default, walked with --include-snapshots
+// =============================================================================
+
+/// A tree with snapshot copies at the root, in a partition, and deeper; a look-alike name
+/// that must not be skipped; and one loose file.
+fn snapshot_tree(source: &std::path::Path) {
+    for (rel, size) in [
+        ("loose.txt", 10),
+        ("alice/f.txt", 100),
+        ("alice/.snapshotsx/h.txt", 200),
+        ("alice/.snapshots/@GMT-1/f.txt", 100),
+        ("alice/sub/.snapshots/@GMT-1/g.txt", 300),
+        (".snapshots/@GMT-1/alice/f.txt", 100),
+    ] {
+        create_test_file(&source.join(rel), size).unwrap();
+    }
+}
+
+fn xdu_into(source: &std::path::Path, index: &std::path::Path, extra: &[&str]) -> (String, bool) {
+    let mut args = vec![
+        "--apparent-size",
+        "-o",
+        index.to_str().unwrap(),
+        source.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    let (_out, err, ok) = run_xdu(&args);
+    (err, ok)
+}
+
+#[test]
+fn test_snapshots_skipped_by_default() {
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("source");
+    snapshot_tree(&source);
+
+    for depth in ["1", "2"] {
+        let index = tmp.path().join(format!("index-{depth}"));
+        let (err, ok) = xdu_into(&source, &index, &["--split-depth", depth]);
+        assert!(ok, "xdu failed: {err}");
+        let paths = find_paths(&index);
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.contains("/.snapshots/")),
+            "{paths:?}"
+        );
+        assert!(paths.iter().any(|p| p.ends_with(".snapshotsx/h.txt")));
+        // No partition was made for a snapshot directory, at the top or below it.
+        assert!(!index.join(".snapshots").exists());
+        assert!(!index.join("alice/.snapshots").exists());
+    }
+
+    // A crawl root inside a snapshot, as when indexing one snapshot to diff it against
+    // another, is walked: only .snapshots directories below the root are skipped.
+    let index = tmp.path().join("index-snap");
+    let (err, ok) = xdu_into(&source.join(".snapshots/@GMT-1"), &index, &[]);
+    assert!(ok, "xdu failed: {err}");
+    assert_eq!(find_count(&index, &[]), 1);
+}
+
+#[test]
+fn test_include_snapshots_indexes_them() {
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("source");
+    let index = tmp.path().join("index");
+    snapshot_tree(&source);
+
+    let (err, ok) = xdu_into(&source, &index, &["--include-snapshots"]);
+    assert!(ok, "xdu failed: {err}");
+    assert_eq!(find_count(&index, &[]), 6);
+    assert_eq!(find_count(&index, &["-u", ".snapshots"]), 1);
+}
+
+#[test]
+fn test_partition_run_keeps_the_index_snapshot_setting() {
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("source");
+    let index = tmp.path().join("index");
+    snapshot_tree(&source);
+
+    let (err, ok) = xdu_into(&source, &index, &[]);
+    assert!(ok, "xdu failed: {err}");
+
+    let (err, ok) = xdu_into(&source, &index, &["-p", "alice", "--include-snapshots"]);
+    assert!(!ok);
+    assert!(err.contains("without --include-snapshots"), "{err}");
+
+    let (err, ok) = xdu_into(&source, &index, &["-p", ".snapshots"]);
+    assert!(!ok);
+    assert!(err.contains("--include-snapshots"), "{err}");
+
+    let (err, ok) = xdu_into(&source, &index, &["-p", "alice"]);
+    assert!(ok, "xdu failed: {err}");
+    assert_eq!(find_count(&index, &[]), 3);
+
+    // A full run may change the setting.
+    let (err, ok) = xdu_into(&source, &index, &["--include-snapshots"]);
+    assert!(ok, "xdu failed: {err}");
+    assert_eq!(find_count(&index, &[]), 6);
+}

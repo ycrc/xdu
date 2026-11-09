@@ -423,6 +423,11 @@ pinned `httpfs`, with the glob a bound parameter (`lib::parquet_source`); `xdu-r
   `NESTED_INDEX_FORMAT_VERSION` (3) in its marker, so a reader that globs `*/*.parquet` refuses it;
   a flat one stays version 2. Readers accept both (`SUPPORTED_INDEX_FORMATS`). Split specs are
   local-only; an `s3://` index is always flat.
+- **Snapshots:** a directory named `.snapshots` (`layout::SNAPSHOT_DIR`) below the crawl root is
+  skipped unless `--include-snapshots`, in three places that must agree: the top-level listing
+  in `crawl`, the walker's `process_read_dir`, and `resolve_split_points`, or a snapshot could
+  still become a partition. `_xdu.json` records the setting and a `--partition` run refuses the
+  other one; a manifest without the field is not checked.
 - **Run-level completion marker:** `<outdir>/.xdu-complete` (`COMPLETION_MARKER`, `lib.rs`) — a
   dotfile and not a `.parquet`, so the readers' glob never mistakes it for a chunk. Per-chunk
   `.partial`→rename is atomic for one *file* but cannot express whether the **run** finished: when one
