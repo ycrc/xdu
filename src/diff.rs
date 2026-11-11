@@ -50,7 +50,7 @@ pub fn discover_index_root(
         return Ok(m.root);
     }
     let sql = format!(
-        "SELECT min(path), max(path) FROM read_parquet({})",
+        "SELECT min(path), max(path) FROM read_parquet({}, hive_partitioning = false)",
         sql_quote(&index_glob(index, None))
     );
     let (lo, hi): (Option<String>, Option<String>) =
@@ -143,7 +143,7 @@ impl DiffSide {
         };
         format!(
             "SELECT substr(path, {start}) AS rel, size, atime, mtime, ctime, uid, gid, mode \
-             FROM read_parquet({glob})",
+             FROM read_parquet({glob}, hive_partitioning = false)",
             start = self.root.chars().count() + 2,
             glob = sql_quote(&glob),
         )

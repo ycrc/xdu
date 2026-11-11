@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
-# Multi-stage build for the six xdu binaries (xdu, xdu-find, xdu-view, xdu-rm, xdu-du, xdu-diff) and the DuckDB
-# extensions they load from /usr/local/lib/xdu/extensions.
+# Multi-stage build for the eight xdu binaries (xdu, xdu-find, xdu-view, xdu-rm, xdu-cp, xdu-mv,
+# xdu-du, xdu-diff) and the DuckDB extensions they load from /usr/local/lib/xdu/extensions.
 #
 # Usage:
 #   docker build -t xdu .
@@ -49,13 +49,16 @@ COPY packaging/extensions ./packaging/extensions
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release --locked \
-        --bin xdu --bin xdu-find --bin xdu-view --bin xdu-rm --bin xdu-du --bin xdu-diff \
+        --bin xdu --bin xdu-find --bin xdu-view --bin xdu-rm --bin xdu-cp --bin xdu-mv \
+        --bin xdu-du --bin xdu-diff \
         --example extension-probe && \
     mkdir -p /out/bin /probe && \
     cp target/release/xdu \
        target/release/xdu-find \
        target/release/xdu-view \
        target/release/xdu-rm \
+       target/release/xdu-cp \
+       target/release/xdu-mv \
        target/release/xdu-du \
        target/release/xdu-diff \
        /out/bin/ && \
@@ -86,7 +89,7 @@ RUN apt-get update && \
 RUN groupadd --system xdu && \
     useradd --system --gid xdu --home-dir /home/xdu --create-home xdu
 
-# Install the checked tree whole: the four user-facing binaries (release profile already strips
+# Install the checked tree whole: the eight user-facing binaries (release profile already strips
 # them) and lib/xdu/extensions beside them, so the image holds exactly what check.sh loaded.
 COPY --from=builder /out/ /usr/local/
 RUN test -f /usr/local/lib/xdu/extensions/httpfs.duckdb_extension

@@ -2,9 +2,9 @@
 //!
 //! Every statement reads a `Relation`: the index itself, whose `FROM` comes from
 //! `parquet_source` (so a local index gets its glob as text and an S3 index gets
-//! `read_parquet(?)` with its glob bound), or one partition of a comparison against an older
-//! index. The one other value a statement draws from the index, the directory prefix a listing
-//! matches, is bound on the S3 arm as well. Each statement is built by a pure function
+//! `read_parquet(?, …)` with its glob bound, both with Hive detection turned off), or one
+//! partition of a comparison against an older index. The one other value a statement draws
+//! from the index, the directory prefix a listing matches, is bound on the S3 arm as well. Each statement is built by a pure function
 //! returning its text and the values it binds, so a unit test can pin the text without a
 //! connection.
 
@@ -255,8 +255,9 @@ pub fn root_files_in(
 /// The statement listing every top-level partition but `__root__` from a relation with a
 /// `partition` column, with its bound values.
 ///
-/// Not Hive partitioning: the layout uses bare directory names, so `hive_partitioning=true`
-/// would yield no partition column at all. Filters apply before grouping, so only matching
+/// Not Hive partitioning: the layout uses bare directory names, and `parquet_source` turns
+/// Hive detection off, so a partition or index directory named `key=value` reads as a name
+/// and adds no column. Filters apply before grouping, so only matching
 /// files are counted and a partition with none is left out.
 pub fn partitions_in_sql(
     rel: &Relation,
@@ -662,7 +663,7 @@ mod tests {
             let (sql, params) =
                 root_files_in_sql(&Relation::index(&index, Some(ROOT_PARTITION)), &conditions);
             assert!(
-                sql.contains("FROM read_parquet('/index/scratch/__root__/**/*.parquet')"),
+                sql.contains("FROM read_parquet('/index/scratch/__root__/**/*.parquet', hive_partitioning = false)"),
                 "{sql}"
             );
             assert!(params.is_empty());
@@ -671,7 +672,7 @@ mod tests {
                 let (sql, params) =
                     partitions_in_sql(&Relation::index_partitions(&index), &conditions, sort_mode);
                 assert!(
-                    sql.contains("read_parquet('/index/scratch/**/*.parquet', filename=true)"),
+                    sql.contains("read_parquet('/index/scratch/**/*.parquet', hive_partitioning = false, filename=true)"),
                     "{sql}"
                 );
                 assert!(sql.contains("split_part("), "{sql}");
@@ -711,27 +712,36 @@ mod tests {
         for conditions in condition_sets() {
             let (sql, params) =
                 root_files_in_sql(&Relation::index(&index, Some(ROOT_PARTITION)), &conditions);
-            assert!(sql.contains("FROM read_parquet(?)"), "{sql}");
+            assert!(
+                sql.contains("FROM read_parquet(?, hive_partitioning = false)"),
+                "{sql}"
+            );
             assert_eq!(params, vec![glob(ROOT_PARTITION)]);
             assert_bound(&sql);
 
             let (sql, params) = partition_root_sql(&index, "o'brien");
             assert_eq!(
                 sql,
-                "SELECT path FROM read_parquet(?) ORDER BY length(path) LIMIT 1"
+                "SELECT path FROM read_parquet(?, hive_partitioning = false) ORDER BY length(path) LIMIT 1"
             );
             assert_eq!(params, vec![glob("o'brien")]);
 
             for sort_mode in SortMode::ALL {
                 let (sql, params) =
                     partitions_in_sql(&Relation::index_partitions(&index), &conditions, sort_mode);
-                assert!(sql.contains("FROM read_parquet(?, filename=true)"), "{sql}");
+                assert!(
+                    sql.contains("FROM read_parquet(?, hive_partitioning = false, filename=true)"),
+                    "{sql}"
+                );
                 assert_eq!(params, vec![glob("*")]);
                 assert_bound(&sql);
 
                 let rel = Relation::index(&index, Some("o'brien"));
                 let (sql, params) = directory_in_sql(&rel, "/data/x'y", &conditions, sort_mode);
-                assert!(sql.contains("FROM read_parquet(?)"), "{sql}");
+                assert!(
+                    sql.contains("FROM read_parquet(?, hive_partitioning = false)"),
+                    "{sql}"
+                );
                 assert!(sql.contains("starts_with(path, ?)"), "{sql}");
                 // The glob is the first placeholder and the prefix the second.
                 assert_eq!(params, vec![glob("o'brien"), "/data/x'y/".to_string()]);

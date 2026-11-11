@@ -19,27 +19,32 @@ Extreme-scale parallel "du" command with search and TUI viewer.
 
 %build
 cargo build --release --locked \
-    --bin xdu --bin xdu-find --bin xdu-view --bin xdu-rm --bin xdu-du --bin xdu-diff
+    --bin xdu --bin xdu-find --bin xdu-view --bin xdu-rm --bin xdu-cp --bin xdu-mv \
+    --bin xdu-du --bin xdu-diff
 
 %install
 install -D -m 0755 target/release/xdu %{buildroot}%{_bindir}/xdu
 install -D -m 0755 target/release/xdu-find %{buildroot}%{_bindir}/xdu-find
 install -D -m 0755 target/release/xdu-view %{buildroot}%{_bindir}/xdu-view
 install -D -m 0755 target/release/xdu-rm %{buildroot}%{_bindir}/xdu-rm
+install -D -m 0755 target/release/xdu-cp %{buildroot}%{_bindir}/xdu-cp
+install -D -m 0755 target/release/xdu-mv %{buildroot}%{_bindir}/xdu-mv
 install -D -m 0755 target/release/xdu-du %{buildroot}%{_bindir}/xdu-du
 install -D -m 0755 target/release/xdu-diff %{buildroot}%{_bindir}/xdu-diff
 
 # Man pages and shell completions are generated in CI from doc/*.scd and
 # src/cli.rs; they are not part of the tag archive yet, so this package ships
-# the six binaries only until the release tarball becomes the source.
+# the eight binaries only until the release tarball becomes the source.
 
 %files
 %{_bindir}/%{name}
+%{_bindir}/%{name}-cp
+%{_bindir}/%{name}-diff
+%{_bindir}/%{name}-du
 %{_bindir}/%{name}-find
+%{_bindir}/%{name}-mv
 %{_bindir}/%{name}-rm
 %{_bindir}/%{name}-view
-%{_bindir}/%{name}-du
-%{_bindir}/%{name}-diff
 
 %changelog
 * Mon Sep 07 2026 Geoffrey Lentner <glentner@purdue.edu> - 0.4.2-1

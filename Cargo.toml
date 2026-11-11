@@ -1,6 +1,6 @@
 [package]
 name = "xdu"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 license = "MIT"
 
@@ -67,6 +67,14 @@ path = "src/bin/xdu-view.rs"
 [[bin]]
 name = "xdu-rm"
 path = "src/bin/xdu-rm.rs"
+
+[[bin]]
+name = "xdu-cp"
+path = "src/bin/xdu-cp.rs"
+
+[[bin]]
+name = "xdu-mv"
+path = "src/bin/xdu-mv.rs"
 
 [[bin]]
 name = "xdu-du"

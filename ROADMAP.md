@@ -24,26 +24,14 @@ Miller-columns tree view (file-type detection and a scrollable text preview pane
 established too: the release tarball, `install.sh`, the scdoc man pages, and generated shell
 completions (so GitHub issue #4 is effectively resolved). The tarball also carries the DuckDB
 extensions xdu cannot link statically, pinned to its engine version under `lib/xdu/extensions/`, so
-nothing downloads at runtime (record in `spec/duckdb-extension-distribution/`). Everything below
-builds on that baseline.
+nothing downloads at runtime (record in `spec/duckdb-extension-distribution/`). An index can live in
+S3 as well: `xdu -o s3://bucket/prefix` builds straight into a bucket, and `xdu-find` and `xdu-view`
+query it in place over ranged reads, with no local copy (record in `spec/s3-index-target/`).
+`xdu-cp` and `xdu-mv` copy or move exactly the set an index query selects, under `xdu-rm`'s
+dry-run, confirmation and `--safe` model, through one select-act engine in `lib` (record in
+`spec/bulk-copy-move-xdu-cp-mv/`). Everything below builds on that baseline.
 
 ---
-
-## S3 as an index target
-
-Indices today live on local disk, which ties them to the machine that built them. The
-`<partition>/<chunk>.parquet` layout maps directly onto object-store key prefixes, so writing the
-index to S3-compatible storage is cheap — and it unlocks centralized, build-once/read-anywhere
-indices that any tool (or a future web client) can point at without copying files around.
-
-Reading is the half worth stating precisely, because it is the half a first cycle got wrong by
-staging the whole index to a temp directory per query. DuckDB's `httpfs` reads Parquet over HTTP
-range requests: measured against an 80.1 MiB index, `--count` moved 0.13 MiB and a `--top 10` moved
-3.94 MiB, where a staging design pays the full 80.1 MiB every time. The intention is that a query
-costs what the query asks for, not what the index weighs.
-
-*Horizon: mid-term · Depends on: shipped DuckDB extensions, for `httpfs` — met, on `main` since #31 · Refs: in flight as a pilot (build into a bucket; `xdu-find` and `xdu-view` query in place) — see `spec/s3-index-target/`; its deferrals are the eight entries after `S3 as a crawl source` and the debug-build DuckDB entry*
-**Seed:** [`issues/s3-index-target.md`](issues/s3-index-target.md)
 
 ## S3 as a crawl source
 
@@ -58,15 +46,16 @@ no atime — the Unix-only/no-atime assumption no longer holds for every backend
 *Horizon: long-term · Depends on: crawler-source abstraction; expect dedicated research + sub-phases · Refs: —*
 **Seed:** [`issues/s3-crawl-source.md`](issues/s3-crawl-source.md)
 
-## `xdu-rm` against an index in S3
+## `xdu-rm`, `xdu-cp` and `xdu-mv` against an index in S3
 
 The S3 pilot builds an index into a bucket and lets `xdu-find` and `xdu-view` query it in place, but
-`xdu-rm` refuses an `s3://` locator before it reads anything. An operator who keeps one central index
-still needs a local copy of it to run a guarded bulk delete. The deletions stay local; what is missing
-is reading the index in place under every one of `xdu-rm`'s destructive gates unchanged, which is
-high-blast work on the one tool that deletes files.
+`xdu-rm` refuses an `s3://` locator before it reads anything, and `xdu-cp` and `xdu-mv` refuse it
+the same way so that the select-act engine has one S3 posture. An operator who keeps one central
+index still needs a local copy of it to run a guarded bulk delete, copy or move. The file operations
+stay local; what is missing is reading the index in place under every one of the destructive gates
+unchanged, which is high-blast work on the tools that delete and move files.
 
-*Horizon: mid-term · Depends on: S3 as an index target · Refs: `spec/s3-index-target/` (GOAL non-goals, R8)*
+*Horizon: mid-term · Depends on: S3 as an index target — met, on `main` since #33 · Refs: `spec/s3-index-target/` (GOAL non-goals, R8); `spec/bulk-copy-move-xdu-cp-mv/` (GOAL non-goals)*
 **Seed:** [`issues/s3-index-rm.md`](issues/s3-index-rm.md)
 
 ## S3 credentials beyond environment variables and the shared files
@@ -78,7 +67,7 @@ Any widening has to stay in the one resolver, so the writer and the readers keep
 identity, and has to settle whether DuckDB's `credential_chain` (the separate `aws` extension) earns a
 place in the pinned set.
 
-*Horizon: mid-term · Depends on: S3 as an index target · Refs: `spec/s3-index-target/` (GOAL non-goals)*
+*Horizon: mid-term · Depends on: S3 as an index target — met, on `main` since #33 · Refs: `spec/s3-index-target/` (GOAL non-goals)*
 **Seed:** [`issues/s3-credential-chain.md`](issues/s3-credential-chain.md)
 
 ## S3 traffic through an HTTP proxy
@@ -88,7 +77,7 @@ writer's client is built with the proxy turned off so that writer and readers ca
 routes. A site that reaches its object store only through a proxy cannot use an S3 index. The fix is
 one proxy configuration that reaches both directions.
 
-*Horizon: near-term · Depends on: S3 as an index target · Refs: `spec/s3-index-target/` (PLAN deviation 6)*
+*Horizon: near-term · Depends on: S3 as an index target — met, on `main` since #33 · Refs: `spec/s3-index-target/` (PLAN deviation 6)*
 **Seed:** [`issues/s3-proxy-support.md`](issues/s3-proxy-support.md)
 
 ## Index non-ASCII top-level directories into S3
@@ -98,7 +87,7 @@ percent-encodes such a name in the key and the readers' glob would no longer mat
 of the same tree works. Building keys raw would admit these names, but only after a reader-parity
 wire test shows how `httpfs` lists and reports such keys.
 
-*Horizon: near-term · Depends on: S3 as an index target · Refs: `spec/s3-index-target/` (TECH P3, foreman ruling at P3 run B)*
+*Horizon: near-term · Depends on: S3 as an index target — met, on `main` since #33 · Refs: `spec/s3-index-target/` (TECH P3, foreman ruling at P3 run B)*
 **Seed:** [`issues/s3-non-ascii-partition-names.md`](issues/s3-non-ascii-partition-names.md)
 
 ## Reach S3 buckets whose names carry capitals or `_`
@@ -109,7 +98,7 @@ stores still create such buckets, and AWS still serves legacy ones. Path-style r
 bucket is a path segment and never part of the host, could reach them, with a wider allow-list that
 still cannot reach the authority in either direction.
 
-*Horizon: near-term · Depends on: S3 as an index target · Refs: `spec/s3-index-target/` (TECH review cycle 2 triage, foreman ruling at run B)*
+*Horizon: near-term · Depends on: S3 as an index target — met, on `main` since #33 · Refs: `spec/s3-index-target/` (TECH review cycle 2 triage, foreman ruling at run B)*
 **Seed:** [`issues/s3-legacy-bucket-names.md`](issues/s3-legacy-bucket-names.md)
 
 ## One TLS check for both S3 directions
@@ -122,7 +111,7 @@ write an index the readers refuse. The pilot lands with all three recorded in it
 fix is committed: make every direction verify alike, through an in-process relay that uses the
 writer's TLS client or an upstream change, and delete the exception and both limits.
 
-*Horizon: near-term · Depends on: S3 as an index target · Refs: `spec/s3-index-target/` (GOAL R11 and its 2026-11-06 clarifications, REVIEW cycle 4 finding 1, cycle 5 findings 1–2)*
+*Horizon: near-term · Depends on: S3 as an index target — met, on `main` since #33 · Refs: `spec/s3-index-target/` (GOAL R11 and its 2026-11-06 clarifications, REVIEW cycle 4 finding 1, cycle 5 findings 1–2)*
 **Seed:** [`issues/s3-reader-tls-hostname.md`](issues/s3-reader-tls-hostname.md)
 
 ## Reach an AWS bucket whose name holds a dot
@@ -132,7 +121,7 @@ The bucket rule admits dots, but against AWS every tool addresses the bucket vir
 refuse it as an untrusted certificate, which sends the operator after the wrong cause. Path-style
 addressing in both directions, or a refusal that names the dot, would fix it.
 
-*Horizon: near-term · Depends on: S3 as an index target · Refs: `spec/s3-index-target/` (REVIEW cycle 4 finding 3)*
+*Horizon: near-term · Depends on: S3 as an index target — met, on `main` since #33 · Refs: `spec/s3-index-target/` (REVIEW cycle 4 finding 3)*
 **Seed:** [`issues/s3-dotted-bucket-names.md`](issues/s3-dotted-bucket-names.md)
 
 ## Bind the index path and partition names in local-index reader SQL
@@ -213,34 +202,21 @@ a batch job over complete data nothing. Measured: a partitioned rewrite is one s
 work is the safety around it — a schema that survives, provenance that is not laundered, and a
 failure that leaves no readable-but-wrong index.
 
-*Horizon: mid-term · Depends on: the self-describing marker; S3 as an index target, for the remote side · Refs: —*
+*Horizon: mid-term · Depends on: the self-describing marker; S3 as an index target, for the remote side (met, on `main` since #33) · Refs: —*
 **Seed:** [`issues/xdu-repack.md`](issues/xdu-repack.md)
-
-## Bulk operations: `xdu-cp` and `xdu-mv` over a shared select-act engine
-
-First of the bulk-operations theme, whose entries land in file order: copy/move, then archives,
-then diffing. `xdu-rm` proved the pattern: select a set with an index query, act on exactly that
-set, with dry-run, confirmation, `--safe` re-stat, and deterministic ordering under `--limit`.
-This entry lifts that path into one `lib` implementation behind `rm`, `cp`, and `mv` instead of a
-fourth copy of `rm`'s `main`, turning "move everything untouched in two years to cold storage"
-and "copy this user's stale logs to a staging prefix" into single safe commands — and the staging
-copy is the primitive the archive entry builds on. Sequenced after richer search and the schema
-work so both tools are born with the final filter surface and columns rather than retrofitted.
-
-*Horizon: mid-term · Depends on: search + schema entries (sequencing) · Refs: #1*
-**Seed:** [`issues/bulk-copy-move-xdu-cp-mv.md`](issues/bulk-copy-move-xdu-cp-mv.md)
 
 ## Bulk operations: `xdu-tar` slice archives for backup
 
-Second in the theme, on the engine above. There is no way to archive a slice of a tree — "all
-files older than X", "everything changed since the last backup" — with the structure preserved.
-`xdu-find | xargs tar` inherits every `xargs` failure and assembles ten thousand appends where
-tape wants one ordered stream. `xdu-tar` archives exactly the matched set as one reproducible
-stream to file or stdout: a full slice today, an incremental slice once the diff entry below
-supplies the selection. Staging through the copy entry's semantics versus streaming the archive
-directly is the planning decision, weighed on scratch cost against tape behavior.
+Second in the theme, after `xdu-cp` and `xdu-mv`, and built on their select-act engine, on `main`
+since #37. There is no way to archive a slice of a tree — "all files older than X", "everything
+changed since the last backup" — with the structure preserved. `xdu-find | xargs tar` inherits every
+`xargs` failure and assembles ten thousand appends where tape wants one ordered stream. `xdu-tar`
+archives exactly the matched set as one reproducible stream to file or stdout: a full slice today,
+an incremental slice once the diff entry below supplies the selection. Staging through `xdu-cp`'s
+semantics versus streaming the archive directly is the planning decision, weighed on scratch cost
+against tape behavior.
 
-*Horizon: mid-term · Depends on: copy/move engine above · Refs: #1*
+*Horizon: mid-term · Depends on: the copy/move engine — met, on `main` since #37 · Refs: #1*
 **Seed:** [`issues/xdu-tar-slice-archive.md`](issues/xdu-tar-slice-archive.md)
 
 ## Bulk operations: index diffing for incremental selection
@@ -254,6 +230,39 @@ guaranteed present by the schema now delivered on `main` (record in `spec/richer
 
 *Horizon: mid-term · Depends on: richer-schema mtime/ctime, delivered on `main`; after tar above · Refs: —*
 **Seed:** [`issues/index-diff-incremental-select.md`](issues/index-diff-incremental-select.md)
+
+## Bulk operations: `xdu-rm` on the shared select-act engine
+
+The copy/move cycle (#37) built its engine for `xdu-cp` and `xdu-mv` and left `xdu-rm` on its own
+copy, gaps included: `--safe` re-checks only atime and maximum size though its man page claims
+more, the selection writes the index path and partition name into SQL text, and failed unlinks
+exit 0. Moving `xdu-rm` onto the engine closes all three in the tool that deletes, and makes every
+later engine fix land in every select-act tool at once.
+
+*Horizon: near-term · Depends on: the copy/move engine — met, on `main` since #37 · Refs: `spec/bulk-copy-move-xdu-cp-mv/` (GOAL-gate ruling)*
+**Seed:** [`issues/xdu-rm-on-shared-engine.md`](issues/xdu-rm-on-shared-engine.md)
+
+## Bulk operations: the site lists `xdu-cp` and `xdu-mv` at their release
+
+The copy/move cycle (#37) added two binaries but left `www/` alone, because the site deploys on
+every push to `main` and would advertise tools no release yet ships. Until the release that carries
+them, the site's tools table and its "all four" count omit them, and its roadmap still lists them as
+`† v0.8` with a sentence that puts `rm` on the shared engine, which it is not until the entry above
+lands. At that release the site moves both tools into its table, counts six, and says what the
+engine serves.
+
+*Horizon: near-term, at the release that ships the tools · Depends on: the copy/move engine — met, on `main` since #37 · Refs: `spec/bulk-copy-move-xdu-cp-mv/` (P4)*
+**Seed:** [`issues/www-cp-mv-at-release.md`](issues/www-cp-mv-at-release.md)
+
+## Bulk operations: `xdu-mv` removes only the file it copied
+
+A cross-filesystem `xdu-mv` re-checks the source name against the file it copied and then removes
+the name, two system calls apart. A file renamed onto that name in between is removed in its
+place. Renaming the source to a private name first, checking that name's inode, and removing only
+it closes the window; the man page lists the race until then.
+
+*Horizon: near-term · Depends on: the copy/move engine — met, on `main` since #37 · Refs: `spec/bulk-copy-move-xdu-cp-mv/` (P5)*
+**Seed:** [`issues/xdu-mv-quarantine-unlink.md`](issues/xdu-mv-quarantine-unlink.md)
 
 ## Permission-aware, access-scoped queries
 
@@ -318,7 +327,7 @@ rather than the query path. Aggregates report what the caller can see and count 
 true total across invisible rows is a differencing oracle, and a silently filtered one contradicts
 `lfs quota`. Serving queries rather than handing out data is also what keeps grants revocable.
 
-*Horizon: long-term · Depends on: visibility classification, the API contract, authentication; S3 as an index target — expect sub-phases · Refs: —*
+*Horizon: long-term · Depends on: visibility classification, the API contract, authentication; S3 as an index target (met, on `main` since #33) — expect sub-phases · Refs: —*
 **Seed:** [`issues/xdu-api-query-service.md`](issues/xdu-api-query-service.md)
 
 ## Authentication (`xdu-login`) and group resolution for a shared index
@@ -386,7 +395,7 @@ a world-readable index or credentials the user can read back out of it, and a br
 identity with which to scope anything. That constraint is also what makes the served architecture
 unavoidable rather than merely preferable.
 
-*Horizon: long-term · Depends on: the API contract, authentication, `xdu-api`; S3 as an index target for the store · Refs: —*
+*Horizon: long-term · Depends on: the API contract, authentication, `xdu-api`; S3 as an index target for the store (met, on `main` since #33) · Refs: —*
 **Seed:** [`issues/xdu-web-client.md`](issues/xdu-web-client.md)
 
 ## Streaming index updates & Lustre changelog
@@ -436,9 +445,11 @@ Four measured gaps in what the literal gate can structurally see, all pre-existi
 alone because the pass that found them was scoped to making the *existing* assertions
 layout-insensitive; the fourth turned out to be an unmet requirement of that pass and was fixed there. No
 literal names the binary it belongs to, so copying one rendered page over another is green. The page
-list is hard-coded while the render step globs `doc/*.scd`, so a fifth man page is entirely unasserted
-— measured shipping the exact historical `OUTDIR//.parquet` corruption past a green gate, which matters
-because the bulk-operations theme queues new binaries above. The four env-var assertions are thin
+list is hard-coded while the render step globs `doc/*.scd`, so a seventh man page is entirely
+unasserted — measured shipping the exact historical `OUTDIR//.parquet` corruption past a green gate.
+The bulk copy/move cycle took the list from four pages to six by hand: `xdu-cp.1` and `xdu-mv.1`
+rendered unasserted until a later phase added their `check` lines, the step this gap relies on
+someone remembering. The four env-var assertions are thin
 literals — a well-chosen path per page would catch more than a variable name does (their
 *duplicate-occurrence* blind spot was an unmet R7 and is already fixed). And
 `col -b` rewrites multibyte characters as literal `\xNN` text outside a UTF-8 locale, which bounds what
@@ -447,6 +458,18 @@ can ever be asserted and already mis-measured the `groff` work above. Deriving t
 
 *Horizon: near-term, low priority · Depends on: — · Refs: the two entries above; `issues/ci-gates-are-advisory.md` (a gate that binds nothing is the wider version)*
 **Seed:** [`issues/manpage-gate-coverage-gaps.md`](issues/manpage-gate-coverage-gaps.md)
+
+## The README's raw DuckDB queries read a `key=value` directory name as a column
+
+Every xdu reader reads an index with `hive_partitioning = false` since #38, so a directory named
+`size=0`, or an index stored under `…/mtime=0/`, no longer shadows the row's own column. The
+README's hand-written DuckDB examples still read with DuckDB's default, so the same name changes
+what they select, and the site calls the index "Hive-partitioned", which invites exactly that
+query. Documentation only: the examples should read such a name as a name, or say why not, and
+the site should stop promising Hive semantics xdu does not apply.
+
+*Horizon: near-term, low priority · Depends on: — · Refs: `spec/hive-partition-columns-find-rm/` (PLAN §5)*
+**Seed:** [`issues/raw-query-hive-shadowing.md`](issues/raw-query-hive-shadowing.md)
 
 ## Piping `xdu-find` into `head` exits 1 with a broken-pipe error
 
@@ -492,6 +515,17 @@ after. One change to one file, best done together with the `strip_ansi` lift abo
 
 *Horizon: near-term · Depends on: — · Refs: —*
 **Seed:** [`issues/xdu-view-terminal-safety.md`](issues/xdu-view-terminal-safety.md)
+
+## `xdu-view` lists a sibling's files under a directory named with `_` or `%`
+
+Both views select a directory's rows with `path LIKE '<dir>/%'` and never escape the directory, so
+`_` and `%` in its name act as wildcards. Measured on the bundled engine against a local index,
+listing `a_b` also reports the files of its siblings `axb` and `a%b`, with their sizes summed in, and
+selecting one of those phantom entries leads nowhere. The S3 arm binds the same unescaped pattern.
+Pre-existing; it may ride with the local bound-parameters work, which rewrites the same literal.
+
+*Horizon: near-term · Depends on: — · Refs: `spec/xdu-view-prefix-bytes-vs-chars/` (GOAL non-goals; found at plan)*
+**Seed:** [`issues/xdu-view-like-metacharacters.md`](issues/xdu-view-like-metacharacters.md)
 
 ## Completion marker: scoped runs should not speak for the whole index
 
@@ -567,19 +601,6 @@ that would fix them.
 
 *Horizon: near-term · Depends on: the man-page gate and container-image fixes above must land first (enforcement would otherwise block its own remediation) · Refs: `spec/readers-autoload-parquet-at-runtime/META.md` F6 covers the factory-skill half*
 **Seed:** [`issues/ci-gates-are-advisory.md`](issues/ci-gates-are-advisory.md)
-
-## HPCCM recipe: assert the image carries the shipped extensions
-
-Release tarballs now carry the pinned DuckDB extensions in `lib/xdu/extensions/`, and the HPCCM
-recipe puts them beside `bin/` by extracting the whole tarball, but nothing in the recipe checks
-it. The repository's own `Dockerfile` and every release leg fail when the extension is missing; the
-HPCCM image would build green and fail at its first S3 query. The guard is one `test -f` in the
-existing smoke step, and it cannot land early: the recipe pins a release with no `lib/`, so the
-guard would break it on `main`. It belongs in the release commit that first moves the recipe's
-`VERSION` to a tarball carrying `lib/`.
-
-*Horizon: near-term · Depends on: the first release that ships `lib/xdu/extensions/` · Refs: —*
-**Seed:** [`issues/hpccm-extension-guard.md`](issues/hpccm-extension-guard.md)
 
 ## The bundled DuckDB does not build against the macOS 27 SDK
 
