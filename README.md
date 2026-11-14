@@ -742,6 +742,37 @@ drilling into it in `xdu-view`, diffing it, or re-indexing it with `-p` touches 
 Splitting it with `--split` (see [Nested Partitions](#nested-partitions)) breaks it into smaller units
 for those operations.
 
+#### Where the stat runs
+
+Each indexed file costs a directory read, which yields its name and type, and a `stat`, which
+yields everything else in the row. On GPFS or Lustre the `stat` is a round trip to a metadata
+server and dominates the crawl.
+
+The `-j` pool threads read directories through jwalk's `process_read_dir` callback, and the same
+callback stats every regular file in the directory it has just read. The result travels with the
+entry in jwalk's per-entry `client_state`, and the partition's driver thread takes it from there to
+build the row. A partition's stats are therefore spread over all `-j` threads, wherever its
+directories happen to be read, and a pool thread cannot read further ahead than it can stat, so
+memory stays bounded.
+
+Earlier versions ran the `stat` in the driver loop. A partition has one driver, so every stat in
+that partition was serialized on one thread while the pool read directories far ahead of it and
+queued the entries in memory. On `/gpfs/gibbs/pi`, a single 192M-file partition (its `.snapshots`
+included) crawled at about 2,200 files/s for the last ~24 hours of a 29-hour run, which used ~7
+CPU-hours and 132 GB of RSS.
+
+| Run | Stat in driver loop | Stat on the pool |
+|-----|---------------------|------------------|
+| 9.1M-file GPFS tree, as root, `-j 16` | 1,694 files/s, 5,370 s, 14.9 GB RSS | ~28,500 files/s, 1.9 GB RSS |
+| `/gpfs/gibbs/pi`, as root, `-j 32` on 4 cores | — | 755M files in 9.0 h, ~3.5 cores busy, 42 GB RSS |
+
+The index is unchanged: the same files, and the same values in each row. The stat is an `lstat`
+(`follow_links(false)`), so a file cannot be swapped for a symlink between the directory read and
+the stat. A stat that fails on the pool leaves the slot empty, and the driver repeats it to report
+the error as a vanished file or a hard error, as before. `test_metadata_matches_files`
+(`tests/nested_tests.rs`) gives every file a distinct size and mtime and checks that each row
+carries its own file's values.
+
 ## License
 
 MIT
