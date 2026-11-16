@@ -11,9 +11,9 @@ use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, Metadata};
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use arrow::array::{Int64Builder, StringBuilder};
@@ -156,12 +156,84 @@ pub trait IndexSink: Send + Sync {
 /// up to the first gap, and the marker a file at the index root.
 pub struct LocalSink {
     outdir: PathBuf,
+    /// The crawl root when `--mirror-permissions` is in force: each index directory then takes
+    /// the group access of the source directory at the same relative path.
+    mirror: Option<PathBuf>,
+    /// The index directories already given their access in this run, so a directory shared by
+    /// several nested partitions is set once.
+    prepared: Mutex<HashSet<String>>,
 }
 
 impl LocalSink {
     pub fn new(outdir: PathBuf) -> Self {
-        Self { outdir }
+        Self {
+            outdir,
+            mirror: None,
+            prepared: Mutex::new(HashSet::new()),
+        }
     }
+
+    /// Give every partition directory its source directory's group access (see
+    /// `mirrored_mode`) before its first chunk is written.
+    pub fn mirroring(mut self, root: PathBuf) -> Self {
+        self.mirror = Some(root);
+        self
+    }
+
+    /// Create the directories of `partition` and set each one's group and mode from the
+    /// source directory at the same relative path, before anything is written into them.
+    ///
+    /// A new directory is created 0700, so until its mode is set only the crawler can enter
+    /// it. An existing one is set again, so a change to a source directory's access reaches
+    /// the index at the next run. `__root__` holds the loose files of the crawl root, whose
+    /// access no one group's can stand for, and stays the crawler's alone. A failure fails the
+    /// run with the directory no wider than it was.
+    fn prepare_partition_dir(&self, root: &Path, partition: &str) -> Result<()> {
+        let mut prepared = self.prepared.lock().unwrap();
+        let mut rel = String::new();
+        for component in partition.split('/') {
+            if !rel.is_empty() {
+                rel.push('/');
+            }
+            rel.push_str(component);
+            if prepared.contains(&rel) {
+                continue;
+            }
+            let dir = self.outdir.join(&rel);
+            match fs::DirBuilder::new().mode(0o700).create(&dir) {
+                Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("Failed to create partition dir: {}", dir.display())));
+                }
+                _ => {}
+            }
+            let mode = if partition == ROOT_PARTITION {
+                0o700
+            } else {
+                let source = root.join(&rel);
+                let meta = fs::symlink_metadata(&source).with_context(|| {
+                    format!("Failed to read the access of {}", source.display())
+                })?;
+                std::os::unix::fs::chown(&dir, None, Some(meta.gid())).with_context(|| {
+                    format!("Failed to give {} the group {}", dir.display(), meta.gid())
+                })?;
+                mirrored_mode(meta.mode())
+            };
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode))
+                .with_context(|| format!("Failed to set the mode of {}", dir.display()))?;
+            prepared.insert(rel.clone());
+        }
+        Ok(())
+    }
+}
+
+/// The mode of an index directory whose source directory has mode `source`: read and search
+/// for the crawler, and for the group and others whichever of read and search the source
+/// grants them. Write access and the setuid, setgid and sticky bits are never copied: a group
+/// that could write its partition could plant rows naming any path, and the index is what an
+/// administrator's `xdu-rm` reads.
+pub fn mirrored_mode(source: u32) -> u32 {
+    0o700 | (source & 0o055)
 }
 
 impl IndexSink for LocalSink {
@@ -171,17 +243,27 @@ impl IndexSink for LocalSink {
 
     fn put_chunk(&self, partition: &str, id: usize, bytes: Vec<u8>) -> Result<()> {
         let partition_dir = self.outdir.join(partition);
-        fs::create_dir_all(&partition_dir).with_context(|| {
-            format!(
-                "Failed to create partition dir: {}",
-                partition_dir.display()
-            )
-        })?;
+        match self.mirror {
+            Some(ref root) => self.prepare_partition_dir(root, partition)?,
+            None => fs::create_dir_all(&partition_dir).with_context(|| {
+                format!(
+                    "Failed to create partition dir: {}",
+                    partition_dir.display()
+                )
+            })?,
+        }
 
         // Write to .partial file first; finalize renames it atomically.
         let partial_path = partition_dir.join(chunk_partial_name(id));
         fs::write(&partial_path, bytes)
-            .with_context(|| format!("Failed to create file: {}", partial_path.display()))
+            .with_context(|| format!("Failed to create file: {}", partial_path.display()))?;
+        // The directory decides who reads a mirrored partition, so its chunks are readable by
+        // whoever can enter it, whatever the crawler's umask.
+        if self.mirror.is_some() {
+            fs::set_permissions(&partial_path, fs::Permissions::from_mode(0o644))
+                .with_context(|| format!("Failed to set the mode of {}", partial_path.display()))?;
+        }
+        Ok(())
     }
 
     fn finalize_partition(&self, partition: &str, count: usize) -> Result<usize> {

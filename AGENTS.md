@@ -470,6 +470,13 @@ pinned `httpfs`, with the glob a bound parameter (`lib::parquet_source`); `xdu-r
   comparison hides a directory unreadable in either index from both sides (`DiffSide::hidden`),
   or every file in it would read as added or removed. The crawler keeps the strict
   `list_partitions`, since a partition it cannot see is one it cannot prune.
+- **Mirrored access:** under `--mirror-permissions` (local output only; recorded as
+  `mirror_permissions` in `_xdu.json` and applied by every later run) `LocalSink` gives each index
+  directory, before its first chunk, the source directory's group and `crawl::mirrored_mode`: the
+  source's group and other read and search bits, owner `rwx`, and never group or other write,
+  setuid, setgid or sticky. Write access would let a group plant rows naming any path in an index
+  `xdu-rm` reads, so widening `mirrored_mode` is a security change. `__root__` stays 0700, chunks
+  are 0644, ACLs are not copied, and a failure fails the run with the directory still 0700.
 - **Run-level completion marker:** `<outdir>/.xdu-complete` (`COMPLETION_MARKER`, `lib.rs`) — a
   dotfile and not a `.parquet`, so the readers' glob never mistakes it for a chunk. Per-chunk
   `.partial`→rename is atomic for one *file* but cannot express whether the **run** finished: when one
@@ -521,7 +528,7 @@ pinned `httpfs`, with the glob a bound parameter (`lib::parquet_source`); `xdu-r
 
 - `xdu DIR -o/--outdir DIR|s3://BUCKET/PREFIX [-j/--jobs N (env XDU_JOBS, dflt 4)] [-B/--buffsize N (100000)]
   [--apparent-size] [-k/--block-size SIZE] [-p/--partition NAMES [-r/--recursive]]
-  [--split-depth N] [--split PATHS] [--split-file FILE] [--allow-errors]`
+  [--split-depth N] [--split PATHS] [--split-file FILE] [--allow-errors] [--mirror-permissions]`
   — `--allow-errors` is **opt-in**: by default any walk/stat error fails the run non-zero and no
   completion marker is written; with it, unreadable entries are counted, reported on stderr, the run
   exits 0, and the marker records the tolerated `errors=N`.

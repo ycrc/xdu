@@ -176,6 +176,7 @@ xdu /home -o /var/lib/xdu/home -j 16 -B 100000
 | `-k, --block-size` | Round sizes up to block size (e.g., `128K`). Implies `--apparent-size` | |
 | `--include-snapshots` | Also index snapshot directories | Skipped |
 | `--snapshot-dir NAME` | Also skip directories named NAME as snapshots (repeatable) | `.snapshots`, `.snapshot` |
+| `--mirror-permissions` | Give each partition directory its source directory's group access | Off, or the index's saved setting |
 
 Directories named `.snapshots` (GPFS) or `.snapshot` (NetApp, PowerScale, VAST) are skipped
 wherever they occur: each snapshot is a copy of the tree around it, so indexing it counts the same
@@ -186,6 +187,29 @@ snapshot (e.g. `/fs/.snapshots/@GMT-…/home`) is still indexed. The skipped nam
 To compare snapshots, crawl each with `--apparent-size`. Inside a GPFS snapshot `st_blocks` does
 not report a file's real usage (a 14 MB file reports 512 bytes), so disk-usage sizes cannot be
 compared.
+
+#### Sharing one index with many groups
+
+An index of `/gpfs/gibbs/project` built as root can be read by each group for its own projects
+alone. With `--mirror-permissions`, each partition directory takes the group of its source
+directory and the read and search bits that directory grants its group and others:
+
+```bash
+sudo xdu /gpfs/gibbs/project -o /shared/index/project --mirror-permissions
+ls -l /shared/index/project      # alice: drwxr-x--- root pi_alice
+xdu-view -i /shared/index/project   # a member of pi_alice sees alice only
+```
+
+The owner stays root and write access is never copied, since a group that could write its
+partition could add rows naming any path to an index an administrator's `xdu-rm` reads. Setgid
+and sticky bits and ACLs are not copied; `__root__` is root's alone. The index root, its
+`.xdu-complete` marker and `_xdu.json` must stay world-readable. The setting is saved in
+`_xdu.json`, so `-p` runs apply it too.
+
+Every reader leaves out the partitions it cannot open and prints a note on stderr saying how many
+directories it left out. A partition lists every file below its directory, so a group can see the
+names, sizes and owners of files in a member's private subdirectory that it cannot list in the
+source tree.
 
 ### Querying with xdu-find
 

@@ -81,6 +81,7 @@ fn crawl(
     recursive: bool,
     allow_errors: bool,
     snapshots: &SnapshotDirs,
+    mirror: bool,
     is_tty: bool,
 ) -> Result<CrawlStats> {
     // Build shared rayon thread pool for jwalk walkers
@@ -160,6 +161,9 @@ fn crawl(
             opts.push_str(", include-snapshots");
         } else {
             opts.push_str(&format!(", skip={}", snapshots.names().join(",")));
+        }
+        if mirror {
+            opts.push_str(", mirror-permissions");
         }
         let msg = format!("Indexing {}{} ({opts})", top_dir.display(), filter_desc);
         eprintln!("{}", format_log_record(LogLevel::Info, &msg));
@@ -720,18 +724,33 @@ fn run(is_tty: bool) -> Result<()> {
     // directory it always was, non-UTF-8 bytes included. Nothing is sent to S3 yet.
     // `local_outdir` is the index directory when there is one: the manifest and the
     // stale-partition sweep exist only there.
-    let (sink, local_outdir): (Arc<dyn IndexSink>, Option<std::path::PathBuf>) =
+    // `mirror` is `--mirror-permissions`, or the index's own record of it: once an index's
+    // partitions carry their sources' group access, a later run that did not would add
+    // partitions any user could read.
+    let (sink, local_outdir, mirror): (Arc<dyn IndexSink>, Option<std::path::PathBuf>, bool) =
         match IndexLocator::parse(args.outdir.as_os_str())? {
             IndexLocator::Local(outdir) => {
                 fs::create_dir_all(&outdir).with_context(|| {
                     format!("Failed to create output directory: {}", outdir.display())
                 })?;
                 let outdir = outdir.canonicalize()?;
-                (Arc::new(LocalSink::new(outdir.clone())), Some(outdir))
+                let mirror = args.mirror_permissions
+                    || Manifest::load(&outdir)?.is_some_and(|m| m.mirror_permissions);
+                let mut sink = LocalSink::new(outdir.clone());
+                if mirror {
+                    sink = sink.mirroring(top_dir.clone());
+                }
+                (Arc::new(sink), Some(outdir), mirror)
             }
             IndexLocator::S3(locator) => {
+                if args.mirror_permissions {
+                    anyhow::bail!(
+                        "--mirror-permissions needs a local output directory; an s3:// index \
+                         has no directories to carry permissions"
+                    );
+                }
                 let settings = S3Settings::resolve(&ProcessEnv)?;
-                (Arc::new(S3Sink::connect(&locator, &settings)?), None)
+                (Arc::new(S3Sink::connect(&locator, &settings)?), None, false)
             }
         };
 
@@ -863,6 +882,7 @@ fn run(is_tty: bool) -> Result<()> {
         args.recursive,
         args.allow_errors,
         &snapshots,
+        mirror,
         is_tty,
     )?;
 
@@ -899,6 +919,7 @@ fn run(is_tty: bool) -> Result<()> {
             split: spec.clone(),
             size_mode: size_label.clone(),
             snapshot_dirs: Some(snapshots.clone()),
+            mirror_permissions: mirror,
         }
         .save(outdir)
         .with_context(|| format!("Failed to write manifest in {}", outdir.display()))?;

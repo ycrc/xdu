@@ -103,6 +103,14 @@ pub struct XduArgs {
         value_parser = crate::layout::parse_snapshot_dir
     )]
     pub snapshot_dir: Vec<String>,
+
+    /// Give each partition directory of the index its source directory's group and that
+    /// group's read and search access, so a group reads only its own partitions. The owner
+    /// stays the crawler, write access stays with it, __root__ is the crawler's alone, and
+    /// ACLs are not copied. Local output only. Recorded in the index, so every later run
+    /// applies it too.
+    #[arg(long)]
+    pub mirror_permissions: bool,
 }
 
 /// Arguments for `xdu-find` — the index query tool.

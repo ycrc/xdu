@@ -182,6 +182,10 @@ pub struct Manifest {
     /// any snapshot setting existed; that xdu walked them, but whether the tree had any is
     /// unknown.
     pub snapshot_dirs: Option<SnapshotDirs>,
+    /// Whether partition directories carry their source directories' group access
+    /// (`--mirror-permissions`). Once set, every later run applies it, or a `--partition` run
+    /// would add a partition any user could read.
+    pub mirror_permissions: bool,
 }
 
 impl Manifest {
@@ -227,6 +231,7 @@ impl Manifest {
             split: SplitSpec { depth, patterns },
             size_mode: v["size_mode"].as_str().unwrap_or("").to_string(),
             snapshot_dirs: snapshot_dirs_field(&v),
+            mirror_permissions: v["mirror_permissions"].as_bool().unwrap_or(false),
         }))
     }
 
@@ -241,6 +246,9 @@ impl Manifest {
         });
         if let Some(ref dirs) = self.snapshot_dirs {
             v["snapshot_dirs"] = serde_json::json!(dirs.names());
+        }
+        if self.mirror_permissions {
+            v["mirror_permissions"] = serde_json::json!(true);
         }
         let path = index.join(MANIFEST_FILE);
         let tmp = index.join(format!("{}.partial", MANIFEST_FILE));
@@ -842,10 +850,12 @@ mod tests {
             },
             size_mode: "disk-usage".into(),
             snapshot_dirs: Some(SnapshotDirs::new(false, &[".zfs".to_string()])),
+            mirror_permissions: true,
         };
         m.save(tmp.path()).unwrap();
         let back = Manifest::load(tmp.path()).unwrap().unwrap();
         assert_eq!(back.root, "/data");
+        assert!(back.mirror_permissions);
         assert_eq!(
             back.snapshot_dirs.unwrap().names(),
             [".snapshot", ".snapshots", ".zfs"]

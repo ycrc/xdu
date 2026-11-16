@@ -54,7 +54,8 @@ compares two indexes one partition at a time.
   index **format version**: 2 for the flat layout, 3 when any partition is nested. Every reader
   refuses an index with no marker or a version it does not understand, and warns when the marker
   records tolerated errors.
-- `_xdu.json` — the manifest: crawl root, split spec, size mode and the skipped snapshot names.
+- `_xdu.json` — the manifest: crawl root, split spec, size mode, the skipped snapshot names and
+  whether partition directories carry their sources' group access (`mirror_permissions`).
   A later run reuses the split spec, and a `-p` run refuses a different one, so partitions never
   overlap.
 
@@ -99,6 +100,13 @@ each time it holds `-B` rows. `LocalSink` writes `NNNNNN.parquet.partial` and re
 when the partition is finalized, then prunes higher-numbered chunks left by an earlier, larger run.
 `S3Sink` PUTs each chunk at its final key and finalizes with a LIST and DELETE of stale chunks.
 Each chunk is atomic; a partition as a whole is not.
+
+**Access** (`--mirror-permissions`, `LocalSink::mirroring`). Before a partition's first chunk,
+`LocalSink` creates each directory of its key mode 0700, gives it the group of the source directory
+at the same relative path, and sets `crawl::mirrored_mode`: `rwx` for the crawler and whichever of
+read and search the source grants its group and others, never write, setuid, setgid or sticky.
+`__root__` stays 0700 and chunks are 0644, so the directory alone decides who reads them. The
+manifest records the setting, and every later run applies it.
 
 **Attestation.** After a full run, partitions that are no longer split points are removed
 (`crawl::remove_stale_partition`) and the manifest is saved. If any error was not tolerated the run

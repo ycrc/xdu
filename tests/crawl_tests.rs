@@ -1320,3 +1320,124 @@ fn test_partition_run_refuses_an_index_from_the_older_snapshot_rule() {
     assert!(text.contains(r#""snapshot_dirs""#), "{text}");
     assert!(!text.contains("include_snapshots"), "{text}");
 }
+
+/// Mode bits of a path, setuid, setgid and sticky included.
+fn mode_of(path: &std::path::Path) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+fn set_mode(path: &std::path::Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Give `dir` one of this process's supplementary groups when the filesystem allows it, so the
+/// group the index copies differs from the one it would get anyway. Returns the gid it holds.
+fn give_another_group(dir: &std::path::Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    let own = fs::metadata(dir).unwrap().gid();
+    let mut groups = vec![0 as libc::gid_t; 64];
+    // SAFETY: the buffer holds 64 gids and getgroups writes at most that many.
+    let n = unsafe { libc::getgroups(64, groups.as_mut_ptr()) };
+    for &g in groups.iter().take(n.max(0) as usize) {
+        if g != own && std::os::unix::fs::chown(dir, None, Some(g)).is_ok() {
+            return g;
+        }
+    }
+    own
+}
+
+#[test]
+fn test_mirror_permissions_copies_each_source_directory_group_access() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("source");
+    let index = tmp.path().join("index");
+    for d in ["a", "b", "c", "p/q"] {
+        fs::create_dir_all(source.join(d)).unwrap();
+    }
+    for f in ["a/1", "b/2", "c/3", "p/4", "p/q/5", "loose"] {
+        create_test_file(&source.join(f), 10).unwrap();
+    }
+    let a_gid = give_another_group(&source.join("a"));
+    set_mode(&source.join("a"), 0o750);
+    set_mode(&source.join("b"), 0o705);
+    set_mode(&source.join("c"), 0o2770);
+    set_mode(&source.join("p/q"), 0o750);
+
+    let (_, err, ok) = run_xdu(&[
+        "--apparent-size",
+        "--mirror-permissions",
+        "--split",
+        "p/q",
+        "-o",
+        index.to_str().unwrap(),
+        source.to_str().unwrap(),
+    ]);
+    assert!(ok, "xdu failed: {err}");
+    assert!(err.contains("mirror-permissions"), "{err}");
+    assert_eq!(find_count(&index, &[]), 6);
+
+    assert_eq!(fs::metadata(index.join("a")).unwrap().gid(), a_gid);
+    assert_eq!(mode_of(&index.join("a")), 0o750);
+    assert_eq!(mode_of(&index.join("b")), 0o705);
+    assert_eq!(
+        mode_of(&index.join("c")),
+        0o750,
+        "group write and setgid are not copied"
+    );
+    assert_eq!(mode_of(&index.join("p")), 0o755);
+    assert_eq!(mode_of(&index.join("p/q")), 0o750);
+    assert_eq!(mode_of(&index.join("__root__")), 0o700);
+    assert_eq!(mode_of(&index.join("a/000000.parquet")), 0o644);
+    let manifest = fs::read_to_string(index.join("_xdu.json")).unwrap();
+    assert!(
+        manifest.contains(r#""mirror_permissions": true"#),
+        "{manifest}"
+    );
+
+    // The index's record carries the setting: a later run without the flag still copies, and
+    // a source directory's new mode reaches the index.
+    set_mode(&source.join("a"), 0o700);
+    let (_, err, ok) = run_xdu(&[
+        "--apparent-size",
+        "-p",
+        "a",
+        "-o",
+        index.to_str().unwrap(),
+        source.to_str().unwrap(),
+    ]);
+    assert!(ok, "xdu -p a failed: {err}");
+    assert_eq!(mode_of(&index.join("a")), 0o700);
+    assert!(err.contains("mirror-permissions"), "{err}");
+}
+
+#[test]
+fn test_without_mirror_permissions_directories_keep_the_crawler_default() {
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("source");
+    let index = tmp.path().join("index");
+    fs::create_dir_all(source.join("a")).unwrap();
+    create_test_file(&source.join("a/1"), 10).unwrap();
+    set_mode(&source.join("a"), 0o700);
+    build_index(&source, &index);
+    assert_ne!(mode_of(&index.join("a")), 0o700);
+    let manifest = fs::read_to_string(index.join("_xdu.json")).unwrap();
+    assert!(!manifest.contains("mirror_permissions"), "{manifest}");
+}
+
+#[test]
+fn test_mirror_permissions_refuses_an_s3_index() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("a")).unwrap();
+    let (_, err, ok) = run_xdu(&[
+        "--mirror-permissions",
+        "-o",
+        "s3://bucket/prefix",
+        tmp.path().to_str().unwrap(),
+    ]);
+    assert!(!ok);
+    assert!(
+        err.contains("--mirror-permissions needs a local output directory"),
+        "{err}"
+    );
+}

@@ -6,7 +6,7 @@ xdu - build a distributed file metadata index in Parquet format
 
 # SYNOPSIS
 
-*xdu* _DIR_ *-o* _OUTDIR_ \[*-j* _N_] \[*-B* _N_] \[*--apparent-size*] \[*-k* _SIZE_] \[*-p* _NAMES_ \[*-r*]] \[*--split-depth* _N_] \[*--split* _PATHS_] \[*--split-file* _FILE_] \[*--allow-errors*] \[*--include-snapshots* | *--snapshot-dir* _NAME_]
+*xdu* _DIR_ *-o* _OUTDIR_ \[*-j* _N_] \[*-B* _N_] \[*--apparent-size*] \[*-k* _SIZE_] \[*-p* _NAMES_ \[*-r*]] \[*--split-depth* _N_] \[*--split* _PATHS_] \[*--split-file* _FILE_] \[*--allow-errors*] \[*--include-snapshots* | *--snapshot-dir* _NAME_] \[*--mirror-permissions*]
 
 # DESCRIPTION
 
@@ -91,6 +91,13 @@ _DIR_
 	*--include-snapshots*. The list is saved with the index, and a *-p* run
 	must give the same names.
 
+*--mirror-permissions*
+	Give each partition directory of the index the group of the source
+	directory at the same path, and that group's and others' read and search
+	access to it, so each group can read only its own partitions. See
+	_SHARING AN INDEX_. Local _OUTDIR_ only. The setting is saved with the
+	index, and every later run applies it.
+
 *-h*, *--help*
 	Print help information.
 
@@ -122,6 +129,30 @@ split points. Split paths are supported only for a local _OUTDIR_.
 A nested index records index format version 3 in its completion marker, so a
 reader that globs only one directory level refuses it instead of missing the
 nested partitions; a flat index records version 2.
+
+# SHARING AN INDEX
+
+An index built as root over many groups' directories can be read by each group
+for its own directories alone. With *--mirror-permissions*, each directory of
+_OUTDIR_ takes the group of the source directory at the same path, and its mode
+grants the group and others whichever of read and search the source grants
+them. The owner stays the user running *xdu*, which alone can write: a group
+that could write its partition could add rows naming any path, and the index is
+what *xdu-rm*(1) reads. The setuid, setgid and sticky bits are not copied, and
+neither are ACLs, so access a source directory grants only through an ACL, or
+only to its owner, is not granted in the index. *\_\_root\_\_*, which holds
+the files lying directly in _DIR_, is readable by the owner alone. Each chunk
+is mode 0644; its directory decides who reads it.
+
+A new directory is created mode 0700 and given its access before any chunk is
+written into it, and an existing one is set again on every run, so a change to
+a source directory reaches the index at the next run. _OUTDIR_ itself, the
+completion marker and \_xdu.json must stay readable by every user, since the
+readers refuse an index whose marker they cannot read.
+
+A reader leaves out the partitions it cannot open and says so on standard
+error. A partition lists every file below its directory, including files in a
+subdirectory its group cannot list in the source tree.
 
 # S3 OUTPUT
 
