@@ -201,8 +201,11 @@ xdu-view -i /shared/index/project   # a member of pi_alice sees alice only
 ```
 
 The owner stays root and write access is never copied, since a group that could write its
-partition could add rows naming any path to an index an administrator's `xdu-rm` reads. Setgid
-and sticky bits and ACLs are not copied; `__root__` is root's alone. The index root, its
+partition could add rows naming any path to an index an administrator's `xdu-rm` reads. The
+source directory's owner gets its read and search access through a POSIX ACL entry instead
+(`user:alice:r-x`), which only root can change, so a private 0700 home under `--split-depth 2`
+stays readable by its owner; this needs POSIX ACLs on the index filesystem. Setgid and sticky
+bits and the source's own ACLs are not copied; `__root__` is root's alone. The index root, its
 `.xdu-complete` marker and `_xdu.json` must stay world-readable. The setting is saved in
 `_xdu.json`, so `-p` runs apply it too.
 

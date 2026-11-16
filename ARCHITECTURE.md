@@ -104,9 +104,12 @@ Each chunk is atomic; a partition as a whole is not.
 **Access** (`--mirror-permissions`, `LocalSink::mirroring`). Before a partition's first chunk,
 `LocalSink` creates each directory of its key mode 0700, gives it the group of the source directory
 at the same relative path, and sets `crawl::mirrored_mode`: `rwx` for the crawler and whichever of
-read and search the source grants its group and others, never write, setuid, setgid or sticky.
-`__root__` stays 0700 and chunks are 0644, so the directory alone decides who reads them. The
-manifest records the setting, and every later run applies it.
+read and search the source grants its group and others, never write, setuid, setgid or sticky. The
+source directory's owner, unless it is the crawler, gets its read and search bits through a POSIX
+access ACL entry (`crawl::owner_acl`, written as `system.posix_acl_access`), never through
+ownership, which would let it chmod its way to write access. `__root__` stays 0700 and chunks are
+0644, so the directory alone decides who reads them. The manifest records the setting, and every
+later run applies it.
 
 **Attestation.** After a full run, partitions that are no longer split points are removed
 (`crawl::remove_stale_partition`) and the manifest is saved. If any error was not tolerated the run

@@ -105,10 +105,11 @@ pub struct XduArgs {
     pub snapshot_dir: Vec<String>,
 
     /// Give each partition directory of the index its source directory's group and that
-    /// group's read and search access, so a group reads only its own partitions. The owner
-    /// stays the crawler, write access stays with it, __root__ is the crawler's alone, and
-    /// ACLs are not copied. Local output only. Recorded in the index, so every later run
-    /// applies it too.
+    /// group's read and search access, and the source directory's owner theirs through an
+    /// ACL entry, so each reads only their own partitions. The owner stays the crawler, write
+    /// access stays with it, __root__ is the crawler's alone, and the source's own ACLs are
+    /// not copied. Local output only. Recorded in the index, so every later run applies it
+    /// too.
     #[arg(long)]
     pub mirror_permissions: bool,
 }

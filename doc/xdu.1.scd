@@ -138,11 +138,16 @@ _OUTDIR_ takes the group of the source directory at the same path, and its mode
 grants the group and others whichever of read and search the source grants
 them. The owner stays the user running *xdu*, which alone can write: a group
 that could write its partition could add rows naming any path, and the index is
-what *xdu-rm*(1) reads. The setuid, setgid and sticky bits are not copied, and
-neither are ACLs, so access a source directory grants only through an ACL, or
-only to its owner, is not granted in the index. *\_\_root\_\_*, which holds
-the files lying directly in _DIR_, is readable by the owner alone. Each chunk
-is mode 0644; its directory decides who reads it.
+what *xdu-rm*(1) reads. The source directory's owner, when it is not the user
+running *xdu*, gets whichever of read and search its owner bits grant through a
+POSIX ACL entry, which only the index directory's owner can change; *ls* then
+shows the ACL mask as the group bits. This needs POSIX ACLs on the filesystem
+holding _OUTDIR_, and a run that cannot set one fails, leaving the directory
+closed. The setuid, setgid and sticky bits are not copied, and neither are the
+source's own ACLs, so access a source directory grants only through an ACL is
+not granted in the index. *\_\_root\_\_*, which holds the files lying directly
+in _DIR_, is readable by the owner alone. Each chunk is mode 0644; its
+directory decides who reads it.
 
 A new directory is created mode 0700 and given its access before any chunk is
 written into it, and an existing one is set again on every run, so a change to

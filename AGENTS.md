@@ -475,8 +475,11 @@ pinned `httpfs`, with the glob a bound parameter (`lib::parquet_source`); `xdu-r
   directory, before its first chunk, the source directory's group and `crawl::mirrored_mode`: the
   source's group and other read and search bits, owner `rwx`, and never group or other write,
   setuid, setgid or sticky. Write access would let a group plant rows naming any path in an index
-  `xdu-rm` reads, so widening `mirrored_mode` is a security change. `__root__` stays 0700, chunks
-  are 0644, ACLs are not copied, and a failure fails the run with the directory still 0700.
+  `xdu-rm` reads, so widening `mirrored_mode` is a security change. The source's owner, unless it
+  is the crawler, gets its owner read and search bits as a POSIX ACL entry (`crawl::owner_acl`,
+  set after the chmod, since a chmod rewrites an ACL's mask); never as ownership, since an owner
+  can chmod. `__root__` stays 0700, chunks are 0644, the source's own ACLs are not copied, and a
+  failure, including a filesystem without POSIX ACLs, fails the run with the directory closed.
 - **Run-level completion marker:** `<outdir>/.xdu-complete` (`COMPLETION_MARKER`, `lib.rs`) — a
   dotfile and not a `.parquet`, so the readers' glob never mistakes it for a chunk. Per-chunk
   `.partial`→rename is atomic for one *file* but cannot express whether the **run** finished: when one

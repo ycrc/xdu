@@ -207,8 +207,8 @@ impl LocalSink {
                 }
                 _ => {}
             }
-            let mode = if partition == ROOT_PARTITION {
-                0o700
+            let (mode, owner) = if partition == ROOT_PARTITION {
+                (0o700, None)
             } else {
                 let source = root.join(&rel);
                 let meta = fs::symlink_metadata(&source).with_context(|| {
@@ -217,10 +217,33 @@ impl LocalSink {
                 std::os::unix::fs::chown(&dir, None, Some(meta.gid())).with_context(|| {
                     format!("Failed to give {} the group {}", dir.display(), meta.gid())
                 })?;
-                mirrored_mode(meta.mode())
+                // SAFETY: geteuid cannot fail.
+                let crawler = unsafe { libc::geteuid() };
+                let owner_perm = (meta.mode() >> 6) & 0o5;
+                let owner =
+                    (meta.uid() != crawler && owner_perm != 0).then_some((meta.uid(), owner_perm));
+                (mirrored_mode(meta.mode()), owner)
             };
+            // The mode first, then the ACL: a chmod of a directory carrying an ACL rewrites
+            // its mask, not its group entry. Without an owner entry, an ACL left by an
+            // earlier run, when the source had another owner, is removed before the chmod.
+            if owner.is_none() {
+                remove_access_acl(&dir)
+                    .with_context(|| format!("Failed to remove the ACL of {}", dir.display()))?;
+            }
             fs::set_permissions(&dir, fs::Permissions::from_mode(mode))
                 .with_context(|| format!("Failed to set the mode of {}", dir.display()))?;
+            if let Some((uid, perm)) = owner {
+                set_access_acl(&dir, &owner_acl(mode, uid, perm)).with_context(|| {
+                    format!(
+                        "Failed to give the source owner {} access to {} by an ACL; \
+                         --mirror-permissions needs POSIX ACLs on the index filesystem when a \
+                         source directory is owned by anyone but the crawler",
+                        uid,
+                        dir.display()
+                    )
+                })?;
+            }
             prepared.insert(rel.clone());
         }
         Ok(())
@@ -234,6 +257,100 @@ impl LocalSink {
 /// administrator's `xdu-rm` reads.
 pub fn mirrored_mode(source: u32) -> u32 {
     0o700 | (source & 0o055)
+}
+
+/// The extended attribute holding a file's POSIX access ACL on Linux.
+#[cfg(target_os = "linux")]
+const ACCESS_ACL_XATTR: &[u8] = b"system.posix_acl_access\0";
+
+/// The POSIX access ACL, in the kernel's `system.posix_acl_access` encoding, for an index
+/// directory of mode `mode` that also grants user `uid` the bits `perm`.
+///
+/// The source owner is not the index directory's owner, since an owner can change a mode or an
+/// ACL and so could write its partition. A named entry gives that owner the read and search
+/// its owner bits grant in the source, and only the crawler, which owns the directory, can
+/// change it. The mask covers the named entry and the group entry, so `stat` reports the
+/// mask's bits as the group's while the group itself keeps only its own.
+pub fn owner_acl(mode: u32, uid: u32, perm: u32) -> Vec<u8> {
+    const VERSION: u32 = 2;
+    const USER_OBJ: u16 = 0x01;
+    const USER: u16 = 0x02;
+    const GROUP_OBJ: u16 = 0x04;
+    const MASK: u16 = 0x10;
+    const OTHER: u16 = 0x20;
+    const UNDEFINED_ID: u32 = u32::MAX;
+    fn entry(acl: &mut Vec<u8>, tag: u16, perm: u32, id: u32) {
+        acl.extend_from_slice(&tag.to_le_bytes());
+        acl.extend_from_slice(&(perm as u16).to_le_bytes());
+        acl.extend_from_slice(&id.to_le_bytes());
+    }
+    let group = (mode >> 3) & 0o7;
+    let mut acl = VERSION.to_le_bytes().to_vec();
+    // Entries in the order the kernel requires: by tag, then by id.
+    entry(&mut acl, USER_OBJ, (mode >> 6) & 0o7, UNDEFINED_ID);
+    entry(&mut acl, USER, perm, uid);
+    entry(&mut acl, GROUP_OBJ, group, UNDEFINED_ID);
+    entry(&mut acl, MASK, group | perm, UNDEFINED_ID);
+    entry(&mut acl, OTHER, mode & 0o7, UNDEFINED_ID);
+    acl
+}
+
+#[cfg(target_os = "linux")]
+fn c_path(path: &Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+}
+
+#[cfg(target_os = "linux")]
+fn set_access_acl(path: &Path, acl: &[u8]) -> std::io::Result<()> {
+    let path = c_path(path)?;
+    // SAFETY: both strings are NUL-terminated and `acl` is valid for its length.
+    let rc = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            ACCESS_ACL_XATTR.as_ptr().cast(),
+            acl.as_ptr().cast(),
+            acl.len(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Remove a directory's access ACL. Absent, or a filesystem with no ACLs, is nothing to do.
+#[cfg(target_os = "linux")]
+fn remove_access_acl(path: &Path) -> std::io::Result<()> {
+    let path = c_path(path)?;
+    // SAFETY: both strings are NUL-terminated.
+    let rc = unsafe { libc::removexattr(path.as_ptr(), ACCESS_ACL_XATTR.as_ptr().cast()) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ENODATA) | Some(libc::EOPNOTSUPP) => Ok(()),
+        _ => Err(err),
+    }
+}
+
+/// Elsewhere there is no `system.posix_acl_access`, so a source directory owned by anyone but
+/// the crawler fails the run rather than leaving its owner shut out without a word.
+#[cfg(not(target_os = "linux"))]
+fn set_access_acl(_path: &Path, _acl: &[u8]) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "POSIX access ACLs are set only on Linux",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_access_acl(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 impl IndexSink for LocalSink {
@@ -833,6 +950,92 @@ impl PartitionBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_owner_acl_encoding() {
+        let acl = owner_acl(0o750, 4242, 0o5);
+        let entries: Vec<(u16, u16, u32)> = acl[4..]
+            .chunks(8)
+            .map(|e| {
+                (
+                    u16::from_le_bytes([e[0], e[1]]),
+                    u16::from_le_bytes([e[2], e[3]]),
+                    u32::from_le_bytes([e[4], e[5], e[6], e[7]]),
+                )
+            })
+            .collect();
+        assert_eq!(u32::from_le_bytes(acl[..4].try_into().unwrap()), 2);
+        assert_eq!(
+            entries,
+            vec![
+                (0x01, 0o7, u32::MAX),
+                (0x02, 0o5, 4242),
+                (0x04, 0o5, u32::MAX),
+                (0x10, 0o5, u32::MAX),
+                (0x20, 0o0, u32::MAX),
+            ]
+        );
+        // A group with no access still gets none: the mask covers the named owner alone.
+        let closed = owner_acl(0o700, 4242, 0o5);
+        assert_eq!(&closed[4 + 2 * 8 + 2..4 + 2 * 8 + 4], &0u16.to_le_bytes());
+    }
+
+    /// The kernel takes the encoding, reports the mask as the group bits, and gives it back
+    /// unchanged; removing it leaves no ACL. Any user may set an ACL on a directory they own.
+    /// The named entry is this process's own uid: inside a user namespace, such as an
+    /// Apptainer container, an ACL naming an unmapped uid is refused with EINVAL.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_access_acl_round_trip() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("d");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        // SAFETY: geteuid cannot fail.
+        let acl = owner_acl(0o700, unsafe { libc::geteuid() }, 0o5);
+        match set_access_acl(&dir, &acl) {
+            Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+                eprintln!("skipped: no POSIX ACLs on {}", tmp.path().display());
+                return;
+            }
+            r => r.unwrap(),
+        }
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750, "the group bits report the mask");
+
+        let path = c_path(&dir).unwrap();
+        let mut buf = vec![0u8; 256];
+        // SAFETY: both strings are NUL-terminated and `buf` is valid for its length.
+        let n = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                ACCESS_ACL_XATTR.as_ptr().cast(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        assert!(n > 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(&buf[..n as usize], &acl[..]);
+
+        remove_access_acl(&dir).unwrap();
+        remove_access_acl(&dir).unwrap();
+        // SAFETY: as above.
+        let n = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                ACCESS_ACL_XATTR.as_ptr().cast(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        assert_eq!(n, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENODATA)
+        );
+    }
+
     use crate::get_schema;
     use std::fs::File;
     use std::io::Write;
