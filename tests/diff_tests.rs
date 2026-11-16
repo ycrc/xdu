@@ -62,6 +62,7 @@ fn open(conn: &Connection, dir: &Path) -> (DiffSide, Vec<String>) {
         DiffSide {
             index: dir.to_path_buf(),
             root,
+            hidden: Vec::new(),
         },
         partitions,
     )

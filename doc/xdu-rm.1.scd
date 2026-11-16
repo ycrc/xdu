@@ -22,6 +22,10 @@ Before deleting, *xdu-rm* displays a summary of matched files and prompts for
 confirmation unless *--force* is given. Use *--dry-run* to preview what would
 be deleted without removing anything.
 
+A partition directory the reader cannot open, such as one restricted to
+another group, is left out of the selection, and a note on standard error
+counts the directories left out. A *-u* naming one is an error.
+
 # OPTIONS
 
 *-i*, *--index* _DIR_

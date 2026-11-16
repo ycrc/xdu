@@ -331,6 +331,7 @@ pub fn select(args: &SelectArgs) -> Result<Selection> {
     let warning = index_completion_warning(&index);
     let filters = build_filters(args)?;
     let glob = checked_glob(&index, args.partition.as_deref()).map_err(|e| anyhow!(e))?;
+    crate::note_unreadable(&index, args.partition.as_deref())?;
     let (sql, params) = selection_sql(&glob, &filters, args.limit);
 
     let conn = crate::engine::open_connection()?;

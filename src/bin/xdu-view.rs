@@ -21,7 +21,7 @@ use ratatui::{
 
 use xdu::cli::XduViewArgs;
 use xdu::diff::discover_index_root;
-use xdu::layout::{list_partitions, normalize_partition_arg, top_level};
+use xdu::layout::{normalize_partition_arg, readable_partitions, top_level};
 use xdu::view_query::{self, Compare, DirEntry, Relation};
 use xdu::{
     IndexLocator, QueryFilters, ROOT_PARTITION, SortMode, format_bytes, format_bytes_signed,
@@ -1846,7 +1846,10 @@ fn main() -> Result<()> {
     // needs the root to line files up, and so needs a local index on both sides.
     let (index_root, compare) = match index {
         IndexLocator::Local(ref index_path) => {
-            let partitions = list_partitions(index_path)?;
+            let partitions = xdu::note_unreadable(index_path, None)?.partitions;
+            if let Some(ref p) = args.partition {
+                readable_partitions(index_path, Some(&normalize_partition_arg(p)))?;
+            }
             let index_root = discover_index_root(&conn, index_path, &partitions)?;
             let compare = match args.compare {
                 Some(ref old_path) => {

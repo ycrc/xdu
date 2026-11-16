@@ -21,6 +21,10 @@ Parquet index built by *xdu*(1). It supports two view modes:
 
 All command-line filters can also be modified interactively.
 
+A partition directory the reader cannot open, such as one restricted to
+another group, is left out of every answer, and a note on standard error counts
+the directories left out. A *-u* naming one is an error.
+
 # OPTIONS
 
 *-i*, *--index* _DIR_

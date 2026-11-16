@@ -58,6 +58,7 @@ fn main() -> Result<()> {
         eprintln!("{}", warning);
     }
 
+    xdu::note_unreadable(&index_path, args.partition.as_deref())?;
     let glob_pattern = index_glob(&index_path, args.partition.as_deref());
 
     // Connect to DuckDB (in-memory)

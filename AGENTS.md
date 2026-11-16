@@ -463,6 +463,13 @@ pinned `httpfs`, with the glob a bound parameter (`lib::parquet_source`); `xdu-r
   `--partition` run refuses a different one. An older manifest's `include_snapshots: false` reads
   as `[".snapshots"]`, the one name that xdu skipped; a manifest with neither field is not
   checked.
+- **Unreadable partitions:** DuckDB's glob skips a directory it cannot open and says nothing, so a
+  reader that cannot open some partitions sees a smaller tree at exit 0. Every local reader calls
+  `lib::note_unreadable` after the marker gates; it lists with `layout::readable_partitions`,
+  prints one stderr line counting the directories left out, and refuses a `-u` naming one. A
+  comparison hides a directory unreadable in either index from both sides (`DiffSide::hidden`),
+  or every file in it would read as added or removed. The crawler keeps the strict
+  `list_partitions`, since a partition it cannot see is one it cannot prune.
 - **Run-level completion marker:** `<outdir>/.xdu-complete` (`COMPLETION_MARKER`, `lib.rs`) — a
   dotfile and not a `.parquet`, so the readers' glob never mistakes it for a chunk. Per-chunk
   `.partial`→rename is atomic for one *file* but cannot express whether the **run** finished: when one

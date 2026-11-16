@@ -63,6 +63,7 @@ fn main() -> Result<()> {
             if let Some(warning) = index_completion_warning(&index_path) {
                 eprintln!("{}", warning);
             }
+            xdu::note_unreadable(&index_path, args.partition.as_deref())?;
 
             // Connect to DuckDB (in-memory)
             let conn = xdu::engine::open_connection()?;

@@ -19,6 +19,10 @@ With _PATH_ arguments it prints the total of the files at or below each one.
 Sizes are those the index recorded: disk usage, or apparent sizes when the
 index was built with *--apparent-size*.
 
+A partition directory the reader cannot open, such as one restricted to
+another group, is left out of every answer, and a note on standard error counts
+the directories left out. A *-u* naming one is an error.
+
 # OPTIONS
 
 *-i*, *--index* _DIR_

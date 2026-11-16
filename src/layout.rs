@@ -502,37 +502,109 @@ pub fn top_level_partitions(partitions: &[String]) -> Vec<String> {
 
 /// The partitions of a local index: every directory holding a `.parquet` chunk, at any
 /// depth, as sorted keys relative to the index root.
+///
+/// Every directory must be readable. The crawler lists with this, since a partition it
+/// cannot see is one it cannot prune; the readers use `readable_partitions`.
 pub fn list_partitions(index: &Path) -> Result<Vec<String>> {
-    fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) -> Result<()> {
-        let mut has_parquet = false;
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let ft = entry.file_type()?;
-            if ft.is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let child = if rel.is_empty() {
-                    name
-                } else {
-                    format!("{}/{}", rel, name)
-                };
-                walk(&entry.path(), &child, out)?;
-            } else if !rel.is_empty()
-                && entry.path().extension().is_some_and(|ext| ext == "parquet")
-            {
-                has_parquet = true;
+    let mut found = Readable::default();
+    if index.is_dir() {
+        walk_partitions(index, "", false, &mut found)?;
+    }
+    found.partitions.sort();
+    Ok(found.partitions)
+}
+
+/// What a reader can see of a local index: the partitions it can read, and the directories it
+/// was refused, whose partitions it cannot even name.
+#[derive(Debug, Default, PartialEq)]
+pub struct Readable {
+    pub partitions: Vec<String>,
+    /// Keys of the directories that refused a listing, sorted.
+    pub unreadable: Vec<String>,
+}
+
+impl Readable {
+    /// The one stderr line a reader prints when partitions were left out, or `None`.
+    ///
+    /// DuckDB's glob skips a directory it cannot open without a word, so without this an
+    /// index whose partitions carry their sources' permissions reads as a smaller tree, at
+    /// exit 0, for anyone outside some of the groups.
+    pub fn note(&self, index: &Path) -> Option<String> {
+        let n = self.unreadable.len();
+        (n > 0).then(|| {
+            format!(
+                "Note: {} director{} of index {} {} not readable by you; the partitions in {} \
+                 are left out.",
+                n,
+                if n == 1 { "y" } else { "ies" },
+                index.display(),
+                if n == 1 { "is" } else { "are" },
+                if n == 1 { "it" } else { "them" },
+            )
+        })
+    }
+}
+
+/// The partitions of a local index this process can read, under `scope` when one is given.
+///
+/// A directory whose listing fails with `PermissionDenied` is recorded in `unreadable` and not
+/// entered; any other error fails. A `scope` that is itself unreadable, or lies under a
+/// directory that is, is an error naming it, since every answer for it would be empty.
+pub fn readable_partitions(index: &Path, scope: Option<&str>) -> Result<Readable> {
+    let mut found = Readable::default();
+    match scope {
+        None => {
+            if index.is_dir() {
+                walk_partitions(index, "", true, &mut found)?;
             }
         }
-        if has_parquet {
-            out.push(rel.to_string());
+        Some(scope) => {
+            let dir = index.join(scope);
+            match std::fs::read_dir(&dir) {
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => anyhow::bail!(
+                    "Partition '{}' of index {} is not readable by you",
+                    scope,
+                    index.display()
+                ),
+                // Absent: the query's own "No files found" names the glob it tried.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                _ => walk_partitions(&dir, scope, true, &mut found)?,
+            }
         }
-        Ok(())
     }
-    let mut partitions = Vec::new();
-    if index.is_dir() {
-        walk(index, "", &mut partitions)?;
+    found.partitions.sort();
+    found.unreadable.sort();
+    Ok(found)
+}
+
+fn walk_partitions(dir: &Path, rel: &str, tolerant: bool, out: &mut Readable) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Err(e) if tolerant && e.kind() == std::io::ErrorKind::PermissionDenied => {
+            out.unreadable.push(rel.to_string());
+            return Ok(());
+        }
+        r => r.with_context(|| format!("Reading index directory {}", dir.display()))?,
+    };
+    let mut has_parquet = false;
+    for entry in entries {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{}/{}", rel, name)
+            };
+            walk_partitions(&entry.path(), &child, tolerant, out)?;
+        } else if !rel.is_empty() && entry.path().extension().is_some_and(|ext| ext == "parquet") {
+            has_parquet = true;
+        }
     }
-    partitions.sort();
-    Ok(partitions)
+    if has_parquet {
+        out.partitions.push(rel.to_string());
+    }
+    Ok(())
 }
 
 /// The index root as the readers' globs spell it, so `filename` values start with it.
@@ -858,6 +930,54 @@ mod tests {
         assert_eq!(
             top_level_partitions(&list_partitions(tmp.path()).unwrap()),
             vec!["__root__", "alice", "projects"]
+        );
+    }
+
+    #[test]
+    fn test_readable_partitions_records_refused_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        for p in ["alice", "bob", "projects", "projects/big"] {
+            fs::create_dir_all(tmp.path().join(p)).unwrap();
+            fs::write(tmp.path().join(p).join("000000.parquet"), b"").unwrap();
+        }
+        let lock = |p: &str, mode| {
+            fs::set_permissions(tmp.path().join(p), fs::Permissions::from_mode(mode)).unwrap()
+        };
+        lock("bob", 0o000);
+        lock("projects/big", 0o000);
+        let all = readable_partitions(tmp.path(), None);
+        let scoped = readable_partitions(tmp.path(), Some("projects"));
+        let refused = readable_partitions(tmp.path(), Some("bob"));
+        let strict = list_partitions(tmp.path());
+        lock("bob", 0o755);
+        lock("projects/big", 0o755);
+
+        let all = all.unwrap();
+        assert_eq!(all.partitions, vec!["alice", "projects"]);
+        assert_eq!(all.unreadable, vec!["bob", "projects/big"]);
+        assert!(
+            all.note(tmp.path())
+                .unwrap()
+                .contains("2 directories of index")
+        );
+        let scoped = scoped.unwrap();
+        assert_eq!(scoped.partitions, vec!["projects"]);
+        assert_eq!(scoped.unreadable, vec!["projects/big"]);
+        assert!(refused.unwrap_err().to_string().contains("Partition 'bob'"));
+        assert!(
+            strict.is_err(),
+            "the crawler's listing must not skip a directory"
+        );
+        assert_eq!(
+            readable_partitions(tmp.path(), None)
+                .unwrap()
+                .note(tmp.path()),
+            None
         );
     }
 

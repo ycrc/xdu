@@ -90,6 +90,11 @@ pub fn discover_index_root(
 pub struct DiffSide {
     pub index: PathBuf,
     pub root: String,
+    /// Keys of the directories either side could not read (`layout::Readable::unreadable`),
+    /// whose files are left out of both sides. DuckDB's glob skips an unreadable directory
+    /// without a word, so a directory readable in only one index would otherwise read as
+    /// every file in it added, or every file removed.
+    pub hidden: Vec<String>,
 }
 
 /// A unit of comparison: one partition, or a top-level directory with everything below it.
@@ -141,13 +146,39 @@ impl DiffSide {
         } else {
             partition_only_glob(&self.index, &unit.name)
         };
-        format!(
+        let select = format!(
             "SELECT substr(path, {start}) AS rel, size, atime, mtime, ctime, uid, gid, mode \
              FROM read_parquet({glob}, hive_partitioning = false)",
             start = self.root.chars().count() + 2,
             glob = sql_quote(&glob),
-        )
+        );
+        if self.hidden.is_empty() {
+            return select;
+        }
+        // A partition key is its directory relative to the crawl root, which is what `rel`
+        // is relative to, so a hidden key hides the paths below it; a hidden `__root__`
+        // hides the loose files, the paths with no directory.
+        let hide: Vec<String> = self
+            .hidden
+            .iter()
+            .map(|key| {
+                if key == ROOT_PARTITION {
+                    "strpos(rel, '/') > 0".to_string()
+                } else {
+                    format!("NOT starts_with(rel, {})", sql_quote(&format!("{key}/")))
+                }
+            })
+            .collect();
+        format!("SELECT * FROM ({select}) WHERE {}", hide.join(" AND "))
     }
+}
+
+/// The directories to hide from both sides of a comparison: those either side could not read.
+pub fn union_hidden(old: &[String], new: &[String]) -> Vec<String> {
+    let mut all: Vec<String> = old.iter().chain(new).cloned().collect();
+    all.sort();
+    all.dedup();
+    all
 }
 
 /// A query comparing one unit (see `diff_units`) between an old and a new index.
@@ -242,10 +273,12 @@ mod tests {
         let old = DiffSide {
             index: "/idx/old".into(),
             root: "/snap/a/home".into(),
+            hidden: Vec::new(),
         };
         let new = DiffSide {
             index: "/idx/new".into(),
             root: "/home".into(),
+            hidden: Vec::new(),
         };
         let unit = DiffUnit {
             name: "p".into(),

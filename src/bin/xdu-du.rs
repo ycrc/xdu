@@ -6,7 +6,7 @@ use duckdb::params_from_iter;
 
 use xdu::cli::XduDuArgs;
 use xdu::layout::top_level_key_sql;
-use xdu::{format_bytes, open_index, parquet_source};
+use xdu::{IndexLocator, format_bytes, open_index, parquet_source};
 
 fn fmt_size(bytes: i64, human: bool) -> String {
     if human {
@@ -19,6 +19,9 @@ fn fmt_size(bytes: i64, human: bool) -> String {
 fn main() -> Result<()> {
     let args = XduDuArgs::parse();
     let (index, conn) = open_index(&args.index)?;
+    if let IndexLocator::Local(ref path) = index {
+        xdu::note_unreadable(path, args.partition.as_deref())?;
+    }
     let source = |filename: bool| parquet_source(&index, args.partition.as_deref(), filename);
 
     let stdout = io::stdout();

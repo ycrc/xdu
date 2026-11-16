@@ -8,7 +8,7 @@ use duckdb::Connection;
 
 use xdu::cli::XduDiffArgs as Args;
 use xdu::diff::{DIFF_STATUSES, DiffSide, diff_partition_sql, diff_units, discover_index_root};
-use xdu::layout::{SplitSpec, index_split_spec, list_partitions, normalize_partition_arg};
+use xdu::layout::{SplitSpec, index_split_spec, normalize_partition_arg};
 use xdu::{
     IndexLocator, ROOT_PARTITION, csv_escape, format_bytes, format_bytes_signed, glob_to_regex,
     index_completion_warning, index_version_error, parse_size, sql_quote,
@@ -129,13 +129,19 @@ fn open_side(
     if let Some(warning) = index_completion_warning(&index) {
         eprintln!("{}", warning);
     }
-    let partitions = list_partitions(&index)?;
+    let readable = xdu::note_unreadable(&index, None)?;
+    let partitions = readable.partitions;
     let root = match root_override {
         Some(r) => r.trim_end_matches('/').to_string(),
         None => discover_index_root(conn, &index, &partitions)?,
     };
     let spec = index_split_spec(&index)?;
-    Ok((DiffSide { index, root }, partitions, spec))
+    let side = DiffSide {
+        index,
+        root,
+        hidden: readable.unreadable,
+    };
+    Ok((side, partitions, spec))
 }
 
 fn run(args: Args) -> Result<bool> {
@@ -170,8 +176,11 @@ fn run(args: Args) -> Result<bool> {
         .map_err(|e| anyhow::anyhow!(e))?;
 
     let conn = xdu::engine::open_connection()?;
-    let (old, old_parts, old_spec) = open_side(&conn, &args.old, &args.old_root)?;
-    let (new, new_parts, new_spec) = open_side(&conn, &args.new, &args.new_root)?;
+    let (mut old, old_parts, old_spec) = open_side(&conn, &args.old, &args.old_root)?;
+    let (mut new, new_parts, new_spec) = open_side(&conn, &args.new, &args.new_root)?;
+    let hidden = xdu::diff::union_hidden(&old.hidden, &new.hidden);
+    old.hidden = hidden.clone();
+    new.hidden = hidden;
 
     let mut units = diff_units(&old_parts, &new_parts, old_spec.same_layout(&new_spec));
     // Conditions on relative paths shared by both modes.

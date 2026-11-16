@@ -15,8 +15,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use duckdb::{Connection, params_from_iter};
 
-use crate::diff::{DiffSide, DiffUnit, diff_as_index_sql, diff_units, discover_index_root};
-use crate::layout::{list_partitions, top_level_key_sql};
+use crate::diff::{
+    DiffSide, DiffUnit, diff_as_index_sql, diff_units, discover_index_root, union_hidden,
+};
+use crate::layout::{readable_partitions, top_level_key_sql};
 use crate::{IndexLocator, QueryFilters, ROOT_PARTITION, SortMode, parquet_source, sql_quote};
 
 /// One row of a view: a partition, a directory, or a file.
@@ -548,8 +550,12 @@ impl Compare {
         new_partitions: &[String],
         old: &Path,
     ) -> Result<Compare> {
-        let old_partitions = list_partitions(old)?;
+        let old_read = crate::note_unreadable(old, None)?;
+        let old_partitions = old_read.partitions;
         let old_root = discover_index_root(conn, old, &old_partitions)?;
+        // The new index's note was printed when it was opened; this reads only its refusals.
+        let new_hidden = readable_partitions(new, None)?.unreadable;
+        let hidden = union_hidden(&old_read.unreadable, &new_hidden);
         let units = diff_units(&old_partitions, new_partitions, false)
             .into_iter()
             .map(|u| (u.name.clone(), u))
@@ -558,10 +564,12 @@ impl Compare {
             old: DiffSide {
                 index: old.to_path_buf(),
                 root: old_root,
+                hidden: hidden.clone(),
             },
             new: DiffSide {
                 index: new.to_path_buf(),
                 root: new_root.to_string(),
+                hidden,
             },
             units,
             tables: RefCell::new(HashMap::new()),

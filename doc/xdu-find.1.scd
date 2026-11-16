@@ -21,6 +21,10 @@ format, suitable for piping to other tools.
 
 Uses DuckDB for efficient Parquet queries with partition pruning.
 
+A partition directory the reader cannot open, such as one restricted to
+another group, is left out of every answer, and a note on standard error counts
+the directories left out. A *-u* naming one is an error.
+
 # OPTIONS
 
 *-i*, *--index* _DIR_

@@ -264,6 +264,21 @@ pub fn open_index(raw: &Path) -> anyhow::Result<(IndexLocator, duckdb::Connectio
     }
 }
 
+/// The partitions of a local index this process can read, under `scope` when one is given,
+/// having said on stderr how many directories it could not.
+///
+/// Every local reader calls this once after the marker gates. Their globs need no change:
+/// DuckDB skips a directory it cannot open, so the rows are already the readable ones, and
+/// this supplies the word that skip does not. A `scope` the reader cannot open fails here,
+/// naming it, rather than in DuckDB's "No files found".
+pub fn note_unreadable(index: &Path, scope: Option<&str>) -> anyhow::Result<layout::Readable> {
+    let readable = layout::readable_partitions(index, scope)?;
+    if let Some(note) = readable.note(index) {
+        eprintln!("{}", note);
+    }
+    Ok(readable)
+}
+
 /// Why an S3 request failed, as far as the reader can tell from DuckDB's error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum S3Cause {

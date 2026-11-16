@@ -29,6 +29,11 @@ Otherwise a file can lie in different partitions on each side, and whole
 top-level directories are compared instead. Both indexes must be local
 directories.
 
+A partition directory the reader cannot open in either index, such as one
+restricted to another group, is left out of both, so its files are reported
+neither added nor removed, and a note on standard error counts the directories
+left out.
+
 # OPTIONS
 
 _OLD_, _NEW_

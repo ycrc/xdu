@@ -117,6 +117,11 @@ The query path is shared:
    connection (for S3, `engine::open_s3_connection` with credentials from `s3::S3Settings`).
 2. The marker gates run: `lib::index_version_error` refuses, `lib::index_completion_warning` warns
    (`read_completion_marker_s3` and the `marker_*` pair for S3).
+   On a local index `lib::note_unreadable` then lists the partitions with
+   `layout::readable_partitions`. DuckDB's glob skips a directory it cannot open without a word,
+   so the rows are already the readable ones; this prints the count of directories left out, and
+   refuses a `-u` naming one. `xdu-diff` and `--compare` hide a directory unreadable in either
+   index from both sides (`DiffSide::hidden`), or its files would read as added or removed.
 3. `lib::parquet_source` builds the `FROM` clause: `read_parquet('<index>/**/*.parquet',
    hive_partitioning = false)`, or `<index>/<partition>/**/*.parquet` for `-u`. For S3 the glob is a
    bound parameter.

@@ -41,6 +41,10 @@ it is: a directory there would otherwise carry its whole subtree with it.
 Before moving, *xdu-mv* asks for confirmation unless *--force* is given. Use
 *--dry-run* to list each source with its destination without writing anything.
 
+A partition directory the reader cannot open, such as one restricted to
+another group, is left out of the selection, and a note on standard error
+counts the directories left out. A *-u* naming one is an error.
+
 # OPTIONS
 
 *-i*, *--index* _DIR_
