@@ -1441,3 +1441,122 @@ fn test_mirror_permissions_refuses_an_s3_index() {
         "{err}"
     );
 }
+
+/// Every `.parquet` chunk under `index`, at any depth.
+fn chunks_under(index: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![index.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "parquet") {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Nested partitions under `--mirror-permissions`: a parent that holds no chunks of its own
+/// still takes its source's access, a parent stricter than its child stays stricter (so it
+/// guards the way in, as in the source), each nested partition takes its own source's access
+/// rather than its parent's, and an index first built without the flag is corrected.
+#[test]
+fn test_mirror_permissions_with_nested_partitions() {
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("source");
+    let index = tmp.path().join("index");
+    let s = |p: &str| source.join(p);
+    let ix = |p: &str| index.join(p);
+
+    // g1 and g2 hold no files of their own, only their children's.
+    for d in ["g1/u1", "g1/u2", "g2/open", "g3/deep/inner"] {
+        fs::create_dir_all(s(d)).unwrap();
+    }
+    for f in [
+        "g1/u1/a",
+        "g1/u2/b",
+        "g2/open/c",
+        "g3/d",
+        "g3/deep/inner/e",
+        "loose",
+    ] {
+        create_test_file(&s(f), 10).unwrap();
+    }
+    let split = |extra: &[&str]| {
+        let mut args = vec![
+            "--apparent-size",
+            "--split-depth",
+            "2",
+            "--split",
+            "g3/deep/inner",
+            "-o",
+            index.to_str().unwrap(),
+            source.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let (_, err, ok) = run_xdu(&args);
+        assert!(ok, "xdu {extra:?} failed: {err}");
+        err
+    };
+
+    // Built first without the flag, so the directories exist at the crawler's default; the
+    // mirrored run must set them all again rather than only the ones it creates.
+    split(&[]);
+    set_mode(&s("g1"), 0o750);
+    set_mode(&s("g1/u1"), 0o700);
+    set_mode(&s("g1/u2"), 0o755);
+    set_mode(&s("g2"), 0o700);
+    set_mode(&s("g2/open"), 0o755);
+    set_mode(&s("g3"), 0o2775);
+    set_mode(&s("g3/deep"), 0o711);
+    set_mode(&s("g3/deep/inner"), 0o750);
+    split(&["--mirror-permissions"]);
+    assert_eq!(find_count(&index, &[]), 6);
+
+    let expect = [
+        ("g1", 0o750),
+        ("g1/u1", 0o700),
+        ("g1/u2", 0o755),
+        ("g2", 0o700),
+        ("g2/open", 0o755),
+        ("g3", 0o755),
+        ("g3/deep", 0o711),
+        ("g3/deep/inner", 0o750),
+        ("__root__", 0o700),
+    ];
+    for (dir, mode) in expect {
+        assert_eq!(mode_of(&ix(dir)), mode, "{dir}");
+    }
+    assert!(
+        !ix("g1").join("000000.parquet").exists() && !ix("g3/deep").join("000000.parquet").exists(),
+        "g1 and g3/deep are parents only, holding no chunks"
+    );
+    let chunks = chunks_under(&index);
+    assert_eq!(
+        chunks.len(),
+        6,
+        "one chunk per partition holding files: {chunks:?}"
+    );
+    for chunk in chunks {
+        assert_eq!(mode_of(&chunk), 0o644, "{}", chunk.display());
+    }
+
+    // A -p run of a nested partition, without the flag, sets that partition and the parents
+    // on its path, and leaves every other directory as it was until a run writes below it.
+    set_mode(&s("g2/open"), 0o750);
+    set_mode(&s("g2"), 0o750);
+    set_mode(&s("g1"), 0o710);
+    split(&["-p", "g2/open"]);
+    assert_eq!(mode_of(&ix("g2/open")), 0o750);
+    assert_eq!(mode_of(&ix("g2")), 0o750);
+    assert_eq!(mode_of(&ix("g1")), 0o750, "no -p run wrote below g1");
+
+    // A full run without the flag reaches the rest.
+    let err = split(&[]);
+    assert!(err.contains("mirror-permissions"), "{err}");
+    assert_eq!(mode_of(&ix("g1")), 0o710);
+    assert_eq!(mode_of(&ix("g1/u1")), 0o700);
+}
