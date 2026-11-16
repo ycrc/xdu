@@ -174,12 +174,18 @@ xdu /home -o /var/lib/xdu/home -j 16 -B 100000
 | `--split-file` | Read `--split` paths from a file | |
 | `--apparent-size` | Report file length instead of disk usage (st_blocks) | |
 | `-k, --block-size` | Round sizes up to block size (e.g., `128K`). Implies `--apparent-size` | |
-| `--include-snapshots` | Also index `.snapshots` directories (GPFS snapshots) | Skipped |
+| `--include-snapshots` | Also index snapshot directories | Skipped |
+| `--snapshot-dir NAME` | Also skip directories named NAME as snapshots (repeatable) | `.snapshots`, `.snapshot` |
 
-Directories named `.snapshots` are skipped wherever they occur: each GPFS snapshot is a copy of
-the tree around it, so indexing it counts the same files again. A crawl root inside a snapshot
-(e.g. `/fs/.snapshots/@GMT-…/home`) is still indexed. A `-p` run must use the setting the index
-was built with.
+Directories named `.snapshots` (GPFS) or `.snapshot` (NetApp, PowerScale, VAST) are skipped
+wherever they occur: each snapshot is a copy of the tree around it, so indexing it counts the same
+files again. `--snapshot-dir` adds a name, such as `.zfs`, without a rebuild. A crawl root inside a
+snapshot (e.g. `/fs/.snapshots/@GMT-…/home`) is still indexed. The skipped names are saved in
+`_xdu.json`, and a `-p` run must use the same ones.
+
+To compare snapshots, crawl each with `--apparent-size`. Inside a GPFS snapshot `st_blocks` does
+not report a file's real usage (a 14 MB file reports 512 bytes), so disk-usage sizes cannot be
+compared.
 
 ### Querying with xdu-find
 

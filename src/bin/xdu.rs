@@ -23,7 +23,7 @@ use xdu::crawl::{
     lossy_path, remove_stale_partition,
 };
 use xdu::layout::{
-    MANIFEST_VERSION, Manifest, SNAPSHOT_DIR, SplitPoint, SplitSpec, is_nested, list_partitions,
+    MANIFEST_VERSION, Manifest, SnapshotDirs, SplitPoint, SplitSpec, is_nested, list_partitions,
     normalize_partition_arg, resolve_split_points, split_keys,
 };
 use xdu::s3::{IndexLocator, ProcessEnv, S3Settings, S3Sink};
@@ -80,7 +80,7 @@ fn crawl(
     partition_filter: Option<&HashSet<String>>,
     recursive: bool,
     allow_errors: bool,
-    include_snapshots: bool,
+    snapshots: &SnapshotDirs,
     is_tty: bool,
 ) -> Result<CrawlStats> {
     // Build shared rayon thread pool for jwalk walkers
@@ -101,7 +101,7 @@ fn crawl(
         let entry = entry?;
         let path = entry.path();
         let ft = entry.file_type()?;
-        if ft.is_dir() && !include_snapshots && entry.file_name() == SNAPSHOT_DIR {
+        if ft.is_dir() && snapshots.skips(&entry.file_name()) {
             continue;
         }
         let name = path.file_name().unwrap().to_string_lossy().to_string();
@@ -121,6 +121,7 @@ fn crawl(
         build_split_work_queue(entries, top_dir, split_points, partition_filter, recursive)?;
     let num_items = work_queue.len();
     let split_skip = Arc::new(SplitSkip::new(split_points));
+    let snapshot_dirs = Arc::new(snapshots.clone());
 
     // Pre-flight has passed, so from here the index is being rewritten and the previous
     // run's attestation no longer describes it. Dropping the marker after the last check
@@ -155,8 +156,10 @@ fn crawl(
         if allow_errors {
             opts.push_str(", allow-errors");
         }
-        if include_snapshots {
+        if snapshots.names().is_empty() {
             opts.push_str(", include-snapshots");
+        } else {
+            opts.push_str(&format!(", skip={}", snapshots.names().join(",")));
         }
         let msg = format!("Indexing {}{} ({opts})", top_dir.display(), filter_desc);
         eprintln!("{}", format_log_record(LogLevel::Info, &msg));
@@ -214,6 +217,7 @@ fn crawl(
                 let global_bar_ref = &global_bar;
                 let sink = Arc::clone(sink);
                 let split_skip = Arc::clone(&split_skip);
+                let snapshot_dirs = Arc::clone(&snapshot_dirs);
 
                 s.spawn(move || -> Result<()> {
                     let bar_style = ProgressStyle::default_spinner()
@@ -260,6 +264,7 @@ fn crawl(
                             // each file is indexed by the deepest partition containing it
                             // and by no other.
                             let skip = Arc::clone(&split_skip);
+                            let snapshots = Arc::clone(&snapshot_dirs);
                             let base_depth = item.depth;
                             // Each entry carries its lstat result from the pool thread
                             // that read its directory. Done in the driver loop instead,
@@ -286,12 +291,12 @@ fn crawl(
                                         // `depth` is None for the walk root's own entry, which is
                                         // always kept.
                                         let Some(depth) = depth else { return };
-                                        // Below the root only: a walk root named .snapshots
-                                        // was asked for by name.
-                                        if !include_snapshots {
+                                        // Below the root only: a walk root inside a
+                                        // snapshot was asked for by name.
+                                        if !snapshots.names().is_empty() {
                                             children.retain(|child| {
                                                 !matches!(child, Ok(e) if e.file_type.is_dir()
-                                                    && e.file_name == SNAPSHOT_DIR)
+                                                    && snapshots.skips(&e.file_name))
                                             });
                                         }
                                         if !skip.checks_children_at(base_depth + depth) {
@@ -765,18 +770,21 @@ fn run(is_tty: bool) -> Result<()> {
         );
     }
     // Snapshots decide which directories are partitions and which files a partition holds,
-    // so a partial run under the other setting would leave the index mixing the two. An index
-    // from before the setting was recorded is not checked.
+    // so a partial run under another skip list would leave the index mixing the two. An index
+    // from before any snapshot setting was recorded is not checked.
+    let snapshots = SnapshotDirs::new(args.include_snapshots, &args.snapshot_dir);
     if let Some(ref m) = existing
         && args.partition.is_some()
-        && let Some(indexed) = m.include_snapshots
-        && indexed != args.include_snapshots
+        && let Some(ref indexed) = m.snapshot_dirs
+        && *indexed != snapshots
     {
         anyhow::bail!(
-            "The existing index in {} was built {} --include-snapshots; repeat that setting, \
-             or run without --partition to rebuild the whole index",
+            "The existing index in {} was built skipping snapshot directories: {}; this run \
+             skips: {}. Repeat the index's --include-snapshots/--snapshot-dir setting, or run \
+             without --partition to rebuild the whole index",
             args.outdir.display(),
-            if indexed { "with" } else { "without" }
+            indexed.describe(),
+            snapshots.describe()
         );
     }
     let size_label = size_mode_label(size_mode);
@@ -796,7 +804,7 @@ fn run(is_tty: bool) -> Result<()> {
         }
     }
 
-    let (split_points, warnings) = resolve_split_points(&top_dir, &spec, args.include_snapshots)?;
+    let (split_points, warnings) = resolve_split_points(&top_dir, &spec, &snapshots)?;
     for w in &warnings {
         let msg = format!("warning: {w}");
         if is_tty {
@@ -818,12 +826,12 @@ fn run(is_tty: bool) -> Result<()> {
             if name == ROOT_PARTITION || keys.contains(name) {
                 continue;
             }
-            if !args.include_snapshots && name.split('/').any(|c| c == SNAPSHOT_DIR) {
+            if let Some(dir) = snapshots.first_in_path(name) {
                 anyhow::bail!(
-                    "Partition '{}' is inside a {} directory, which is skipped; pass \
-                     --include-snapshots to index snapshots",
+                    "Partition '{}' is inside a {} directory, which is skipped as a snapshot; \
+                     pass --include-snapshots to index snapshots",
                     name,
-                    SNAPSHOT_DIR
+                    dir
                 );
             }
             if top_dir.join(name).is_dir() {
@@ -854,7 +862,7 @@ fn run(is_tty: bool) -> Result<()> {
         partition_filter.as_ref(),
         args.recursive,
         args.allow_errors,
-        args.include_snapshots,
+        &snapshots,
         is_tty,
     )?;
 
@@ -890,7 +898,7 @@ fn run(is_tty: bool) -> Result<()> {
             root: top_dir.to_string_lossy().to_string(),
             split: spec.clone(),
             size_mode: size_label.clone(),
-            include_snapshots: Some(args.include_snapshots),
+            snapshot_dirs: Some(snapshots.clone()),
         }
         .save(outdir)
         .with_context(|| format!("Failed to write manifest in {}", outdir.display()))?;

@@ -54,7 +54,7 @@ compares two indexes one partition at a time.
   index **format version**: 2 for the flat layout, 3 when any partition is nested. Every reader
   refuses an index with no marker or a version it does not understand, and warns when the marker
   records tolerated errors.
-- `_xdu.json` — the manifest: crawl root, split spec, size mode and the `.snapshots` setting.
+- `_xdu.json` — the manifest: crawl root, split spec, size mode and the skipped snapshot names.
   A later run reuses the split spec, and a `-p` run refuses a different one, so partitions never
   overlap.
 
@@ -84,8 +84,9 @@ driver threads:
 - The walker's `process_read_dir` callback runs on the pool thread that read each directory. It
   `lstat`s every regular file there and attaches the result to the entry (jwalk's `client_state`),
   so the metadata calls, which dominate on GPFS and Lustre, run on all `-j` threads even inside one
-  partition. The same callback prunes `.snapshots` directories (unless `--include-snapshots`) and
-  the split points that belong to other partitions (`crawl::SplitSkip`).
+  partition. The same callback prunes snapshot directories (`.snapshots`, `.snapshot` and any
+  `--snapshot-dir`, unless `--include-snapshots`) and the split points that belong to other
+  partitions (`crawl::SplitSkip`).
 - A driver turns each entry into a row (`crawl::file_measurements`, `crawl::lossy_path`). A stat
   that fails is repeated and classified (`crawl::classify_io_error`): a file that vanished is
   counted, anything else is an error that fails the run unless `--allow-errors`.

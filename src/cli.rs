@@ -87,11 +87,22 @@ pub struct XduArgs {
     #[arg(long)]
     pub allow_errors: bool,
 
-    /// Also index directories named .snapshots (GPFS snapshots). By default they are
-    /// skipped: each snapshot is a copy of the tree around it, so indexing it counts the
-    /// same files again. A --partition run must use the index's existing setting.
+    /// Also index snapshot directories. By default directories named .snapshots (GPFS) or
+    /// .snapshot (NetApp, PowerScale, VAST), and any named with --snapshot-dir, are skipped:
+    /// each snapshot is a copy of the tree around it, so indexing it counts the same files
+    /// again. A --partition run must use the index's existing setting.
     #[arg(long)]
     pub include_snapshots: bool,
+
+    /// Also skip directories named NAME as snapshots, in addition to .snapshots and
+    /// .snapshot. Matched literally at any depth. Repeat for several names.
+    #[arg(
+        long,
+        value_name = "NAME",
+        conflicts_with = "include_snapshots",
+        value_parser = crate::layout::parse_snapshot_dir
+    )]
+    pub snapshot_dir: Vec<String>,
 }
 
 /// Arguments for `xdu-find` — the index query tool.

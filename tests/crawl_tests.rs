@@ -1132,19 +1132,24 @@ fn test_failing_run_logs_error_record_without_marker() {
 }
 
 // =============================================================================
-// .snapshots: skipped by default, walked with --include-snapshots
+// Snapshot directories: skipped by default, walked with --include-snapshots
 // =============================================================================
 
-/// A tree with snapshot copies at the root, in a partition, and deeper; a look-alike name
-/// that must not be skipped; and one loose file.
+/// A tree with GPFS (.snapshots) and NetApp-style (.snapshot) copies at the root, in a
+/// partition, and deeper; a ZFS-style .zfs that only --snapshot-dir skips; a look-alike name
+/// that must not be skipped; and one loose file. Nine files, four outside any default
+/// snapshot directory.
 fn snapshot_tree(source: &std::path::Path) {
     for (rel, size) in [
         ("loose.txt", 10),
         ("alice/f.txt", 100),
         ("alice/.snapshotsx/h.txt", 200),
+        ("alice/.zfs/snapshot/s1/f.txt", 100),
         ("alice/.snapshots/@GMT-1/f.txt", 100),
         ("alice/sub/.snapshots/@GMT-1/g.txt", 300),
         (".snapshots/@GMT-1/alice/f.txt", 100),
+        ("alice/sub/.snapshot/hourly.0/g.txt", 300),
+        (".snapshot/hourly.0/alice/f.txt", 100),
     ] {
         create_test_file(&source.join(rel), size).unwrap();
     }
@@ -1173,23 +1178,64 @@ fn test_snapshots_skipped_by_default() {
         let (err, ok) = xdu_into(&source, &index, &["--split-depth", depth]);
         assert!(ok, "xdu failed: {err}");
         let paths = find_paths(&index);
-        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert_eq!(paths.len(), 4, "{paths:?}");
         assert!(
-            !paths.iter().any(|p| p.contains("/.snapshots/")),
+            !paths
+                .iter()
+                .any(|p| p.contains("/.snapshots/") || p.contains("/.snapshot/")),
             "{paths:?}"
         );
         assert!(paths.iter().any(|p| p.ends_with(".snapshotsx/h.txt")));
         // No partition was made for a snapshot directory, at the top or below it.
-        assert!(!index.join(".snapshots").exists());
-        assert!(!index.join("alice/.snapshots").exists());
+        for dir in [
+            ".snapshots",
+            ".snapshot",
+            "alice/.snapshots",
+            "alice/sub/.snapshot",
+        ] {
+            assert!(!index.join(dir).exists(), "{dir}");
+        }
     }
 
     // A crawl root inside a snapshot, as when indexing one snapshot to diff it against
-    // another, is walked: only .snapshots directories below the root are skipped.
-    let index = tmp.path().join("index-snap");
-    let (err, ok) = xdu_into(&source.join(".snapshots/@GMT-1"), &index, &[]);
+    // another, is walked: only snapshot directories below the root are skipped.
+    for root in [".snapshots/@GMT-1", ".snapshot/hourly.0"] {
+        let index = tmp.path().join(format!("index-{}", root.replace('/', "_")));
+        let (err, ok) = xdu_into(&source.join(root), &index, &[]);
+        assert!(ok, "xdu failed: {err}");
+        assert_eq!(find_count(&index, &[]), 1, "{root}");
+    }
+}
+
+#[test]
+fn test_snapshot_dir_adds_a_name() {
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("source");
+    snapshot_tree(&source);
+
+    let index = tmp.path().join("index");
+    let (err, ok) = xdu_into(
+        &source,
+        &index,
+        &["--split-depth", "2", "--snapshot-dir", ".zfs"],
+    );
     assert!(ok, "xdu failed: {err}");
-    assert_eq!(find_count(&index, &[]), 1);
+    let paths = find_paths(&index);
+    assert_eq!(paths.len(), 3, "{paths:?}");
+    assert!(!paths.iter().any(|p| p.contains("/.zfs/")), "{paths:?}");
+    assert!(!index.join("alice/.zfs").exists());
+    // The run states the list it skipped.
+    assert!(err.contains("skip=.snapshot,.snapshots,.zfs"), "{err}");
+
+    // The flag names one directory, literally, and means nothing beside --include-snapshots.
+    for extra in [
+        &["--snapshot-dir", "a/b"][..],
+        &["--snapshot-dir", ".snap*"][..],
+        &["--snapshot-dir", ".zfs", "--include-snapshots"][..],
+    ] {
+        let (err, ok) = xdu_into(&source, &tmp.path().join("refused"), extra);
+        assert!(!ok, "{extra:?} was accepted: {err}");
+    }
 }
 
 #[test]
@@ -1201,8 +1247,9 @@ fn test_include_snapshots_indexes_them() {
 
     let (err, ok) = xdu_into(&source, &index, &["--include-snapshots"]);
     assert!(ok, "xdu failed: {err}");
-    assert_eq!(find_count(&index, &[]), 6);
+    assert_eq!(find_count(&index, &[]), 9);
     assert_eq!(find_count(&index, &["-u", ".snapshots"]), 1);
+    assert_eq!(find_count(&index, &["-u", ".snapshot"]), 1);
 }
 
 #[test]
@@ -1215,20 +1262,61 @@ fn test_partition_run_keeps_the_index_snapshot_setting() {
     let (err, ok) = xdu_into(&source, &index, &[]);
     assert!(ok, "xdu failed: {err}");
 
-    let (err, ok) = xdu_into(&source, &index, &["-p", "alice", "--include-snapshots"]);
-    assert!(!ok);
-    assert!(err.contains("without --include-snapshots"), "{err}");
+    for extra in [
+        &["-p", "alice", "--include-snapshots"][..],
+        &["-p", "alice", "--snapshot-dir", ".zfs"][..],
+    ] {
+        let (err, ok) = xdu_into(&source, &index, extra);
+        assert!(!ok, "{extra:?} was accepted");
+        assert!(
+            err.contains("built skipping snapshot directories: .snapshot, .snapshots"),
+            "{err}"
+        );
+    }
 
-    let (err, ok) = xdu_into(&source, &index, &["-p", ".snapshots"]);
-    assert!(!ok);
-    assert!(err.contains("--include-snapshots"), "{err}");
+    for name in [".snapshots", ".snapshot", "alice/sub/.snapshot"] {
+        let (err, ok) = xdu_into(&source, &index, &["-p", name]);
+        assert!(!ok, "{name} was accepted");
+        assert!(err.contains("--include-snapshots"), "{err}");
+    }
 
     let (err, ok) = xdu_into(&source, &index, &["-p", "alice"]);
     assert!(ok, "xdu failed: {err}");
-    assert_eq!(find_count(&index, &[]), 3);
+    assert_eq!(find_count(&index, &[]), 4);
 
     // A full run may change the setting.
     let (err, ok) = xdu_into(&source, &index, &["--include-snapshots"]);
     assert!(ok, "xdu failed: {err}");
-    assert_eq!(find_count(&index, &[]), 6);
+    assert_eq!(find_count(&index, &[]), 9);
+}
+
+/// An index built before the list existed skipped .snapshots alone, so a partition run under
+/// today's defaults, which also skip .snapshot, would mix the two rules in one index.
+#[test]
+fn test_partition_run_refuses_an_index_from_the_older_snapshot_rule() {
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("source");
+    let index = tmp.path().join("index");
+    snapshot_tree(&source);
+
+    let (err, ok) = xdu_into(&source, &index, &[]);
+    assert!(ok, "xdu failed: {err}");
+    let manifest = index.join("_xdu.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    let fields = v.as_object_mut().unwrap();
+    assert!(fields.remove("snapshot_dirs").is_some());
+    fields.insert("include_snapshots".into(), serde_json::Value::Bool(false));
+    std::fs::write(&manifest, v.to_string()).unwrap();
+
+    let (err, ok) = xdu_into(&source, &index, &["-p", "alice"]);
+    assert!(!ok);
+    assert!(err.contains("snapshot directories: .snapshots;"), "{err}");
+
+    // A full run rewrites the manifest with the list.
+    let (err, ok) = xdu_into(&source, &index, &[]);
+    assert!(ok, "xdu failed: {err}");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    assert!(text.contains(r#""snapshot_dirs""#), "{text}");
+    assert!(!text.contains("include_snapshots"), "{text}");
 }

@@ -14,7 +14,7 @@
 //! `*/*.parquet` refuses it instead of silently missing the nested chunks.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -30,10 +30,96 @@ pub const MANIFEST_FILE: &str = "_xdu.json";
 /// The newest manifest layout this xdu reads and the one it writes.
 pub const MANIFEST_VERSION: u64 = 1;
 
-/// The name of GPFS's snapshot directory. Each `@GMT-…` entry below it is a read-only copy
-/// of the tree it sits in, so walking it indexes the same files again under other paths;
-/// `xdu` skips directories of this name unless `--include-snapshots` is given.
-pub const SNAPSHOT_DIR: &str = ".snapshots";
+/// The snapshot directory names `xdu` skips by default: GPFS's `.snapshots`, and the
+/// `.snapshot` of NetApp, PowerScale and VAST. Each entry below one is a read-only copy of the
+/// tree it sits in, so walking it indexes the same files again under other paths.
+pub const DEFAULT_SNAPSHOT_DIRS: &[&str] = &[".snapshots", ".snapshot"];
+
+/// The directory names a crawl skips as snapshots, sorted and without duplicates: the
+/// defaults plus any `--snapshot-dir`, or none under `--include-snapshots`. One value is
+/// consulted by the top-level listing, the walker and `resolve_split_points`, which must agree
+/// or a snapshot could still become a partition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotDirs(Vec<String>);
+
+impl SnapshotDirs {
+    pub fn new(include_snapshots: bool, extra: &[String]) -> Self {
+        if include_snapshots {
+            return SnapshotDirs(Vec::new());
+        }
+        let names = DEFAULT_SNAPSHOT_DIRS.iter().map(|s| s.to_string());
+        Self::from_names(names.chain(extra.iter().cloned()).collect())
+    }
+
+    /// A list read back from a manifest, in the canonical order.
+    pub fn from_names(mut names: Vec<String>) -> Self {
+        names.sort();
+        names.dedup();
+        SnapshotDirs(names)
+    }
+
+    pub fn names(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Whether a directory with this name is skipped. Compared on the raw bytes, so a
+    /// non-UTF-8 name never matches by lossy conversion.
+    pub fn skips(&self, name: &OsStr) -> bool {
+        self.0.iter().any(|n| OsStr::new(n) == name)
+    }
+
+    /// The first component of a `/`-separated relative path that is skipped, if any.
+    pub fn first_in_path<'a>(&self, path: &'a str) -> Option<&'a str> {
+        path.split('/').find(|c| self.skips(OsStr::new(c)))
+    }
+
+    /// The list for messages: `.snapshot, .snapshots`, or `none` under `--include-snapshots`.
+    pub fn describe(&self) -> String {
+        if self.0.is_empty() {
+            "none".to_string()
+        } else {
+            self.0.join(", ")
+        }
+    }
+}
+
+impl Default for SnapshotDirs {
+    fn default() -> Self {
+        SnapshotDirs::new(false, &[])
+    }
+}
+
+/// A manifest's snapshot setting. Before the list existed the manifest held only
+/// `include_snapshots`, and that xdu skipped `.snapshots` alone, so `false` reads as that
+/// one-name list rather than today's defaults.
+fn snapshot_dirs_field(v: &serde_json::Value) -> Option<SnapshotDirs> {
+    if let Some(names) = v["snapshot_dirs"].as_array() {
+        let names = names
+            .iter()
+            .filter_map(|n| n.as_str().map(String::from))
+            .collect();
+        return Some(SnapshotDirs::from_names(names));
+    }
+    match v["include_snapshots"].as_bool()? {
+        true => Some(SnapshotDirs::new(true, &[])),
+        false => Some(SnapshotDirs::from_names(vec![".snapshots".to_string()])),
+    }
+}
+
+/// `--snapshot-dir`'s value parser: one literal directory name.
+pub fn parse_snapshot_dir(name: &str) -> Result<String, String> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        return Err(format!(
+            "'{name}' is not a directory name; give one name such as .snapshot, not a path"
+        ));
+    }
+    if name.contains(['*', '?', '[']) {
+        return Err(format!(
+            "'{name}' holds a wildcard; snapshot directory names are matched literally"
+        ));
+    }
+    Ok(name.to_string())
+}
 
 /// Which directories become partitions (split points).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,9 +178,10 @@ pub struct Manifest {
     /// The size mode's label (`disk-usage`, `apparent-size`, `block-rounded(N)`), recorded so
     /// a `--partition` run that mixes modes can say so.
     pub size_mode: String,
-    /// Whether `.snapshots` directories were walked. `None` for a manifest written before
-    /// the setting existed; that xdu walked them, but whether the tree had any is unknown.
-    pub include_snapshots: Option<bool>,
+    /// The snapshot directory names the crawl skipped. `None` for a manifest written before
+    /// any snapshot setting existed; that xdu walked them, but whether the tree had any is
+    /// unknown.
+    pub snapshot_dirs: Option<SnapshotDirs>,
 }
 
 impl Manifest {
@@ -139,7 +226,7 @@ impl Manifest {
             root,
             split: SplitSpec { depth, patterns },
             size_mode: v["size_mode"].as_str().unwrap_or("").to_string(),
-            include_snapshots: v["include_snapshots"].as_bool(),
+            snapshot_dirs: snapshot_dirs_field(&v),
         }))
     }
 
@@ -152,8 +239,8 @@ impl Manifest {
             "split": { "depth": split.depth, "patterns": split.patterns },
             "size_mode": self.size_mode,
         });
-        if let Some(include) = self.include_snapshots {
-            v["include_snapshots"] = serde_json::Value::Bool(include);
+        if let Some(ref dirs) = self.snapshot_dirs {
+            v["snapshot_dirs"] = serde_json::json!(dirs.names());
         }
         let path = index.join(MANIFEST_FILE);
         let tmp = index.join(format!("{}.partial", MANIFEST_FILE));
@@ -210,15 +297,15 @@ pub struct SplitPoint {
 
 /// Real (non-symlink) subdirectories of `dir` as (lossy name, real name), sorted. An
 /// unreadable directory has none: the crawl reports it as an error when it gets there.
-/// `.snapshots` is left out unless `include_snapshots`, since the walk will not enter it.
-fn subdirs(dir: &Path, include_snapshots: bool) -> Vec<(String, OsString)> {
+/// Snapshot directories are left out, since the walk will not enter them.
+fn subdirs(dir: &Path, snapshots: &SnapshotDirs) -> Vec<(String, OsString)> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut names: Vec<(String, OsString)> = rd
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter(|e| include_snapshots || e.file_name() != SNAPSHOT_DIR)
+        .filter(|e| !snapshots.skips(&e.file_name()))
         .map(|e| (e.file_name().to_string_lossy().to_string(), e.file_name()))
         .collect();
     names.sort();
@@ -261,13 +348,13 @@ fn explain_missing_dir(root: &Path, rel: &str) -> String {
 /// parent's partition without a word. Two directories whose names collapse onto one lossy key
 /// are an error too, since both would write the same partition.
 ///
-/// Without `include_snapshots`, no split point lies in a `.snapshots` directory: depth and
-/// wildcards pass over it, and a literal path through it is an error, because the walk skips
-/// it and the partition would come out empty.
+/// No split point lies in a skipped snapshot directory: depth and wildcards pass over it, and
+/// a literal path through it is an error, because the walk skips it and the partition would
+/// come out empty.
 pub fn resolve_split_points(
     root: &Path,
     spec: &SplitSpec,
-    include_snapshots: bool,
+    snapshots: &SnapshotDirs,
 ) -> Result<(Vec<SplitPoint>, Vec<String>)> {
     let mut points: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut warnings = Vec::new();
@@ -304,7 +391,7 @@ pub fn resolve_split_points(
     for _ in 0..spec.depth {
         let mut next = Vec::new();
         for parent in &level {
-            for (name, real) in subdirs(&parent.path, include_snapshots) {
+            for (name, real) in subdirs(&parent.path, snapshots) {
                 let point = child(parent, &name, &real);
                 insert(&mut points, point.clone())?;
                 next.push(point);
@@ -335,12 +422,12 @@ pub fn resolve_split_points(
                 pattern
             );
         }
-        if !include_snapshots && comps.contains(&SNAPSHOT_DIR) {
+        if let Some(dir) = snapshots.first_in_path(pattern) {
             anyhow::bail!(
-                "Split path '{}' is inside a {} directory, which is skipped; pass \
-                 --include-snapshots to index snapshots",
+                "Split path '{}' is inside a {} directory, which is skipped as a snapshot; \
+                 pass --include-snapshots to index snapshots",
                 pattern,
-                SNAPSHOT_DIR
+                dir
             );
         }
         let mut matches: Vec<SplitPoint> = vec![top.clone()];
@@ -349,7 +436,7 @@ pub fn resolve_split_points(
             for parent in &matches {
                 if comp.contains(['*', '?']) {
                     next.extend(
-                        subdirs(&parent.path, include_snapshots)
+                        subdirs(&parent.path, snapshots)
                             .iter()
                             .filter(|(name, _)| component_glob_match(comp, name))
                             .map(|(name, real)| child(parent, name, real)),
@@ -542,7 +629,8 @@ mod tests {
     fn test_resolve_split_points_depth_and_patterns() {
         let tmp = tree();
         let (points, warnings) =
-            resolve_split_points(tmp.path(), &SplitSpec::default(), false).unwrap();
+            resolve_split_points(tmp.path(), &SplitSpec::default(), &SnapshotDirs::default())
+                .unwrap();
         assert_eq!(split_keys(&points), vec!["alice", "projects"]);
         assert_eq!(points[1].path, tmp.path().join("projects"));
         assert!(warnings.is_empty());
@@ -556,7 +644,8 @@ mod tests {
                 "nope*".into(),
             ],
         };
-        let (points, warnings) = resolve_split_points(tmp.path(), &spec, false).unwrap();
+        let (points, warnings) =
+            resolve_split_points(tmp.path(), &spec, &SnapshotDirs::default()).unwrap();
         let points = split_keys(&points);
         assert_eq!(
             points,
@@ -577,7 +666,7 @@ mod tests {
                 depth: 0,
                 patterns: vec![],
             },
-            false,
+            &SnapshotDirs::default(),
         )
         .unwrap();
         assert!(points.is_empty());
@@ -589,6 +678,7 @@ mod tests {
         for d in [
             ".snapshots/@GMT-1/alice",
             "alice/.snapshots/@GMT-1",
+            "alice/.snapshot/hourly.0",
             "alice/sub",
         ] {
             fs::create_dir_all(tmp.path().join(d)).unwrap();
@@ -597,30 +687,39 @@ mod tests {
             depth: 2,
             patterns: vec!["*/*".into()],
         };
-        let (points, _) = resolve_split_points(tmp.path(), &spec, false).unwrap();
+        let (points, _) =
+            resolve_split_points(tmp.path(), &spec, &SnapshotDirs::default()).unwrap();
         assert_eq!(split_keys(&points), vec!["alice", "alice/sub"]);
 
-        let (points, _) = resolve_split_points(tmp.path(), &spec, true).unwrap();
+        let (points, _) =
+            resolve_split_points(tmp.path(), &spec, &SnapshotDirs::new(true, &[])).unwrap();
         assert_eq!(
             split_keys(&points),
             vec![
                 ".snapshots",
                 ".snapshots/@GMT-1",
                 "alice",
+                "alice/.snapshot",
                 "alice/.snapshots",
                 "alice/sub"
             ]
         );
 
+        // A name added with --snapshot-dir is skipped like the defaults.
+        let extra = SnapshotDirs::new(false, &["sub".to_string()]);
+        let (points, _) = resolve_split_points(tmp.path(), &spec, &extra).unwrap();
+        assert_eq!(split_keys(&points), vec!["alice"]);
+
         let literal = SplitSpec {
             depth: 1,
-            patterns: vec!["alice/.snapshots".into()],
+            patterns: vec!["alice/.snapshot".into()],
         };
-        let msg = resolve_split_points(tmp.path(), &literal, false)
+        let msg = resolve_split_points(tmp.path(), &literal, &SnapshotDirs::default())
             .unwrap_err()
             .to_string();
+        assert!(msg.contains("inside a .snapshot directory"), "{msg}");
         assert!(msg.contains("--include-snapshots"), "{msg}");
-        assert!(resolve_split_points(tmp.path(), &literal, true).is_ok());
+        assert!(resolve_split_points(tmp.path(), &literal, &SnapshotDirs::new(true, &[])).is_ok());
     }
 
     #[test]
@@ -636,7 +735,7 @@ mod tests {
                 depth: 1,
                 patterns: vec![pattern.into()],
             };
-            let err = resolve_split_points(tmp.path(), &spec, false)
+            let err = resolve_split_points(tmp.path(), &spec, &SnapshotDirs::default())
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(needle), "{pattern}: {err}");
@@ -651,7 +750,7 @@ mod tests {
             depth: 0,
             patterns: vec!["link".into()],
         };
-        let err = resolve_split_points(tmp.path(), &spec, false)
+        let err = resolve_split_points(tmp.path(), &spec, &SnapshotDirs::default())
             .unwrap_err()
             .to_string();
         assert!(err.contains("is a symlink"), "{err}");
@@ -670,15 +769,66 @@ mod tests {
                 patterns: vec!["b".into(), "a".into()],
             },
             size_mode: "disk-usage".into(),
-            include_snapshots: Some(true),
+            snapshot_dirs: Some(SnapshotDirs::new(false, &[".zfs".to_string()])),
         };
         m.save(tmp.path()).unwrap();
         let back = Manifest::load(tmp.path()).unwrap().unwrap();
         assert_eq!(back.root, "/data");
-        assert_eq!(back.include_snapshots, Some(true));
+        assert_eq!(
+            back.snapshot_dirs.unwrap().names(),
+            [".snapshot", ".snapshots", ".zfs"]
+        );
         assert_eq!(back.split.patterns, vec!["a", "b"]);
         assert_eq!(back.split.depth, 2);
         assert!(!tmp.path().join("_xdu.json.partial").exists());
+    }
+
+    /// A manifest from before the list existed records `include_snapshots` alone. That xdu
+    /// skipped `.snapshots` and nothing else, so `false` must not read as today's defaults,
+    /// or a `--partition` run would mix the two rules without a word.
+    #[test]
+    fn test_manifest_reads_the_older_snapshot_setting() {
+        let tmp = TempDir::new().unwrap();
+        let write = |extra: &str| {
+            let text = format!(
+                r#"{{"version": 1, "root": "/data", "split": {{"depth": 1, "patterns": []}},
+                   "size_mode": "disk-usage"{extra}}}"#
+            );
+            fs::write(tmp.path().join(MANIFEST_FILE), text).unwrap();
+            Manifest::load(tmp.path()).unwrap().unwrap().snapshot_dirs
+        };
+        assert_eq!(
+            write(r#", "include_snapshots": false"#).unwrap().names(),
+            [".snapshots"]
+        );
+        assert!(
+            write(r#", "include_snapshots": true"#)
+                .unwrap()
+                .names()
+                .is_empty()
+        );
+        assert_eq!(write(""), None);
+    }
+
+    #[test]
+    fn test_snapshot_dirs() {
+        let dirs = SnapshotDirs::default();
+        assert_eq!(dirs.names(), [".snapshot", ".snapshots"]);
+        assert!(dirs.skips(OsStr::new(".snapshot")));
+        assert!(!dirs.skips(OsStr::new(".snapshotsx")));
+        assert_eq!(dirs.first_in_path("a/.snapshot/b"), Some(".snapshot"));
+        assert_eq!(dirs.first_in_path("a/b"), None);
+        assert_eq!(dirs.describe(), ".snapshot, .snapshots");
+        // Repeating a default changes nothing, so the recorded list stays comparable.
+        assert_eq!(SnapshotDirs::new(false, &[".snapshots".to_string()]), dirs);
+        let none = SnapshotDirs::new(true, &[]);
+        assert!(!none.skips(OsStr::new(".snapshots")));
+        assert_eq!(none.describe(), "none");
+
+        assert_eq!(parse_snapshot_dir(".zfs"), Ok(".zfs".to_string()));
+        for bad in ["", ".", "..", "a/b", ".snap*"] {
+            assert!(parse_snapshot_dir(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -11,7 +11,8 @@ use tempfile::TempDir;
 
 use common::{binary_path, find_count, run_binary_with_home};
 use xdu::layout::{
-    Manifest, SplitSpec, list_partitions, partition_key_sql, resolve_split_points, split_keys,
+    Manifest, SnapshotDirs, SplitSpec, list_partitions, partition_key_sql, resolve_split_points,
+    split_keys,
 };
 use xdu::{COMPLETION_MARKER, IndexLocator, index_glob, sql_quote};
 
@@ -97,7 +98,8 @@ fn test_resolve_split_points() {
             depth,
             patterns: patterns.iter().map(|s| s.to_string()).collect(),
         };
-        let (points, warnings) = resolve_split_points(tree.path(), &spec, false).unwrap();
+        let (points, warnings) =
+            resolve_split_points(tree.path(), &spec, &SnapshotDirs::default()).unwrap();
         (split_keys(&points), warnings)
     };
     assert_eq!(resolve(1, &[]).0, vec!["alice", "projects"]);
@@ -130,12 +132,12 @@ fn test_resolve_split_points() {
         depth: 1,
         patterns: vec!["../etc".to_string()],
     };
-    assert!(resolve_split_points(tree.path(), &bad, false).is_err());
+    assert!(resolve_split_points(tree.path(), &bad, &SnapshotDirs::default()).is_err());
     let recursive = SplitSpec {
         depth: 1,
         patterns: vec!["projects/**".to_string()],
     };
-    let msg = resolve_split_points(tree.path(), &recursive, false)
+    let msg = resolve_split_points(tree.path(), &recursive, &SnapshotDirs::default())
         .unwrap_err()
         .to_string();
     assert!(msg.contains("'**' is not supported"), "{}", msg);
@@ -146,7 +148,7 @@ fn test_resolve_split_points() {
             depth: 1,
             patterns: vec![p.to_string()],
         };
-        resolve_split_points(tree.path(), &spec, false)
+        resolve_split_points(tree.path(), &spec, &SnapshotDirs::default())
             .unwrap_err()
             .to_string()
     };

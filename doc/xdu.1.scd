@@ -6,7 +6,7 @@ xdu - build a distributed file metadata index in Parquet format
 
 # SYNOPSIS
 
-*xdu* _DIR_ *-o* _OUTDIR_ \[*-j* _N_] \[*-B* _N_] \[*--apparent-size*] \[*-k* _SIZE_] \[*-p* _NAMES_ \[*-r*]] \[*--split-depth* _N_] \[*--split* _PATHS_] \[*--split-file* _FILE_] \[*--allow-errors*] \[*--include-snapshots*]
+*xdu* _DIR_ *-o* _OUTDIR_ \[*-j* _N_] \[*-B* _N_] \[*--apparent-size*] \[*-k* _SIZE_] \[*-p* _NAMES_ \[*-r*]] \[*--split-depth* _N_] \[*--split* _PATHS_] \[*--split-file* _FILE_] \[*--allow-errors*] \[*--include-snapshots* | *--snapshot-dir* _NAME_]
 
 # DESCRIPTION
 
@@ -76,11 +76,20 @@ _DIR_
 	errors) instead of failing the run. See _EXIT STATUS_.
 
 *--include-snapshots*
-	Also index directories named .snapshots, where GPFS keeps its snapshots.
-	By default they are skipped wherever they occur: each snapshot is a
+	Also index snapshot directories. By default directories named .snapshots
+	(GPFS) or .snapshot (NetApp, PowerScale, VAST), and any named with
+	*--snapshot-dir*, are skipped wherever they occur: each snapshot is a
 	read-only copy of the tree around it, so indexing it counts the same
-	files again under other paths. A *-p* run must use the setting the index
-	was built with; changing it takes a full run.
+	files again under other paths. A crawl root inside a snapshot is still
+	indexed. A *-p* run must use the setting the index was built with;
+	changing it takes a full run.
+
+*--snapshot-dir* _NAME_
+	Also skip directories named _NAME_ as snapshots, in addition to the
+	defaults .snapshots and .snapshot. _NAME_ is one directory name, matched literally
+	at any depth. Repeat the option for several names. Cannot be combined with
+	*--include-snapshots*. The list is saved with the index, and a *-p* run
+	must give the same names.
 
 *-h*, *--help*
 	Print help information.
@@ -105,7 +114,7 @@ a real directory: *xdu* never follows symlinks, and a path through one is
 rejected with an error naming the link. Quote patterns so the shell does not
 expand them.
 
-The crawl root, split settings, size mode and snapshot setting are saved in
+The crawl root, split settings, size mode and skipped snapshot names are saved in
 _OUTDIR_/\_xdu.json. Later runs reuse the split settings, *-p* runs included.
 Changing them takes a full run, which removes the partitions that are no longer
 split points. Split paths are supported only for a local _OUTDIR_.
