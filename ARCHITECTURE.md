@@ -91,7 +91,7 @@ driver threads:
   counted, anything else is an error that fails the run unless `--allow-errors`.
 
 Moving the stat from the driver to the pool is the change behind the large speedup on network
-filesystems; `README.md` § "Where the stat runs" has the measurements.
+filesystems; `README.md` § "How the crawl works" explains it with measurements.
 
 **Writing chunks** (`crawl::PartitionBuffer`, `crawl::IndexSink`). A buffer encodes a Parquet chunk
 each time it holds `-B` rows. `LocalSink` writes `NNNNNN.parquet.partial` and renames it into place

@@ -742,36 +742,99 @@ drilling into it in `xdu-view`, diffing it, or re-indexing it with `-p` touches 
 Splitting it with `--split` (see [Nested Partitions](#nested-partitions)) breaks it into smaller units
 for those operations.
 
-#### Where the stat runs
+#### How the crawl works
 
-Each indexed file costs a directory read, which yields its name and type, and a `stat`, which
-yields everything else in the row. On GPFS or Lustre the `stat` is a round trip to a metadata
-server and dominates the crawl.
+The examples below use one small tree:
 
-The `-j` pool threads read directories through jwalk's `process_read_dir` callback, and the same
-callback stats every regular file in the directory it has just read. The result travels with the
-entry in jwalk's per-entry `client_state`, and the partition's driver thread takes it from there to
-build the row. A partition's stats are therefore spread over all `-j` threads, wherever its
-directories happen to be read, and a pool thread cannot read further ahead than it can stat, so
-memory stays bounded.
+```
+/gpfs/gibbs/pi/
+├── alice/      (10 files)
+├── bob/        (200 million files, thousands of subdirectories)
+└── carol/      (5 files)
+```
 
-Earlier versions ran the `stat` in the driver loop. A partition has one driver, so every stat in
-that partition was serialized on one thread while the pool read directories far ahead of it and
-queued the entries in memory. On `/gpfs/gibbs/pi`, a single 192M-file partition (its `.snapshots`
-included) crawled at about 2,200 files/s for the last ~24 hours of a 29-hour run, which used ~7
-CPU-hours and 132 GB of RSS.
+**What each file costs.** A row of the index needs two filesystem calls. A directory read
+(`readdir`) returns the names in one directory and whether each is a file or a subdirectory; one
+call covers many files. A `stat` returns everything else in the row (size, owner, mode, times),
+and there is one per file. On GPFS or Lustre each `stat` is a round trip to a metadata server, so
+`stat` calls dominate the crawl: `/gpfs/gibbs/pi` takes 755 million of them. Crawl speed is set by
+how many run at once.
 
-| Run | Stat in driver loop | Stat on the pool |
-|-----|---------------------|------------------|
+**Two kinds of thread.** With `-j 32`, `xdu` starts two groups:
+
+- **The pool**: 32 worker threads shared by every partition, doing the filesystem work. The pool
+  holds a list of pending tasks, each "read directory X". An idle worker takes the next one, and
+  each subdirectory it finds becomes a new task any idle worker can take. `bob`'s thousands of
+  subdirectories therefore spread across all 32 workers.
+- **Drivers**: up to 32 threads, each responsible for one partition at a time. A driver receives
+  its partition's entries from the pool, builds the rows and writes the Parquet chunks, then takes
+  the next partition from the queue. A partition has exactly one driver, because its rows go into
+  one numbered sequence of chunks.
+
+```
+   partition queue:  alice, bob, carol, ...
+          │
+   driver threads (one partition each)      pool workers (shared by all)
+   ┌───────────────┐                      ┌──────────────────────────┐
+   │ driver: bob   │ ◀── entries ──────── │ w1  w2  w3 ... w32       │
+   │ driver: alice │ ◀── entries ──────── │ each takes "read dir X"  │
+   │ ...           │                      │ tasks from a shared list │
+   └───────────────┘                      └──────────────────────────┘
+          │
+   bob/000000.parquet, bob/000001.parquet ...
+```
+
+**Before: the stat in the driver.** Earlier versions had the pool read directories and the driver
+`stat` each file it received. `bob`'s directories were read in parallel, but all 200 million of its
+files then passed through `bob`'s one driver, which `stat`ed them one at a time. `bob` crawled at
+single-thread speed whatever `-j` was; the small partitions finished early and left their drivers
+and the pool idle; and the pool, reading far faster than the driver could `stat`, queued millions
+of unprocessed entries in memory.
+
+```
+OLD:  pool (32 threads): readdir readdir readdir readdir ...    (parallel)
+                               │
+      bob's driver (1 thread): stat stat stat stat stat ...     (serial: the bottleneck)
+```
+
+On `/gpfs/gibbs/pi` a single 192M-file partition (its `.snapshots` included) crawled at about
+2,200 files/s for the last ~24 hours of a 29-hour run, which used ~7 CPU-hours and 132 GB of RSS.
+
+**Now: the stat on the pool.** jwalk runs a `process_read_dir` callback on the worker right after
+it reads each directory. That callback now `stat`s every regular file in the directory and stores
+the result in the entry's `client_state`, a per-entry slot jwalk provides. The driver receives
+entries that already carry their metadata, and only builds rows and writes chunks.
+
+```
+NEW:  pool (32 threads): [readdir + stat its files] [readdir + stat its files] ...  (parallel)
+                               │
+      bob's driver (1 thread): build row, build row, build row ...                  (cheap)
+```
+
+`bob`'s `stat` calls now spread over all 32 workers, because its directories do and each worker
+`stat`s the files of the directories it read. A worker cannot move to another directory until it
+has `stat`ed the current one's files, so reading no longer runs ahead and memory stays bounded.
+
+| Run | Stat in driver | Stat on the pool |
+|-----|----------------|------------------|
 | 9.1M-file GPFS tree, as root, `-j 16` | 1,694 files/s, 5,370 s, 14.9 GB RSS | ~28,500 files/s, 1.9 GB RSS |
-| `/gpfs/gibbs/pi`, as root, `-j 32` on 4 cores | — | 755M files in 9.0 h, ~3.5 cores busy, 42 GB RSS |
+| `/gpfs/gibbs/pi`, 755M files, as root, `-j 32` on 4 cores | 29 h incl. a 24 h one-partition tail | 9.0 h, ~3.5 cores busy, 42 GB RSS |
+| `/gpfs/gibbs/project` snapshot, 949M files, as root, `-j 32` on 8 cores | — | 9.1 h, ~29,000 files/s, ~7.8 cores busy, 26 GB RSS |
 
-The index is unchanged: the same files, and the same values in each row. The stat is an `lstat`
+In the project-snapshot runs partitions finished in roughly alphabetical order to the end, so the
+largest partitions no longer set the run time, and every core stayed busy: the limit is now how
+fast the node can issue `stat` calls.
+
+The index is unchanged: the same files, and the same values in each row. The `stat` is an `lstat`
 (`follow_links(false)`), so a file cannot be swapped for a symlink between the directory read and
-the stat. A stat that fails on the pool leaves the slot empty, and the driver repeats it to report
-the error as a vanished file or a hard error, as before. `test_metadata_matches_files`
+the `stat`. A `stat` that fails on the pool leaves the slot empty, and the driver repeats it to
+report the error as a vanished file or a hard error, as before. `test_metadata_matches_files`
 (`tests/nested_tests.rs`) gives every file a distinct size and mtime and checks that each row
 carries its own file's values.
+
+What remains serial is one driver per partition building rows and writing Parquet, which costs far
+less than a network `stat`. If it ever limits a very large directory, `--split` divides that
+directory into several partitions, each with its own driver.
 
 ## License
 
